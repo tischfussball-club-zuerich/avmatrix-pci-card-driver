@@ -995,7 +995,7 @@ static int hws_v4l2_g_ext_ctrls(struct file *file, void *fh,struct v4l2_ext_cont
                 c->value = videodev->m_Curr_Hue;
                 break;
             default:
-                // ÉèÖÃ´íÎóË÷Òý²¢·µ»Ø
+                // ï¿½ï¿½ï¿½Ã´ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
                 cs->error_idx = i;
                 printk("Unsupported control id: 0x%x\n", c->id);
                 return -EINVAL;
@@ -1087,7 +1087,7 @@ static int hws_v4l2_s_ext_ctrls(struct file *file, void *fh,struct v4l2_ext_cont
             return -EINVAL;
         }
         
-        // ¼ì²éÖµ·¶Î§
+        // ï¿½ï¿½ï¿½Öµï¿½ï¿½Î§
         if (c->value < found_ctrl->minimum || c->value > found_ctrl->maximum) {
             cs->error_idx = i;
             printk("Value out of range for control 0x%x (%lld-%lld)\n",
@@ -1095,7 +1095,7 @@ static int hws_v4l2_s_ext_ctrls(struct file *file, void *fh,struct v4l2_ext_cont
             return -ERANGE;
         }
         
-        // ¸ù¾ÝIDÉèÖÃÖµ
+        // ï¿½ï¿½ï¿½ï¿½IDï¿½ï¿½ï¿½ï¿½Öµ
         switch (c->id) {
             case V4L2_CID_BRIGHTNESS:
                 videodev->m_Curr_Brightness = c->value;
@@ -1201,18 +1201,16 @@ static int hws_v4l2_query_ext_ctrl(struct file *file, void *fh,struct v4l2_query
 		return ret;
 	}
 	printk( "%s(ch-%d)\n", __func__,videodev->index);
-	
+
     id = qc->id & (~V4L2_CTRL_FLAG_NEXT_CTRL);
     mask_id = qc->id & V4L2_CTRL_FLAG_NEXT_CTRL;
-	printk( "id= %d mask_id=%dn",id ,mask_id);
-	return ret;
     if (mask_id == V4L2_CTRL_FLAG_NEXT_CTRL) {
         if (id == 0) {
             videodev->queryIndex = 0;
             found_ctrl = find_ext_ctrlByIndex(videodev->queryIndex);
             if (found_ctrl) {
                 memcpy(qc, found_ctrl, sizeof(*qc));
-                // Çå³ý NEXT_CTRL ±êÖ¾
+                // ï¿½ï¿½ï¿½ NEXT_CTRL ï¿½ï¿½Ö¾
                 qc->id = found_ctrl->id; 
                 ret = 0;
             }
@@ -1224,13 +1222,19 @@ static int hws_v4l2_query_ext_ctrl(struct file *file, void *fh,struct v4l2_query
                 qc->id = found_ctrl->id;
                 ret = 0;
             } else {
-                // ·µ»Ø¿Õ¿ØÖÆÏî±íÊ¾½áÊø
+                // ï¿½ï¿½ï¿½Ø¿Õ¿ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê¾ï¿½ï¿½ï¿½ï¿½
                 memset(qc, 0, sizeof(*qc));
                 ret = -EINVAL;
             }
         }
     } else {
-        found_ctrl = find_ext_ctrlByIndex(id);
+        /* Direct (non-enumeration) query: qc->id here is the actual V4L2
+         * control ID (e.g. V4L2_CID_BRIGHTNESS = 0x00980900), not an
+         * array index â€” look it up by ID, not by index. The previous
+         * find_ext_ctrlByIndex(id) call always failed its own bounds
+         * check (id is always >= ARRAY_SIZE_OF_EXT_CTRL) and so always
+         * fell through to -EINVAL for every direct query. */
+        found_ctrl = find_ext_ctrl(id);
         if (found_ctrl) {
             memcpy(qc, found_ctrl, sizeof(*qc));
             ret = 0;
@@ -1242,7 +1246,7 @@ static int hws_v4l2_query_ext_ctrl(struct file *file, void *fh,struct v4l2_query
     return ret;
 
 }
-#endif 
+#endif
 #if 0
 static int hws_vidioc_streamon(struct file *file, void *priv, enum v4l2_buf_type i)
 {
@@ -1324,17 +1328,30 @@ int hws_vidioc_s_parm(struct file *file, void *fh,struct v4l2_streamparm *a)
 	struct hws_video *videodev = video_drvdata(file);
 	int io_frame_rate;
 	int in_frame_rate;
-	//int io_widht;
-	//int io_hight;
-	//int io_index; 
 	v4l2_model_timing_t *p_SupportmodeTiming;
-	io_frame_rate = a->parm.capture.timeperframe.denominator/a->parm.capture.timeperframe.numerator;
-	//io_index = a->parm.capture.timeperframe.index;
-	//printk( "%s(CH-%d) io_index =%d \n", __func__,videodev->index,io_index);
+
+	if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+		return -EINVAL;
+
+	io_frame_rate = a->parm.capture.timeperframe.numerator ?
+		a->parm.capture.timeperframe.denominator/a->parm.capture.timeperframe.numerator : 0;
+
 	p_SupportmodeTiming = v4l2_model_get_support_videoformat(videodev->current_out_size_index);
 	if(p_SupportmodeTiming ==NULL) return -EINVAL;
 	in_frame_rate = p_SupportmodeTiming->refresh_rate;
-	//printk( "%s(ch-%d)io_frame_rate =%d  in_frame_rate =%d \n", __func__,videodev->index,io_frame_rate,in_frame_rate);
+
+	/* This capture card cannot be told to run at an arbitrary rate: the
+	 * frame rate is dictated by whatever signal is physically feeding
+	 * the input. Rather than silently accepting whatever was requested
+	 * (which leaves the caller believing it configured a rate the
+	 * hardware never actually applies, causing frame-pacing drift),
+	 * always report back the real detected rate so the caller's own
+	 * record matches reality, per the V4L2 convention that a driver may
+	 * adjust an S_PARM request to the closest value it actually uses. */
+	a->parm.capture.timeperframe.numerator = 1000;
+	a->parm.capture.timeperframe.denominator = in_frame_rate*1000;
+
+	//printk( "%s(ch-%d) requested=%d actual=%d\n", __func__,videodev->index,io_frame_rate,in_frame_rate);
 	return 0;
 }
 
@@ -3358,6 +3375,7 @@ void video_data_process(struct work_struct *p_work)
 	int i;
 	//int copysize;
 	BYTE *bBuf;
+	u64 frame_ts_ns = 0;
 	int in_width;
 	int in_height;
 	int in_vsize;
@@ -3416,6 +3434,7 @@ void video_data_process(struct work_struct *p_work)
 		    	nVindex = i;
 				bBuf =  pdx->m_VideoInfo[nDecoder].m_pVideoBufData[i];
 				interlace = pdx->m_VideoInfo[nDecoder].pStatusInfo[i].dwinterlace;
+				frame_ts_ns = pdx->m_VideoInfo[nDecoder].pStatusInfo[i].capture_ts_ns;
 				break;
 			}
 		}
@@ -3455,17 +3474,21 @@ void video_data_process(struct work_struct *p_work)
         if (!buf)
             break;
 
-        buf->vb.vb2_buf.timestamp = ktime_get_ns();
+        buf->vb.vb2_buf.timestamp = frame_ts_ns ? frame_ts_ns : ktime_get_ns();
         buf->vb.field = V4L2_FIELD_NONE;
 
         if (!buf->mem) {
             vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
             continue;
         }
-		// copy data to buffer 
+		// copy data to buffer
 		if(pdx->m_curr_No_Video[nDecoder]==0 )
 		{
-			
+			if(bBuf == NULL)
+			{
+				vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
+				continue;
+			}
 			//--------------------
 			if(pdx->m_Device_SupportYV12 == 1)
 			{
@@ -4644,8 +4667,8 @@ static int  StartAudioCapture(struct hws_pcie_dev *pdx,int index)
 static int StartVideoCapture(struct hws_pcie_dev *pdx,int index)
 {
 	int j;
-	//unsigned long flags;
-	if(pdx->m_bVCapStarted[index]==1) 
+	unsigned long flags;
+	if(pdx->m_bVCapStarted[index]==1)
 	{
 
 		CheckCardStatus(pdx);
@@ -4658,7 +4681,7 @@ static int StartVideoCapture(struct hws_pcie_dev *pdx,int index)
 	//--------------------
 	CheckCardStatus(pdx);
 	//--------------------
-	//spin_lock_irqsave(&pdx->videoslock[index], flags);
+	spin_lock_irqsave(&pdx->videoslock[index], flags);
 	for (j = 0; j<MAX_VIDEO_QUEUE; j++)
 	{
 			pdx->m_pVCAPStatus[index][j].byLock = MEM_UNLOCK;
@@ -4668,8 +4691,8 @@ static int StartVideoCapture(struct hws_pcie_dev *pdx,int index)
 	pdx->m_nRDVideoIndex[index]=0;
 	pdx->m_VideoInfo[index].dwisRuning = 1;
 	pdx->m_VideoInfo[index].m_nVideoIndex =0;
-	//spin_unlock_irqrestore(&pdx->videoslock[index], flags);
-	
+	spin_unlock_irqrestore(&pdx->videoslock[index], flags);
+
 	pdx->m_bChangeVideoSize[index] = 0;
 	pdx->m_bVCapIntDone[index] = 1;
 	pdx->m_pVideoEvent[index] = 1;
@@ -4867,9 +4890,10 @@ static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder)
 							{
 								pdx->m_VideoInfo[nDecoder].m_nVideoIndex =0;
 							}
-			 				pdx->m_VideoInfo[nDecoder].pStatusInfo[nIndex].dwWidth = pdx->m_pVCAPStatus[nDecoder][0].dwWidth ; 
+			 				pdx->m_VideoInfo[nDecoder].pStatusInfo[nIndex].dwWidth = pdx->m_pVCAPStatus[nDecoder][0].dwWidth ;
 			 				pdx->m_VideoInfo[nDecoder].pStatusInfo[nIndex].dwHeight = pdx->m_pVCAPStatus[nDecoder][0].dwHeight;
 							pdx->m_VideoInfo[nDecoder].pStatusInfo[nIndex].dwinterlace = interlace;
+							pdx->m_VideoInfo[nDecoder].pStatusInfo[nIndex].capture_ts_ns = ktime_get_ns();
 							pdx->m_VideoInfo[nDecoder].pStatusInfo[nIndex].byLock = MEM_LOCK;
 							
 							spin_unlock_irqrestore(&pdx->videoslock[nDecoder], flags);

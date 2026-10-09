@@ -141,7 +141,7 @@ typedef unsigned char BOOL;
 #define MAX_AUDIO_BUF_SIZE 1920
 
 #define MAX_VID_CHANNELS            4
-#define MAX_VIDEO_QUEUE				4
+#define MAX_VIDEO_QUEUE				8
 #define MAX_AUDIO_QUEUE				8
 
 #define CUR_AUDIO_PACKET_LENGTH		4096+34						// 250ms,  2*16,000=32,000 -> 1s
@@ -203,6 +203,7 @@ typedef struct TAG_VCAP_STATUS_INFO
 	DWORD       dwOutFrameRate;
 	DWORD	    dwinterlace;
 	DWORD       dwhdcp;
+	u64         capture_ts_ns; /* ktime_get_ns() at actual DMA completion, not at workqueue dequeue */
 }VCAP_STATUS_INFO, *PVCAP_STATUS_INFO;
 typedef struct 
 {
