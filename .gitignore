@@ -22,3 +22,5 @@ tools/driver-tests/sim/sim
 tools/driver-tests/sim/sim_tsan
 tools/driver-tests/sim/*.txt
 tools/driver-tests/sim/*.log
+tools/driver-tests/conv/doubling.inc
+tools/driver-tests/conv/dbl

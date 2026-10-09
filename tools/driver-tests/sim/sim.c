@@ -134,6 +134,8 @@ static void *sim_memcpy(void *d, const void *s, size_t n)
 	return memcpy(d, s, n);
 }
 #define memcpy sim_memcpy
+/* resume/re-init is not simulated (needs the PCI core) */
+static void hws_hw_bringup(struct hws_pcie_dev *p) { (void)p; }
 #include "core.inc"
 #undef memcpy
 
@@ -271,7 +273,7 @@ static int fps = 60;
 static int seconds = 30;
 
 /* source state per channel, driven by the status thread */
-static _Atomic int src_w[NCH], src_h[NCH], src_present[NCH];
+static _Atomic int src_w[NCH], src_h[NCH], src_il[NCH], src_present[NCH];	/* src_h: field height when interlaced */
 static _Atomic u64 last_src_change[NCH];
 
 /* results */
@@ -303,9 +305,9 @@ static void *irq_thread(void *a)
 	}
 	return NULL;
 }
+static pthread_mutex_t hard = PTHREAD_MUTEX_INITIALIZER;	/* hard IRQs don't nest, nor run twice at once */
 static void raise_irq(int ch, int half)
 {
-	static pthread_mutex_t hard = PTHREAD_MUTEX_INITIALIZER;	/* hard IRQs don't nest */
 	pthread_mutex_lock(&hard);
 	atomic_store(&regs[(CVBS_IN_BASE + (32 + ch) * PCIE_BARADDROFSIZE) / 4], half);
 	atomic_fetch_or(&regs[(CVBS_IN_BASE + 1 * PCIE_BARADDROFSIZE) / 4], 1u << ch);
@@ -427,7 +429,6 @@ static void *storm_thread(void *a)
 	unsigned seed = 4242;
 	(void)a;
 	while (atomic_load(&run)) {
-		static pthread_mutex_t hard = PTHREAD_MUTEX_INITIALIZER;
 		if (!atomic_load(&hostile_now)) { sleep_ns(NSEC_PER_MSEC); continue; }
 		/* mostly valid video/audio bits, sometimes anything (incl. bits nobody acks) */
 		u32 bits = rand_r(&seed) % 10 ? ((u32)rand_r(&seed) & 0x0F0F) :
@@ -557,19 +558,23 @@ static void *status_thread(void *a)
 				if (r == 0) {
 					atomic_store(&src_present[ch], !atomic_load(&src_present[ch]));
 				} else {
-					int big = atomic_load(&src_w[ch]) == 1280;
-					atomic_store(&src_w[ch], big ? 1920 : 1280);
-					atomic_store(&src_h[ch], big ? 1080 : 720);
+					/* 720p (direct), 1080p (scaled), 720i (direct, line-doubled) */
+					static const int modes[3][3] = { {1280, 720, 0}, {1920, 1080, 0}, {1280, 360, 1} };
+					int m = rand_r(&seed) % 3;
+					atomic_store(&src_w[ch], modes[m][0]);
+					atomic_store(&src_h[ch], modes[m][1]);
+					atomic_store(&src_il[ch], modes[m][2]);
 				}
 				atomic_store(&last_src_change[ch], ktime_get_ns());
 			}
 			/* the driver notices once per second */
 			if (tick % 4 == 0) {
 				int present = atomic_load(&src_present[ch]);
-				int w = atomic_load(&src_w[ch]), h = atomic_load(&src_h[ch]);
+				int w = atomic_load(&src_w[ch]), h = atomic_load(&src_h[ch]), il = atomic_load(&src_il[ch]);
 				if (present && (pdx->m_pVCAPStatus[ch][0].dwWidth != (DWORD)w ||
-						pdx->m_pVCAPStatus[ch][0].dwHeight != (DWORD)h))
-					ChangeVideoSize(pdx, ch, w, h, 0);
+						pdx->m_pVCAPStatus[ch][0].dwHeight != (DWORD)h ||
+						pdx->m_pVCAPStatus[ch][0].dwinterlace != (DWORD)il))
+					ChangeVideoSize(pdx, ch, w, h, il);
 				WRITE_ONCE(pdx->m_curr_No_Video[ch], !present);
 				if (!present && pdx->m_bVCapStarted[ch] == TRUE)
 					queue_work(pdx->wq, &pdx->video[ch].videowork);
@@ -818,6 +823,7 @@ int main(int argc, char **argv)
 		mutex_init(&pdx->direct_lock[ch]);
 		INIT_LIST_HEAD(&pdx->direct_bufs[ch]);
 		INIT_WORK(&pdx->video[ch].fanout_work, hws_fanout_work);
+		kthread_init_work(&pdx->video[ch].copy_work, hws_copy_work);
 		spin_lock_init(&pdx->video[ch].fanout_lock);
 		INIT_LIST_HEAD(&pdx->video[ch].fanout_q);
 		INIT_LIST_HEAD(&pdx->video[ch].fanout_free);

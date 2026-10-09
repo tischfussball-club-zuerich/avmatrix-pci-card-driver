@@ -274,7 +274,10 @@ compile tests; none of it has been confirmed on a card yet.
 - **Hard lockup in the interrupt handler:** interrupt sources the driver
   didn't handle were never acknowledged, so a level-triggered line kept the
   CPU in the handler. All sources are acknowledged now; a stuck status bit is
-  detected, and after a storm the card's interrupts are paused for a second.
+  detected, and after a storm (1000 empty interrupts within 100 ms) the
+  card's interrupts are paused for a second.
+- **Reboot/kexec:** there was no shutdown handler, so the card kept DMAing
+  and could hold a shared interrupt line asserted into the next kernel.
 
 ### Hangs and freezes
 
@@ -288,6 +291,8 @@ compile tests; none of it has been confirmed on a card yet.
 - **Shared interrupt lines were refused,** and a failed MSI setup aborted
   probe instead of falling back to legacy interrupts.
 - **Signal loss mid-frame** left an application's buffer stuck.
+- **A card that was gone at resume** and came back later was never
+  re-initialized; it now gets the full bring-up.
 - **A dead card** (all registers read as ones) was accepted at probe and never
   detected at runtime, while a single bad read marked it lost forever. It is
   now detected reliably and recovers automatically.
@@ -308,15 +313,24 @@ compile tests; none of it has been confirmed on a card yet.
   during a mode switch, and halves the card overwrote mid-copy were shown.
   These are now detected and dropped (in a 480 fps stress simulation: 148 torn
   frames per minute before, 0 after). Lost or duplicated half-frame interrupts
-  are handled.
-- **Big copies ran in softirq,** delaying network, timer and disk work; they
-  now run in a preemptible threaded interrupt.
+  are handled, halves far apart in time (interrupts paused, card recovery)
+  are never paired, and the first frame after a mode change that the card
+  started in the old layout is skipped.
+- **Big copies ran in softirq,** delaying network, timer and disk work. Each
+  channel now has its own copy thread (lowest real-time priority), so with
+  4 channels the copies (up to ~1 GB/s at 4×1080p60) run on 4 CPUs instead
+  of queuing behind each other on one; audio no longer waits behind video.
+- **Interlaced input** (1080i, 576i, 480i) shown at the input size is now
+  copied straight from DMA into the application's buffer with the lines
+  doubled, instead of going through the ring and the worker.
 - **Workers:** one wakeup per frame instead of two, on high-priority workers
   that run the channels in parallel instead of one shared thread.
 - **Timestamps** now come from the frame's interrupt instead of worker
   scheduling; sequence numbers are per application and always increase, so a
   gap means a real drop.
 - **The no-signal picture** came once per second; now at about 30 fps.
+- **Mode changes** (resolution, frame rate, signal) are noticed within
+  250 ms instead of up to 1 s.
 - **ALSA xruns:** the minimum period was below the card's 4096-byte packet,
   the BATCH flag was missing and a stale packet played at start.
 - **Faster converters** (byte-identical output): 1080p→720p 0.43→0.19 ms,

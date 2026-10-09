@@ -54,6 +54,11 @@ extern atomic_long sim_ratelimited_warnings;
 #define WRITE_ONCE(x, v) (*(volatile __typeof__(x) *)&(x) = (v))
 #define rmb() atomic_thread_fence(memory_order_acquire)
 #define smp_rmb() atomic_thread_fence(memory_order_acquire)
+#define smp_wmb() atomic_thread_fence(memory_order_release)
+#define smp_store_release(p, v) do { atomic_thread_fence(memory_order_release); WRITE_ONCE(*(p), (v)); } while (0)
+#define smp_load_acquire(p) ({ __typeof__(*(p)) ___v = READ_ONCE(*(p)); atomic_thread_fence(memory_order_acquire); ___v; })
+#define max_t(t, a, b) ((t)(a) > (t)(b) ? (t)(a) : (t)(b))
+#define cpu_relax() sched_yield()
 #define smp_mb__before_atomic() atomic_thread_fence(memory_order_seq_cst)
 #define div_u64(a, b) ((u64)(a) / (b))
 #define div64_u64(a, b) ((u64)(a) / (b))
@@ -149,6 +154,14 @@ struct workqueue_struct { int dummy; };
 void INIT_WORK(struct work_struct *w, void (*f)(struct work_struct *));
 void INIT_DELAYED_WORK(struct delayed_work *d, void (*f)(struct work_struct *));
 bool queue_work(struct workqueue_struct *wq, struct work_struct *w);
+/* kthread_worker: each work item has its own thread here, like one worker per channel */
+#define kthread_work work_struct
+struct kthread_worker { struct task_struct *task; };
+#define kthread_init_work(w, f) INIT_WORK((w), (f))
+#define kthread_queue_work(wk, w) queue_work(NULL, (w))
+#define kthread_flush_work(w) flush_work(w)
+#define queue_work_on(cpu, wq, w) queue_work((wq), (w))
+#define raw_smp_processor_id() 0
 bool flush_work(struct work_struct *w);
 bool cancel_work_sync(struct work_struct *w);
 bool mod_delayed_work(struct workqueue_struct *wq, struct delayed_work *d, unsigned long ms);

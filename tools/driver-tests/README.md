@@ -18,6 +18,9 @@ UndefinedBehaviorSanitizer and ThreadSanitizer, and python3.
   out-of-bounds read or write faults immediately; runs under ASan/UBSan.
   `harness hash` prints a hash per output to compare two versions
   byte-for-byte; `timek` times the converters with kernel compiler flags.
+  `doubling.c` checks that the direct path's line doubling for interlaced
+  input, with the frame split into halves at any byte, matches the worker's
+  deinterlacer byte for byte.
 - **sim/**: the capture core (hard IRQ handler, IRQ thread, half-frame
   copies, ring, worker, direct path, fan-out, stream start/stop, format
   changes) on a small kernel-API shim (`shim.h`), driven by a simulated card

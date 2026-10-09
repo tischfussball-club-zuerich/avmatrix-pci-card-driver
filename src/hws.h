@@ -365,6 +365,7 @@ struct hws_video{
 	struct delayed_work		nosig_work;	/* paces "no signal" frames */
 	/* direct-path fan-out to further consumers, off the IRQ thread */
 	struct work_struct		fanout_work;
+	struct kthread_work		copy_work;	/* half-frame copies, on copy_worker[index] */
 	spinlock_t			fanout_lock;
 	struct list_head		fanout_q;	/* frames to fan out, in order */
 	struct list_head		fanout_free;
@@ -439,8 +440,10 @@ struct hws_pcie_dev {
 	bool				regions_requested;
 	int				m_lost_reads;	/* status thread: consecutive all-ones reads */
 	int				irq_stuck_passes;	/* hard IRQ: consecutive passes with a stuck status bit */
-	bool				irq_storm_off;	/* storm guard switched card interrupts off */
-	u64				irq_storm_off_ns;
+	bool				irq_storm_off;	/* storm guard switched card interrupts off (release/acquire) */
+	atomic64_t			irq_storm_off_ns;
+	u64				irq_stuck_t0;	/* hard IRQ: start of the current storm window */
+	bool				need_bringup;	/* pm_lock: card was gone at resume, re-init when back */
 	int				m_recovered;	/* status thread: card came back, re-arm channels */
 	struct mutex			pm_lock;	/* suspend/resume vs. engine start/stop; nests inside engine_lock */
 	bool				suspended;	/* pm_lock */
@@ -454,6 +457,7 @@ struct hws_pcie_dev {
 	struct mutex			direct_lock[MAX_VID_CHANNELS];
 	struct list_head		direct_bufs[MAX_VID_CHANNELS];
 	int				direct_out_size[MAX_VID_CHANNELS];
+	bool				direct_il[MAX_VID_CHANNELS];	/* direct frame is interlaced: line-doubled */
 	bool				direct_frame[MAX_VID_CHANNELS];	/* first half of the frame in flight went direct */
 	struct hws_timing_stats		tstats[MAX_VID_CHANNELS];
 	struct uio_info info;
@@ -473,6 +477,13 @@ struct hws_pcie_dev {
 	atomic64_t			m_audio_half_ts[MAX_VID_CHANNELS][2];
 	u32				m_fmt_gen[MAX_VID_CHANNELS];	/* bumped on every input size change */
 	u32				m_half1_gen[MAX_VID_CHANNELS];	/* m_fmt_gen when the first half was copied */
+	/* one RT thread per channel copies its half-frames, so channels don't queue behind each other */
+	struct kthread_worker		*copy_worker[MAX_VID_CHANNELS];
+	u32				m_half_seq[MAX_VID_CHANNELS][2];	/* hard IRQ: odd while ts/cnt/peer change */
+	u32				m_half_done_cnt[MAX_VID_CHANNELS][2];	/* copy thread: last completion handled */
+	u64				m_half1_ts[MAX_VID_CHANNELS];	/* IRQ time of that first half */
+	u32				m_fmt_cnt0[MAX_VID_CHANNELS];
+	u64				m_sw_rate_t0[MAX_VID_CHANNELS];	/* status thread: start of the frame-rate count */	/* videoslock: second-half count at the last format change */
 	//-----------------------------
 	//spinlock_t lock; /* guards command register accesses */
 	int irq_count;	/* interrupt counter */	

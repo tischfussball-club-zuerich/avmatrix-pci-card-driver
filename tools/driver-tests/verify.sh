@@ -8,6 +8,14 @@ scan() {	# file label
 echo "== converters: $(python3 -I $S/conv/extract.py $SRC/hws_video.c > $S/conv/driver_conv.inc && echo extracted)"
 (cd $S/conv && gcc -O1 -g -fsanitize=address,undefined -w -o h harness.c && ASAN_OPTIONS=detect_leaks=0 ./h > out.txt 2>&1); echo "   $(grep combinations $S/conv/out.txt)"; scan $S/conv/out.txt
 grep -q "faults: 0" $S/conv/out.txt || fail=1
+python3 -I - $SRC/hws_video.c > $S/conv/doubling.inc <<'PY'
+import re, sys
+s = open(sys.argv[1]).read()
+for name in ("SetDeInterlace", "hws_copy_doubled"):
+    print(re.search(r"^static void " + name + r"\(.*?^\}\n", s, re.S | re.M).group(0))
+PY
+(cd $S/conv && gcc -O1 -fsanitize=address,undefined -w -o dbl doubling.c && ./dbl > dbl.txt 2>&1); echo "== interlaced direct path: $(cat $S/conv/dbl.txt | tail -1)"; scan $S/conv/dbl.txt
+grep -q "mismatches: 0" $S/conv/dbl.txt || fail=1
 rm -f $S/sim/sim $S/sim/sim_tsan
 if ! $S/sim/build.sh $SRC > $S/sim/build.log 2>&1; then echo "!! simulator build FAILED:"; grep -m5 error $S/sim/build.log; echo "RESULT: FAIL"; exit 1; fi
 for mode in race logic nodirect irqfaults; do for f in 60 240 480; do
