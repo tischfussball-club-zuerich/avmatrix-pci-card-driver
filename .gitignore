@@ -10,3 +10,15 @@ hws_install.log
 Module.symvers
 modules.order
 .tmp_versions/
+
+# tools/driver-tests generated files
+tools/driver-tests/conv/driver_conv*.inc
+tools/driver-tests/conv/h
+tools/driver-tests/conv/*.o
+tools/driver-tests/conv/*.txt
+tools/driver-tests/sim/fake/
+tools/driver-tests/sim/*.inc
+tools/driver-tests/sim/sim
+tools/driver-tests/sim/sim_tsan
+tools/driver-tests/sim/*.txt
+tools/driver-tests/sim/*.log

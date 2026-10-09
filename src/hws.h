@@ -68,6 +68,8 @@
 #include <linux/semaphore.h>   
 #include <linux/sched.h>    
 #include <linux/wait.h>   
+#include <linux/kref.h>
+#include <linux/freezer.h>
 
 
 //---------------------------------------------
@@ -112,6 +114,7 @@
 #endif 
 #define MEM_LOCK					1
 #define MEM_UNLOCK					0
+#define MEM_READING					2	/* worker is copying out of this slot */
 
 
 typedef unsigned int DWORD;
@@ -141,7 +144,7 @@ typedef unsigned char BOOL;
 #define MAX_AUDIO_BUF_SIZE 1920
 
 #define MAX_VID_CHANNELS            4
-#define MAX_VIDEO_QUEUE				8
+#define MAX_VIDEO_QUEUE				4
 #define MAX_AUDIO_QUEUE				8
 
 #define CUR_AUDIO_PACKET_LENGTH		4096+34						// 250ms,  2*16,000=32,000 -> 1s
@@ -203,7 +206,6 @@ typedef struct TAG_VCAP_STATUS_INFO
 	DWORD       dwOutFrameRate;
 	DWORD	    dwinterlace;
 	DWORD       dwhdcp;
-	u64         capture_ts_ns; /* ktime_get_ns() at actual DMA completion, not at workqueue dequeue */
 }VCAP_STATUS_INFO, *PVCAP_STATUS_INFO;
 typedef struct 
 {
@@ -217,6 +219,9 @@ typedef struct
 	uint8_t     *m_pVideoData_area3[MAX_VIDEO_QUEUE];
 	int         m_VideoBufferSize[4];
 	VCAP_STATUS_INFO pStatusInfo[MAX_VIDEO_QUEUE];
+	u64         frame_ts[MAX_VIDEO_QUEUE];	/* IRQ time of the frame in the slot */
+	u32         frame_seq[MAX_VIDEO_QUEUE];	/* capture sequence of the frame in the slot */
+	u32         seq_counter;			/* next capture sequence number */
 	DWORD        m_nVideoIndex;
 	BYTE		*m_pVideoScalerBuf;
 	BYTE        *m_pVideoYUV2Buf;
@@ -298,6 +303,7 @@ struct hwsvideo_buffer {
 	struct vb2_v4l2_buffer	vb;
 	struct list_head		queue;
 	void *					mem;
+	bool					mem_bad;	/* worker only: copy into it was skipped */
 
 };
 
@@ -318,38 +324,54 @@ struct hws_vfh_ctx {
     struct vb2_queue    vbq;
     struct list_head    buf_queue;   /* queued hwsvideo_buffer for this fh */
     spinlock_t          qlock;       /* protects buf_queue */
-    bool                streaming;
+    struct mutex        qmutex;      /* vb2 q->lock, serializes this fh's buffer ioctls */
+    bool                streaming;   /* protected by video->consumers_lock */
+    spinlock_t          dlock;       /* delivery: sequence/timestamp bookkeeping + done */
+    bool                seq_valid;   /* dlock */
+    u32                 seq_base;    /* dlock: capture seq of this fh's first frame */
+    bool                have_last;   /* dlock */
+    u32                 last_seq;    /* dlock: last sequence handed to the app */
+    u64                 last_ts;     /* dlock: last timestamp handed to the app */
     struct hws_video   *video;
     struct list_head    node;        /* link into video->consumers */
 };
+/* a direct-path frame waiting for its copies to the other consumers */
+#define HWS_FANOUT_POOL 4
+struct hws_fanout {
+	struct list_head	node;
+	struct list_head	bufs;		/* first holds the frame, the rest get copies */
+	int			out_size;
+	u64			ts;
+	u32			seq;
+};
+
 struct hws_video{
 	struct hws_pcie_dev		*dev;
 	struct v4l2_device		v4l2_dev;
 	struct video_device		vdev;
-	struct vb2_queue		vq;
-	struct list_head		queue;
 	int                     fileindex;
-	int                     startstreamIndex;
-	unsigned				seqnr;
-	struct mutex			video_lock;
-	struct mutex			queue_lock;
+	struct mutex			video_lock;	/* format / control ioctls */
+	struct mutex			engine_lock;	/* capture engine start/stop */
 	/* B1: multi-consumer */
 	spinlock_t			consumers_lock;
-	struct mutex			ioctl_lock;
 	struct list_head		consumers;
-	atomic_t			engine_users;
+	int				engine_users;	/* protected by engine_lock */
 	spinlock_t				slock;
-	v4l2_std_id				std;  //V4L2_STD_NTSC_M
 	u32						pixfmt; //V4L2_PIX_FMT_YUYV(fourcc)
-	int                     queryIndex;
+	struct v4l2_ctrl_handler	ctrl_handler;	/* picture controls; freed with v4l2_dev */
+	bool				ctrl_ready;
 	int						index;
 	struct work_struct		videowork;
+	struct delayed_work		nosig_work;	/* paces "no signal" frames */
+	/* direct-path fan-out to further consumers, off the IRQ thread */
+	struct work_struct		fanout_work;
+	spinlock_t			fanout_lock;
+	struct list_head		fanout_q;	/* frames to fan out, in order */
+	struct list_head		fanout_free;
+	int				fanout_inflight;	/* queued or being completed; fanout_lock */
+	struct hws_fanout		fanout_pool[HWS_FANOUT_POOL];
 	int						Interlaced;
 	//------------------------
-	int m_Curr_Brightness;
-	int m_Curr_Contrast;   
-	int m_Curr_Saturation;
-	int m_Curr_Hue;       
 	//------------------------
 	int current_out_width;
 	int curren_out_height;
@@ -370,6 +392,7 @@ struct hws_audio{
 	void                        *resampled_buf;
 	u32                         resampled_buf_size;
 	spinlock_t                  ring_lock;
+	bool                        running;	/* protected by ring_lock */
     uint32_t                    ring_wpos_byframes;
     uint32_t                    ring_size_byframes;
     uint32_t                    period_size_byframes;
@@ -380,8 +403,56 @@ struct hws_audio{
 };
 	
 
+/*
+ * Per-channel frame pipeline timing stats (timing_debug module param).
+ * Counters are reset once per second by the status thread. Updates from
+ * irq/irq-thread/worker are not serialized against the reset; good enough
+ * for diagnostics.
+ */
+struct hws_timing_stats {
+	atomic_t	frames_in;	/* complete frames committed to the ring */
+	atomic_t	frames_out;	/* frames handed to at least one app buffer */
+	atomic_t	irq_busy_skip;	/* IRQ while the IRQ thread still copying (it reruns, nothing lost) */
+	atomic_t	stale_half;	/* half-frame not rewritten by hardware */
+	atomic_t	dma_overrun;	/* half overwritten by the card before/while we copied it */
+	atomic_t	direct;		/* frames delivered straight from DMA into app buffers */
+	atomic_t	ring_overwrite;	/* unread ring slot overwritten (worker behind) */
+	atomic_t	wq_coalesced;	/* queue_work while still pending -> frame skipped */
+	atomic_t	no_app_buf;	/* frame ready but app had no buffer queued */
+	atomic_t	worker_empty;	/* worker ran but found no ready slot */
+	atomic_t	ring_skip;	/* ready frames skipped: more backlog than app buffers */
+	u64		last_frame_ns;
+	u64		interval_min;
+	u64		interval_max;
+	u64		copy_lat_max;	/* IRQ -> frame committed */
+	u64		wq_lat_max;		/* frame IRQ -> worker picked it */
+	u64		lock_hold_max;		/* worker time with videoslock held, IRQs off */
+	int		backlog_max;		/* ready slots waiting when worker ran */
+	u64		window_start_ns;
+};
+
 struct hws_pcie_dev {
 	struct pci_dev			*pdev;
+	struct kref			kref;		/* probe + one per registered v4l2_device */
+	spinlock_t			reg_lock;	/* read-modify-write of shared control registers */
+	bool				removing;	/* hws_remove() started, hardware is going away */
+	bool				regions_requested;
+	int				m_lost_reads;	/* status thread: consecutive all-ones reads */
+	int				m_recovered;	/* status thread: card came back, re-arm channels */
+	struct mutex			pm_lock;	/* suspend/resume vs. engine start/stop; nests inside engine_lock */
+	bool				suspended;	/* pm_lock */
+	int				nr_v4l2_registered;	/* channels with a registered v4l2_device */
+	unsigned long			m_half_pending[MAX_VID_CHANNELS];	/* bit n: half n done, not yet copied */
+	atomic64_t			m_half_ts[MAX_VID_CHANNELS][2];	/* IRQ time per half; atomic64: no tearing on 32-bit */
+	u32				m_half_cnt[MAX_VID_CHANNELS][2];	/* completed-IRQ count per half */
+	u32				m_half_peer[MAX_VID_CHANNELS][2];	/* other half's count at that IRQ */
+	u32				m_half1_cnt[MAX_VID_CHANNELS];	/* count of the first half copied for the current frame */
+	/* direct-to-buffer path: app buffers being filled straight from DMA (IRQ thread) */
+	struct mutex			direct_lock[MAX_VID_CHANNELS];
+	struct list_head		direct_bufs[MAX_VID_CHANNELS];
+	int				direct_out_size[MAX_VID_CHANNELS];
+	bool				direct_frame[MAX_VID_CHANNELS];	/* first half of the frame in flight went direct */
+	struct hws_timing_stats		tstats[MAX_VID_CHANNELS];
 	struct uio_info info;
 	struct hws_audio		audio[MAX_VID_CHANNELS];
 	struct hws_video		video[MAX_VID_CHANNELS];
@@ -394,9 +465,11 @@ struct hws_pcie_dev {
 	struct workqueue_struct *wq;
 	struct workqueue_struct *auwq;
 	unsigned long video_data[MAX_VID_CHANNELS];
- 	struct tasklet_struct dpc_video_tasklet[MAX_VID_CHANNELS];
  	unsigned long audio_data[MAX_VID_CHANNELS];
- 	struct tasklet_struct dpc_audio_tasklet[MAX_VID_CHANNELS];
+	unsigned long			m_audio_pending[MAX_VID_CHANNELS];	/* bit n: audio half n done */
+	atomic64_t			m_audio_half_ts[MAX_VID_CHANNELS][2];
+	u32				m_fmt_gen[MAX_VID_CHANNELS];	/* bumped on every input size change */
+	u32				m_half1_gen[MAX_VID_CHANNELS];	/* m_fmt_gen when the first half was copied */
 	//-----------------------------
 	//spinlock_t lock; /* guards command register accesses */
 	int irq_count;	/* interrupt counter */	
