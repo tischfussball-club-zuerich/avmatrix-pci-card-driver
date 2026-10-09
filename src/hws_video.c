@@ -124,12 +124,19 @@ static void hws_tstat_report(struct hws_pcie_dev *pdx)
 		u64 elapsed_ms = div_u64(now - ts->window_start_ns, NSEC_PER_MSEC);
 		unsigned int in = atomic_xchg(&ts->frames_in, 0);
 		unsigned int out = atomic_xchg(&ts->frames_out, 0);
+		/* frames the card completed (one second-half interrupt each) vs.
+		 * frames the driver committed: more interrupts = frames lost in the driver */
+		u32 c0 = READ_ONCE(pdx->m_half_cnt[ch][0]);
+		u32 card = c0 - ts->last_half0_cnt;
+
+		ts->last_half0_cnt = c0;
 
 		if (pdx->m_bVCapStarted[ch] && elapsed_ms > 0)
-			pr_info("HwsCapture ch%d: in %llu fps (hw %u) out %llu fps | irq_busy %d stale_half %d dma_overrun %d unpaired %d direct %d overwrite %d skip %d wq_coalesced %d no_app_buf %d empty %d | interval %llu-%llu us, copy_lat %llu us, wq_lat %llu us, lock_hold %llu us, backlog %d\n",
+			pr_info("HwsCapture ch%d: in %llu fps (hw %u) out %llu fps | frames card %u in %u | irq_busy %d stale_half %d dma_overrun %d unpaired %d direct %d overwrite %d skip %d wq_coalesced %d no_app_buf %d empty %d | interval %llu-%llu us, copy_lat %llu us, wq_lat %llu us, lock_hold %llu us, backlog %d\n",
 				ch, div64_u64((u64)in * 1000, elapsed_ms),
 				pdx->m_pVCAPStatus[ch][0].dwFrameRate,
 				div64_u64((u64)out * 1000, elapsed_ms),
+				card, in,
 				atomic_read(&ts->irq_busy_skip), atomic_read(&ts->stale_half),
 				atomic_read(&ts->dma_overrun), atomic_read(&ts->unpaired), atomic_read(&ts->direct),
 				atomic_read(&ts->ring_overwrite), atomic_read(&ts->ring_skip),
@@ -3792,6 +3799,7 @@ static int StartVideoCapture(struct hws_pcie_dev *pdx,int index)
 	/* counted from the same moment, or the first report shows inflated rates */
 	atomic_set(&pdx->tstats[index].frames_in, 0);
 	atomic_set(&pdx->tstats[index].frames_out, 0);
+	pdx->tstats[index].last_half0_cnt = READ_ONCE(pdx->m_half_cnt[index][0]);
 	pdx->m_VideoInfo[index].dwisRuning = 1;
 	pdx->m_VideoInfo[index].m_nVideoIndex =0;
 	pdx->m_nVideoHalfDone[index] = 0;

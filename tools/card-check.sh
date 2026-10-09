@@ -118,6 +118,7 @@ if [ ${#sig_nodes[@]} -gt 0 ]; then
 	thr() { local p t=0; for p in $(pgrep '^hws-(copy|conv)'); do
 			t=$((t + $(awk '{ print $14 + $15 }' /proc/$p/stat 2>/dev/null || echo 0))); done; echo $t; }
 	read -r tot0 idle0 < <(cpu); thr0=$(thr)
+	par_start=$(dmesg 2>/dev/null | wc -l)
 	pids=()
 	for d in "${sig_nodes[@]}"; do
 		n=$(awk -v f="${FPS[$d]}" -v t="$DUR" 'BEGIN { printf "%d", f * t }')
@@ -143,6 +144,21 @@ if [ ${#sig_nodes[@]} -gt 0 ]; then
 	busy=$(awk -v t=$((tot1 - tot0)) -v i=$((idle1 - idle0)) 'BEGIN { printf "%.0f", t ? 100 * (t - i) / t : 0 }')
 	drv=$(awk -v d=$((thr1 - thr0)) -v hz="$(getconf CLK_TCK)" -v s="$DUR" 'BEGIN { printf "%.1f", 100 * d / hz / s }')
 	say "   CPU: whole system ${busy}% busy ($(nproc) cores); the driver's copy/conversion threads used ${drv}% of one core"
+	# frames the card completed vs. frames the driver took in (timing_debug=1):
+	# equal = a late frame never came from the card; more card frames = lost in the driver
+	if [ $dmesg_ok = 1 ]; then
+		cmp=$(dmesg | tail -n +$((par_start + 1)) | awk '
+			/HwsCapture ch[0-9]+: in .*frames card [0-9]+ in [0-9]+/ {
+				ch = $0; sub(/.*HwsCapture /, "", ch); sub(/:.*/, "", ch)
+				m = $0; sub(/.*frames card /, "", m); split(m, v, /[ |]+/)
+				card[ch] += v[1]; got[ch] += v[3]; seen[ch] = 1 }
+			END { for (ch in seen) printf "%s %d %d\n", ch, card[ch], got[ch] }' | sort)
+		while read -r ch c g; do
+			[ -n "$ch" ] || continue
+			if [ $((c - g)) -gt 2 ]; then bad "$ch: the card completed $c frames, the driver took in $g: $((c - g)) lost in the driver"
+			else say "   $ch: the card completed $c frames, the driver took in $g (late frames came late from the card)"; fi
+		done <<< "$cmp"
+	fi
 else
 	say "== all at once: skipped, no channel has a signal"
 	for c in $cards; do

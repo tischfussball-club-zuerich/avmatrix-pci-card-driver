@@ -427,6 +427,7 @@ struct hws_timing_stats {
 	u64		lock_hold_max;		/* worker time with videoslock held, IRQs off */
 	int		backlog_max;		/* ready slots waiting when worker ran */
 	u64		window_start_ns;
+	u32		last_half0_cnt;	/* second-half interrupts seen at the last report */
 };
 
 struct hws_pcie_dev {
