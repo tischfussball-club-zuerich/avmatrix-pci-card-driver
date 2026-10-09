@@ -42,7 +42,8 @@ fi
 remove_module ()
 {
     KERNEL_VERSION=`uname -r`
-    MODULE_PATH=`find /lib/modules/$KERNEL_VERSION -name ${MODULE_NAME}.ko`
+    # MODULE_NAME is also the DKMS name ("HwsCapture.ko"); the file itself is HwsCapture.ko
+    MODULE_PATH=`find /lib/modules/$KERNEL_VERSION -name HwsCapture.ko`
     echo_string_nonewline "[${MODULE_NAME}]Removing $MODULE_PATH ... "
     rm -vf $MODULE_PATH >> $LOGFILE 2>&1
     RET=$?
