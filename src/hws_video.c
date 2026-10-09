@@ -287,6 +287,16 @@ static const framegrabber_pixfmt_t *framegrabber_g_support_pixelfmt_by_fourcc(u3
 	return &support_pixfmts[pixfmt_index];
 }
 
+/* every format reply carries complete colorimetry, never a caller's leftovers */
+static void hws_fill_colorimetry(struct v4l2_pix_format *pix)
+{
+	pix->colorspace = V4L2_COLORSPACE_REC709;
+	pix->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
+	pix->quantization = V4L2_QUANTIZATION_DEFAULT;
+	pix->xfer_func = V4L2_XFER_FUNC_DEFAULT;
+	pix->flags = 0;
+}
+
 static int hws_vidioc_querycap(struct file *file, void *priv, struct v4l2_capability *cap)
 {
 	struct hws_video *videodev = video_drvdata(file);
@@ -314,10 +324,6 @@ static int hws_vidioc_enum_fmt_vid_cap(struct file *file, void *priv_fh,struct v
 	if(videodev)
 	{
 		const framegrabber_pixfmt_t *pixfmt;
-		if(f->index <0)
-		{
-			return -EINVAL;
-		}
 		if(f->index >= FRAMEGRABBER_PIXFMT_MAX)
 		{
 			return -EINVAL;
@@ -354,7 +360,7 @@ static int hws_vidioc_g_fmt_vid_cap(struct file *file, void *fh, struct v4l2_for
 		fmt->fmt.pix.pixelformat  = pixfmt->fourcc;
 		fmt->fmt.pix.bytesperline = (fmt->fmt.pix.width * pixfmt->depth) >> 3;
 		fmt->fmt.pix.sizeimage =	fmt->fmt.pix.height * fmt->fmt.pix.bytesperline;
-		fmt->fmt.pix.colorspace = V4L2_COLORSPACE_REC709;
+		hws_fill_colorimetry(&fmt->fmt.pix);
 		return 0;
 	}
 
@@ -414,7 +420,7 @@ static int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_f
 		pix->height=pModeTiming->frame_size.height;
 		pix->bytesperline = (pix->width * fmt->depth) >> 3;
 		pix->sizeimage =pix->height * pix->bytesperline;
-		pix->colorspace = V4L2_COLORSPACE_REC709;//V4L2_COLORSPACE_SMPTE170M;
+		hws_fill_colorimetry(pix);
 		pix->priv = 0;
 		return 0;
 	}
@@ -423,7 +429,7 @@ static int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_f
 	pix->height=pModeTiming->frame_size.height;
 	pix->bytesperline = (pix->width * fmt->depth) >> 3;
 	pix->sizeimage =pix->height * pix->bytesperline;
-	pix->colorspace = V4L2_COLORSPACE_REC709;//V4L2_COLORSPACE_SMPTE170M;
+	hws_fill_colorimetry(pix);
 	pix->priv = 0;
 
 	return 0;
@@ -544,8 +550,8 @@ static int hws_vidioc_enum_input(struct file *file, void *priv,struct v4l2_input
 	if (i->index != 0)
 		return -EINVAL;
 	i->type = V4L2_INPUT_TYPE_CAMERA;
-	strscpy(i->name, KBUILD_MODNAME, sizeof(i->name));
-	i->std = 0;	/* HDMI: no analog TV standard */
+	strscpy(i->name, "HDMI/SDI", sizeof(i->name));
+	i->std = 0;	/* digital input: no analog TV standard */
 	i->capabilities = 0;
 	i->status = READ_ONCE(videodev->dev->m_curr_No_Video[videodev->index]) ? V4L2_IN_ST_NO_SIGNAL : 0;
 
@@ -554,18 +560,8 @@ static int hws_vidioc_enum_input(struct file *file, void *priv,struct v4l2_input
 
 static int hws_vidioc_g_input(struct file *file, void *priv, unsigned int *i)
 {
-	int Index;
-	Index = *i;
-
-if(Index >0)
-{
-	return   -EINVAL;
-}
-else
-{
-	*i = 0;
-}
-return 0;
+	*i = 0;	/* one input */
+	return 0;
 }
 
 static int hws_vidioc_s_input(struct file *file, void *priv, unsigned int i)
@@ -981,8 +977,7 @@ static const struct v4l2_ioctl_ops hws_ioctl_fops = {
 	.vidioc_enum_input = hws_vidioc_enum_input,
 	.vidioc_g_input = hws_vidioc_g_input,
 	.vidioc_s_input = hws_vidioc_s_input,
-	//.vidioc_log_status = vidioc_log_status,
-	//.vidioc_subscribe_event = v4l2_ctrl_subscribe_event,
+	.vidioc_log_status = v4l2_ctrl_log_status,
 	//.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
 	.vidioc_g_parm = hws_vidioc_g_parm,
 	.vidioc_s_parm = hws_vidioc_s_parm,
@@ -1010,8 +1005,8 @@ static int hws_queue_setup_multi(struct vb2_queue *q,
     spin_unlock_irqrestore(&pdx->videoslock[videodev->index], flags);
 
     if (*num_planes) {
-        /* larger than the biggest frame twice over is only a way to eat memory */
-        if (sizes[0] < size || sizes[0] > PAGE_ALIGN(MAX_VIDEO_SCLAER_SIZE))
+        /* single plane; larger than the biggest frame twice over is only a way to eat memory */
+        if (*num_planes != 1 || sizes[0] < size || sizes[0] > 2 * PAGE_ALIGN(MAX_VIDEO_SCLAER_SIZE))
             return -EINVAL;
         return 0;
     }
@@ -2923,7 +2918,7 @@ static struct snd_pcm_hardware audio_pcm_hardware = {
 	.rate_max 			=	48000,
 	.channels_min 		=	2,
 	.channels_max 		=	2,
-	.buffer_bytes_max 	=	64*1024,
+	.buffer_bytes_max 	=	128*1024,	/* ~680 ms */
 	/* the card delivers 4096-byte packets; smaller periods can't be honoured */
 	.period_bytes_min 	=	4096,
 	.period_bytes_max 	=	16*1024,
@@ -2934,11 +2929,17 @@ static int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 {
 	struct hws_audio *drv = snd_pcm_substream_chip(substream);
 	struct snd_pcm_runtime *runtime = substream->runtime;
-
-
 	unsigned long flags;
+	int err;
 
 	runtime->hw = audio_pcm_hardware;
+	/* the card delivers 1024-frame packets: periods of whole packets, whole periods per buffer */
+	err = snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
+	if (err < 0)
+		return err;
+	err = snd_pcm_hw_constraint_step(runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_SIZE, 1024);
+	if (err < 0)
+		return err;
 	spin_lock_irqsave(&drv->ring_lock, flags);
 	drv->sample_rate_out        = 48000;
 	drv->channels               = 2;
@@ -3085,7 +3086,7 @@ static int hws_audio_register(struct hws_pcie_dev *dev)
 		card->private_free = hws_snd_card_free;
 		strscpy(card->driver, KBUILD_MODNAME, sizeof(card->driver));
 		strscpy(card->shortname, audioname, sizeof(card->shortname));
-		strscpy(card->longname, card->shortname, sizeof(card->longname));
+		snprintf(card->longname, sizeof(card->longname), "%s at %s", audioname, pci_name(dev->pdev));
 
 		ret = snd_pcm_new(card,pcm_name,0,0,1,&pcm);
 		if (ret < 0){

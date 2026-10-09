@@ -132,7 +132,7 @@ lsmod | grep HwsCapture            # module loaded
 dkms status                        # (DKMS install) shows HwsCapture.ko ... installed
 v4l2-ctl --list-devices            # one "HVideo N" entry per channel (package v4l-utils)
 arecord -l                         # one "HAudio N" card per channel
-sudo dmesg | grep -iE 'hws|MV360'  # driver messages, e.g. the detected PCI device
+sudo dmesg | grep -i hwscapture     # driver messages, e.g. the detected card
 ```
 
 ### Optional: PipeWire / PulseAudio device names
@@ -231,7 +231,14 @@ sudo depmod -a
    setup `in` and `out` match the input frame rate and `dma_overrun`,
    `overwrite` and `skip` stay at 0. `direct` counts frames that took the
    fast path.
-3. For a deeper analysis run `sudo tools/stutter-monitor.py --device /dev/video0`
+3. Run `tools/card-check.sh` with a source connected. Per channel it runs
+   `v4l2-compliance`, a 10 s capture that counts lost and late frames, and a
+   short audio capture, and it lists problem messages from the kernel log. It
+   only reads from the devices. Expected: `v4l2-compliance` reports failures
+   only in its multi-open tests ("a second open can't request buffers or
+   stream"); this driver deliberately gives every application its own queue,
+   so several apps can capture the same channel.
+4. For a deeper analysis run `sudo tools/stutter-monitor.py --device /dev/video0`
    while capturing; it reports dropped, duplicated and late frames together
    with likely system causes (interrupt rate, saturated or throttled CPUs,
    CPU/memory/IO pressure, busy application threads, kernel errors).
@@ -391,6 +398,7 @@ compile tests; none of it has been confirmed on a card yet.
   injection, ThreadSanitizer). Run `tools/driver-tests/verify.sh src`; see its
   README.
 - `tools/stutter-monitor.py`: frame pacing and system monitor (above).
+- `tools/card-check.sh`: checks on the real card (above).
 - `doc/`: the vendor's original user guide.
 
 Licensed under the GPL (see `MODULE_LICENSE` in the source).
