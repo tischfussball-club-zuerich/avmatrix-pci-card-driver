@@ -12,7 +12,7 @@
 #
 #   tools/test-on-card.sh            # test, then restore the original driver
 #   tools/test-on-card.sh --keep     # leave the new driver loaded afterwards
-#   DUR=30 tools/test-on-card.sh     # longer captures per channel
+#   DUR=60 tools/test-on-card.sh     # longer captures (each phase)
 #
 # A reboot always brings back the installed driver.
 set -u
@@ -139,7 +139,7 @@ sudo dmesg | tail -n +$((DMESG_START + 1)) | grep -i hwscapture | sed 's/^/   /'
 
 # ---------------------------------------------------------------- test
 say ""
-sudo env DUR="${DUR:-10}" "$HERE/tools/card-check.sh"
+sudo env DUR="${DUR:-10}" ${SCALE_DUR:+SCALE_DUR=$SCALE_DUR} SKIP_COMPLIANCE="${SKIP_COMPLIANCE:-0}" "$HERE/tools/card-check.sh"
 rc=$?
 
 say ""

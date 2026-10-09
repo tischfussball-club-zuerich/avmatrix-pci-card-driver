@@ -239,10 +239,14 @@ sudo depmod -a
    Nothing is installed; a log file is written
    to the current directory. `--keep` leaves the new driver loaded for manual
    testing until `sudo rmmod HwsCapture` or a reboot.
-3. Run `tools/card-check.sh` with a source connected. Per channel it runs
-   `v4l2-compliance`, a 10 s capture that counts lost and late frames, and a
-   short audio capture, and it lists problem messages from the kernel log. It
-   only reads from the devices. Expected: `v4l2-compliance` reports failures
+3. Run `tools/card-check.sh` with a source connected (`DUR=60` for longer
+   captures). Per channel it runs `v4l2-compliance`, a capture at the input
+   size and one scaled to another size, counting lost and late frames. Then
+   it captures all channels with a signal and audio on every card at the same
+   time and reports the CPU use, and finally the driver's drop counters and
+   problem messages from the kernel log. Format and controls are restored
+   afterwards. `SKIP_COMPLIANCE=1` leaves out `v4l2-compliance`, e.g. to
+   compare with another driver. Expected: `v4l2-compliance` reports failures
    only in its multi-open tests ("a second open can't request buffers or
    stream"); this driver deliberately gives every application its own queue,
    so several apps can capture the same channel.
