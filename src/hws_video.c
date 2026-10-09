@@ -126,12 +126,12 @@ static void hws_tstat_report(struct hws_pcie_dev *pdx)
 		unsigned int out = atomic_xchg(&ts->frames_out, 0);
 
 		if (pdx->m_bVCapStarted[ch] && elapsed_ms > 0)
-			pr_info("HwsCapture ch%d: in %llu fps (hw %u) out %llu fps | irq_busy %d stale_half %d dma_overrun %d direct %d overwrite %d skip %d wq_coalesced %d no_app_buf %d empty %d | interval %llu-%llu us, copy_lat %llu us, wq_lat %llu us, lock_hold %llu us, backlog %d\n",
+			pr_info("HwsCapture ch%d: in %llu fps (hw %u) out %llu fps | irq_busy %d stale_half %d dma_overrun %d unpaired %d direct %d overwrite %d skip %d wq_coalesced %d no_app_buf %d empty %d | interval %llu-%llu us, copy_lat %llu us, wq_lat %llu us, lock_hold %llu us, backlog %d\n",
 				ch, div64_u64((u64)in * 1000, elapsed_ms),
 				pdx->m_pVCAPStatus[ch][0].dwFrameRate,
 				div64_u64((u64)out * 1000, elapsed_ms),
 				atomic_read(&ts->irq_busy_skip), atomic_read(&ts->stale_half),
-				atomic_read(&ts->dma_overrun), atomic_read(&ts->direct),
+				atomic_read(&ts->dma_overrun), atomic_read(&ts->unpaired), atomic_read(&ts->direct),
 				atomic_read(&ts->ring_overwrite), atomic_read(&ts->ring_skip),
 				atomic_read(&ts->wq_coalesced),
 				atomic_read(&ts->no_app_buf), atomic_read(&ts->worker_empty),
@@ -145,6 +145,7 @@ static void hws_tstat_report(struct hws_pcie_dev *pdx)
 		atomic_set(&ts->irq_busy_skip, 0);
 		atomic_set(&ts->stale_half, 0);
 		atomic_set(&ts->dma_overrun, 0);
+		atomic_set(&ts->unpaired, 0);
 		atomic_set(&ts->direct, 0);
 		atomic_set(&ts->ring_overwrite, 0);
 		atomic_set(&ts->ring_skip, 0);
@@ -1261,7 +1262,10 @@ static void audio_data_process(struct work_struct *p_work)
 		spin_unlock_irqrestore(&pdx->audiolock[dwAudioCh], flags);
 
 		if (bBuf && aud_len > 0)
+		{
+			WRITE_ONCE(drv->last_real_ns, ktime_get_ns());
 			_deliver_samples(drv, bBuf, aud_len);
+		}
 
 		spin_lock_irqsave(&pdx->audiolock[dwAudioCh], flags);
 		if (ai->pStatusInfo[nIndex].byLock == MEM_READING)
@@ -2949,10 +2953,64 @@ static int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 	return 0;
 }
 
-/* deliveries run in the IRQ thread: wait for one in progress */
+static const u8 hws_silence[MAX_DMA_AUDIO_PK_SIZE];
+
+/*
+ * While a capture runs: if the card sends no audio (no signal, or a source
+ * without audio), deliver silent packets at the card's own pace so the stream
+ * keeps moving - otherwise apps see it stall and fail with an I/O error.
+ * Stops by itself once real packets arrive again or the stream stops.
+ */
+static void hws_audio_silence_work(struct work_struct *work)
+{
+	struct hws_audio *drv = container_of(to_delayed_work(work), struct hws_audio, silence_work);
+	struct hws_pcie_dev *pdx = drv->dev;
+	unsigned int bytes = min_t(unsigned int, pdx->m_dwAudioPTKSize, sizeof(hws_silence));
+	u64 pkt_ns = div_u64((u64)(bytes / 4) * NSEC_PER_SEC, 48000);	/* S16 stereo: 4 bytes per frame */
+	u64 last = READ_ONCE(drv->last_real_ns), now = ktime_get_ns();	/* last first: now >= last */
+	/*
+	 * No signal: the card sends nothing, fill at once. With a signal, a gap
+	 * is usually just late delivery - inserting silence then would push the
+	 * audio behind the video for good - so only a long one (a source without
+	 * audio) is filled.
+	 */
+	u64 gap_ns = READ_ONCE(pdx->m_curr_No_Video[drv->index]) ? 3 * pkt_ns : 250 * NSEC_PER_MSEC;
+	unsigned long flags;
+	bool running, filling;
+	int n;
+
+	spin_lock_irqsave(&drv->ring_lock, flags);
+	running = drv->running;
+	spin_unlock_irqrestore(&drv->ring_lock, flags);
+	if (!running || !pkt_ns)
+		return;
+	filling = (s64)(now - last) > (s64)gap_ns;
+	if (filling)
+	{
+		/* continue where the card stopped; after a long gap don't burst */
+		if ((s64)(drv->silence_next_ns - (last + pkt_ns)) < 0)
+			drv->silence_next_ns = last + pkt_ns;
+		if ((s64)(now - drv->silence_next_ns) > (s64)(8 * pkt_ns))	/* signed: "next" is usually ahead */
+			drv->silence_next_ns = now - 4 * pkt_ns;
+		for (n = 0; n < 8 && (s64)(now - drv->silence_next_ns) >= 0; n++)
+		{
+			if (READ_ONCE(drv->last_real_ns) != last)
+				break;	/* the card is sending again */
+			_deliver_samples(drv, hws_silence, bytes);
+			drv->silence_next_ns += pkt_ns;
+		}
+	}
+	/* filling: every packet; real audio flowing: just look again in a while */
+	queue_delayed_work(pdx->wq, &drv->silence_work,
+			   max_t(unsigned long, 1, nsecs_to_jiffies(filling ? pkt_ns : 2 * pkt_ns)));
+}
+
+/* deliveries run in the IRQ thread and the silence work: wait for one in progress */
 static void hws_audio_sync(struct hws_audio *drv)
 {
 	struct hws_pcie_dev *pdx = drv->dev;
+
+	cancel_delayed_work_sync(&drv->silence_work);	/* running is false by now: it doesn't re-arm */
 
 	/* irq_lock: remove can't free (and reuse) the IRQ in between */
 	mutex_lock(&pdx->irq_lock);
@@ -3021,6 +3079,11 @@ static int hws_pcie_audio_trigger(struct snd_pcm_substream *substream, int cmd)
 			chip->period_used_byframes = 0;
 			chip->running = true;
 			spin_unlock_irqrestore(&chip->ring_lock, flags);
+			WRITE_ONCE(chip->last_real_ns, ktime_get_ns());
+			chip->silence_next_ns = 0;
+			/* not racing a cancel: ALSA's prepare (which cancels synchronously)
+			 * always comes between a STOP and the next START */
+			mod_delayed_work(dev->wq, &chip->silence_work, msecs_to_jiffies(64));
 			break;
 		case SNDRV_PCM_TRIGGER_STOP:
 		case SNDRV_PCM_TRIGGER_SUSPEND:
@@ -3463,6 +3526,8 @@ static void hws_dev_release(struct kref *kref)
 		kthread_destroy_worker(pdx->conv_worker[i]);
 		pdx->conv_worker[i] = NULL;
 	}
+	for (i = 0; pdx->wq && i < MAX_VID_CHANNELS; i++)
+		cancel_delayed_work_sync(&pdx->audio[i].silence_work);
 	if (pdx->wq)
 		destroy_workqueue(pdx->wq);
 	pci_dev_put(pdx->pdev);
@@ -3550,6 +3615,7 @@ static void hws_quiesce(struct hws_pcie_dev *dev)
 		kthread_cancel_work_sync(&dev->video[i].videowork);
 		kthread_cancel_delayed_work_sync(&dev->video[i].nosig_work);
 		cancel_work_sync(&dev->audio[i].audiowork);
+		cancel_delayed_work_sync(&dev->audio[i].silence_work);
 	}
 }
 
@@ -3723,6 +3789,9 @@ static int StartVideoCapture(struct hws_pcie_dev *pdx,int index)
 	pdx->tstats[index].last_frame_ns = 0;
 	pdx->tstats[index].interval_min = U64_MAX;
 	pdx->tstats[index].window_start_ns = ktime_get_ns();
+	/* counted from the same moment, or the first report shows inflated rates */
+	atomic_set(&pdx->tstats[index].frames_in, 0);
+	atomic_set(&pdx->tstats[index].frames_out, 0);
 	pdx->m_VideoInfo[index].dwisRuning = 1;
 	pdx->m_VideoInfo[index].m_nVideoIndex =0;
 	pdx->m_nVideoHalfDone[index] = 0;
@@ -4225,6 +4294,7 @@ static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder,int mVideoB
 			   t_irq - pdx->m_half1_ts[nDecoder] >
 			   max_t(u64, 2 * hws_frame_period_ns(pdx, nDecoder), 50 * NSEC_PER_MSEC))
 			{
+				atomic_inc(&pdx->tstats[nDecoder].unpaired);
 				pdx->m_nVideoHalfDone[nDecoder] =0;
 				hws_put_mark(pMask);
 				return -1;
@@ -5571,6 +5641,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		gdev->audio[i].dev = gdev;
 		spin_lock_init(&gdev->audio[i].ring_lock);
 		INIT_WORK(&gdev->audio[i].audiowork,audio_data_process);
+		INIT_DELAYED_WORK(&gdev->audio[i].silence_work, hws_audio_silence_work);
 	}
 	/*
 	 * High priority so frame delivery isn't delayed behind ordinary kernel
@@ -5712,6 +5783,7 @@ static int __maybe_unused hws_suspend(struct device *dev)
 		kthread_flush_work(&pdx->video[i].videowork);
 		kthread_cancel_delayed_work_sync(&pdx->video[i].nosig_work);
 		flush_work(&pdx->audio[i].audiowork);
+		cancel_delayed_work_sync(&pdx->audio[i].silence_work);
 	}
 	mutex_unlock(&pdx->pm_lock);
 	return 0;

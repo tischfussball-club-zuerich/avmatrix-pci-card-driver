@@ -27,7 +27,9 @@ UndefinedBehaviorSanitizer and ThreadSanitizer, and python3.
   at real interrupt timing with 2 channels and 5 apps that keep stopping and
   restarting (one of them a display-style app with 2 buffers that keeps its
   frame until the next one arrives; at 60 fps it must get at least 75% of
-  the frames), plus signal loss and resolution changes. Every delivered
+  the frames), plus signal loss and resolution changes. An ALSA capture
+  runs on a channel whose card sends no audio; it must keep moving with
+  silence at 48 kHz (95-105% of the rate). Every delivered
   buffer is checked: no torn frame, no duplicate, frames in order,
   sequence/timestamp increasing, every buffer back after STREAMOFF and none
   completed after it.

@@ -377,6 +377,11 @@ struct hws_audio{
 	struct snd_card 		*card;
 	struct snd_pcm_substream *substream;
 	struct work_struct		audiowork;
+	/* no packets from the card (no signal, or a source without audio): silence
+	 * keeps the stream moving instead of stalling into an I/O error */
+	struct delayed_work		silence_work;
+	u64				last_real_ns;	/* last packet from the card */
+	u64				silence_next_ns;	/* silence_work only: next silent packet due */
 	int						pos;
 	int						index;
 	int                         ring_offsize;
@@ -413,6 +418,7 @@ struct hws_timing_stats {
 	atomic_t	no_app_buf;	/* frame ready but app had no buffer queued */
 	atomic_t	worker_empty;	/* worker ran but found no ready slot */
 	atomic_t	ring_skip;	/* ready frames skipped: more backlog than app buffers */
+	atomic_t	unpaired;	/* second half without a usable first half (pairing rejected it) */
 	u64		last_frame_ns;
 	u64		interval_min;
 	u64		interval_max;

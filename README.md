@@ -369,6 +369,9 @@ compile tests; none of it has been confirmed on a card yet.
   0.77→0.53 ms, NV12 1080p 0.65→0.37 ms per frame.
 - **No signal:** nothing is copied from the card while there's no signal,
   and the "no signal" picture is limited to ~30 fps.
+- **Audio without a signal:** the card sends no audio then, so the ALSA
+  stream stalled and applications got an I/O error after ~10 s. The driver
+  now delivers silence at the normal 48 kHz pace until audio returns.
 - **Several applications on one channel:** up to three are served directly
   by the channel's copy thread; an application that queues a buffer while a
   frame is already arriving still gets that frame.

@@ -36,6 +36,9 @@ for mode in race logic nodirect irqfaults; do for f in 60 240 480; do
 		p=$(grep -o "frames: [0-9]*%" $o | grep -o "[0-9]*"); echo "    steady 2-buffer app got ${p:-?}% of the frames"
 		[ "${p:-0}" -ge 75 ] || { echo "    !! steady 2-buffer app got only ${p:-0}% of the frames"; fail=1; }
 	fi
+	# a capture with no audio from the card must keep moving with silence at 48 kHz
+	a=$(grep -o "expected [0-9]*: [0-9]*%" $o | grep -o "[0-9]*%" | tr -d %); echo "    audio without card audio ran at ${a:-?}% of 48 kHz"
+	[ "${a:-0}" -ge 95 ] && [ "${a:-0}" -le 105 ] || { echo "    !! silent audio stream at ${a:-?}% of its rate"; fail=1; }
 	scan $o; [ $rc = 0 ] || fail=1
 done; done
 unset SIM_DMA_LOCK SIM_NO_DIRECT SIM_LOSE_IRQ SIM_DUP_IRQ

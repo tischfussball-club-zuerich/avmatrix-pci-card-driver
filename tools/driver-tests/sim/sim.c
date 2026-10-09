@@ -137,6 +137,7 @@ static void *sim_memcpy(void *d, const void *s, size_t n)
 #define memcpy sim_memcpy
 /* resume/re-init is not simulated (needs the PCI core) */
 static void hws_hw_bringup(struct hws_pcie_dev *p) { (void)p; }
+static const u8 hws_silence[MAX_DMA_AUDIO_PK_SIZE];	/* a variable: not extracted with the functions */
 #include "core.inc"
 #undef memcpy
 
@@ -1049,6 +1050,7 @@ int main(int argc, char **argv)
 		pdx->audio[ch].index = ch;
 		spin_lock_init(&pdx->audio[ch].ring_lock);
 		INIT_WORK(&pdx->audio[ch].audiowork, audio_data_process);
+		INIT_DELAYED_WORK(&pdx->audio[ch].silence_work, hws_audio_silence_work);
 		if (ch < NCH) {
 			pdx->m_pbyVideoBuffer[ch] = calloc(1, MAX_MM_VIDEO_SIZE);
 			pdx->m_pbyAudioBuffer[ch] = pdx->m_pbyVideoBuffer[ch] + MAX_MM_VIDEO_SIZE - MAX_AUDIO_CAP_SIZE;
@@ -1083,7 +1085,47 @@ int main(int argc, char **argv)
 	for (i = 0; i < ncons; i++)
 		pthread_create(&ct[i], NULL, consumer_thread, &cons[i]);
 
+	/*
+	 * Audio with no audio from the card (the simulated card sends none outside
+	 * hostile mode): an ALSA capture on ch1 must keep moving with silence at
+	 * the card's pace instead of stalling. 1024-frame periods at 48 kHz.
+	 */
+	u64 silence_t0 = 0;
+	if (!hostile) {
+		struct hws_audio *drv = &pdx->audio[1];
+		unsigned long fl;
+		fake_rt[1].dma_area = calloc(16384, 4);
+		fake_rt[1].buffer_size = 16384;
+		fake_rt[1].period_size = 1024;
+		fake_sub[1].runtime = &fake_rt[1];
+		spin_lock_irqsave(&drv->ring_lock, fl);
+		drv->substream = &fake_sub[1];
+		drv->channels = 2;
+		drv->ring_size_byframes = 16384;
+		drv->period_size_byframes = 1024;
+		drv->ring_wpos_byframes = 0;
+		drv->period_used_byframes = 0;
+		drv->running = true;
+		spin_unlock_irqrestore(&drv->ring_lock, fl);
+		/* as trigger START does */
+		silence_t0 = ktime_get_ns();
+		WRITE_ONCE(drv->last_real_ns, silence_t0);
+		drv->silence_next_ns = 0;
+		mod_delayed_work(pdx->wq, &drv->silence_work, 64);
+	}
 	sleep(seconds);
+	if (!hostile) {
+		struct hws_audio *drv = &pdx->audio[1];
+		unsigned long fl;
+		double secs = (ktime_get_ns() - silence_t0) / 1e9;
+		long got = atomic_load(&periods_elapsed);
+		spin_lock_irqsave(&drv->ring_lock, fl);
+		drv->running = false;
+		spin_unlock_irqrestore(&drv->ring_lock, fl);
+		cancel_delayed_work_sync(&drv->silence_work);
+		printf("audio without card audio: %ld periods in %.1f s, expected %.0f: %.0f%%\n",
+		       got, secs, secs * 48000 / 1024, 100.0 * got / (secs * 48000 / 1024));
+	}
 	atomic_store(&run, false);
 	for (i = 0; i < ncons; i++)
 		pthread_join(ct[i], NULL);

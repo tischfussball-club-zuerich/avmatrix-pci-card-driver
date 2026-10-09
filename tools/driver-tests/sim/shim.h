@@ -64,6 +64,8 @@ extern atomic_long sim_ratelimited_warnings;
 #define smp_store_release(p, v) do { atomic_thread_fence(memory_order_release); WRITE_ONCE(*(p), (v)); } while (0)
 #define smp_load_acquire(p) ({ __typeof__(*(p)) ___v = READ_ONCE(*(p)); atomic_thread_fence(memory_order_acquire); ___v; })
 #define max_t(t, a, b) ((t)(a) > (t)(b) ? (t)(a) : (t)(b))
+#define min_t(t, a, b) ((t)(a) < (t)(b) ? (t)(a) : (t)(b))
+#define queue_delayed_work(wq, d, j) mod_delayed_work((wq), (d), (j))
 #define cpu_relax() sched_yield()
 #define smp_mb__before_atomic() atomic_thread_fence(memory_order_seq_cst)
 #define div_u64(a, b) ((u64)(a) / (b))
