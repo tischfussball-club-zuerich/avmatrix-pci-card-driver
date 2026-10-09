@@ -1,0 +1,12 @@
+# install logs (contain local paths)
+hws_install.log
+# kernel build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+.*.cmd
+Module.symvers
+modules.order
+.tmp_versions/
