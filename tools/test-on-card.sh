@@ -54,28 +54,34 @@ NEW_SRC=$(modinfo -F srcversion "$BUILD/HwsCapture.ko")
 say "   built HwsCapture.ko (srcversion $NEW_SRC)"
 
 # ---------------------------------------------------------------- nothing may use the card
-busy=""
-for dev in /dev/video* /dev/snd/*; do
-	[ -e "$dev" ] || continue
-	# only devices of this driver
-	case "$dev" in
-	/dev/video*) v4l2-ctl -d "$dev" --info 2>/dev/null | grep -q 'Driver name *: *HwsCapture' || continue ;;
-	/dev/snd/*) n=$(basename "$dev" | sed -n 's/^[a-zA-Z]*C\([0-9]*\).*/\1/p'); [ -n "$n" ] || continue
-		# /proc/asound/cards: " 1 [HAudio1        ]: HwsCapture - HAudio 1"
-		grep -qE "^ *$n \[.*\]: HwsCapture" /proc/asound/cards 2>/dev/null || continue ;;
-	esac
-	users=$(sudo fuser "$dev" 2>/dev/null)
-	[ -n "$users" ] && busy="$busy $dev:$users"
-done
-if [ -n "$busy" ]; then
-	say "The card is in use:"
-	for b in $busy; do
-		for p in ${b#*:}; do say "   ${b%%:*}  pid $p  $(ps -o comm= -p "$p" 2>/dev/null)"; done
+# one line per user of this driver's devices: "<device> <pid> <program> <uid>"
+card_users() {
+	local dev n p
+	for dev in /dev/video* /dev/snd/*; do
+		[ -e "$dev" ] || continue
+		case "$dev" in
+		/dev/video*) v4l2-ctl -d "$dev" --info 2>/dev/null | grep -q 'Driver name *: *HwsCapture' || continue ;;
+		/dev/snd/*) n=$(basename "$dev" | sed -n 's/^[a-zA-Z]*C\([0-9]*\).*/\1/p'); [ -n "$n" ] || continue
+			# /proc/asound/cards: " 1 [HAudio1        ]: HwsCapture - HAudio 1"
+			grep -qE "^ *$n \[.*\]: HwsCapture" /proc/asound/cards 2>/dev/null || continue ;;
+		esac
+		for p in $(sudo fuser "$dev" 2>/dev/null); do
+			echo "$dev $p $(ps -o comm= -p "$p" 2>/dev/null) $(ps -o uid= -p "$p" 2>/dev/null | tr -d ' ')"
+		done
 	done
-	die "close these programs first (for PipeWire: systemctl --user stop pipewire pipewire-pulse wireplumber), nothing was changed"
-fi
-
-# ---------------------------------------------------------------- swap, with guaranteed restore
+}
+# PipeWire/WirePlumber of this user only watch the card; they can be stopped
+# for the test and started again afterwards. Their sockets restart them on
+# demand, so those have to be stopped too.
+PW_UNITS="pipewire.socket pipewire-pulse.socket wireplumber.service pipewire-pulse.service pipewire.service"
+PW_STOPPED=0
+restart_pipewire() {
+	[ $PW_STOPPED = 1 ] || return
+	say "== starting PipeWire/WirePlumber again"
+	systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber.service pipewire.service pipewire-pulse.service 2>/dev/null ||
+		say "   !! could not start them; log out and in again, or: systemctl --user start pipewire wireplumber"
+	PW_STOPPED=0
+}
 restore() {
 	[ $SWAPPED = 1 ] || return
 	if [ $KEEP = 1 ]; then
@@ -94,8 +100,27 @@ restore() {
 	fi
 	SWAPPED=0
 }
-trap 'restore; [ -n "$BUILD" ] && rm -rf "$BUILD"; say "log: $LOG"' EXIT
+# from here on, whatever happens, the original state comes back
+trap 'restore; restart_pipewire; [ -n "$BUILD" ] && rm -rf "$BUILD"; say "log: $LOG"' EXIT
 trap 'say "interrupted"; exit 130' INT TERM
+users=$(card_users)
+if [ -n "$users" ] && ! echo "$users" | awk -v me="$(id -u)" '$3 !~ /^(pipewire|pipewire-pulse|wireplumber)$/ || $4 != me { bad = 1 } END { exit bad }'; then
+	:	# someone else than our own PipeWire: report below
+elif [ -n "$users" ]; then
+	say "== stopping PipeWire/WirePlumber for the test (desktop audio pauses; started again at the end)"
+	systemctl --user stop $PW_UNITS 2>/dev/null
+	PW_STOPPED=1
+	sleep 2
+	users=$(card_users)
+fi
+if [ -n "$users" ]; then
+	restart_pipewire
+	say "The card is in use:"
+	echo "$users" | while read -r dev pid comm uid; do say "   $dev  pid $pid  $comm  (uid $uid)"; done
+	die "close these programs first, nothing was changed"
+fi
+
+# ---------------------------------------------------------------- swap, with guaranteed restore
 
 if [ $ORIG_LOADED = 1 ]; then
 	sudo rmmod HwsCapture || die "can't unload the current driver (still in use?), nothing was changed"

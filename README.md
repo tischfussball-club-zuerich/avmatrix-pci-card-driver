@@ -234,7 +234,9 @@ sudo depmod -a
    **Another HwsCapture driver installed?** `tools/test-on-card.sh` builds
    this driver from the checkout, loads it in place of the installed one (in
    memory only), runs the check below, and loads the original driver again,
-   also after an error or Ctrl-C. Nothing is installed; a log file is written
+   also after an error or Ctrl-C. If only your PipeWire/WirePlumber hold the
+   card, it stops them for the test and starts them again afterwards.
+   Nothing is installed; a log file is written
    to the current directory. `--keep` leaves the new driver loaded for manual
    testing until `sudo rmmod HwsCapture` or a reboot.
 3. Run `tools/card-check.sh` with a source connected. Per channel it runs
