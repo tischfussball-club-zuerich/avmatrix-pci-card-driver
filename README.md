@@ -352,9 +352,11 @@ compile tests; none of it has been confirmed on a card yet.
 - **Faster converters** (byte-identical output; userspace, kernel compiler
   flags): 1080p→720p 0.43→0.19 ms, 720p→1080p 0.33→0.24 ms, YV12 1080p
   0.77→0.53 ms, NV12 1080p 0.65→0.37 ms per frame.
-- **No signal / no free buffer:** nothing is copied from the card while
-  there's no signal, the "no signal" picture is limited to ~30 fps, and
-  frames no application has a buffer for aren't copied at all.
+- **No signal:** nothing is copied from the card while there's no signal,
+  and the "no signal" picture is limited to ~30 fps.
+- **Several applications on one channel:** up to three are served directly
+  by the channel's copy thread; an application that queues a buffer while a
+  frame is already arriving still gets that frame.
 - **Log flooding** from paths applications can trigger is rate-limited.
 
 ### Correctness and compatibility

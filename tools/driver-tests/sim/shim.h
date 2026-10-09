@@ -100,6 +100,11 @@ typedef struct { pthread_mutex_t m; } spinlock_t;
 #define spin_unlock_irqrestore(l, f) do { (void)(f); pthread_mutex_unlock(&(l)->m); } while (0)
 struct mutex { pthread_mutex_t m; };
 #define mutex_init(l) pthread_mutex_init(&(l)->m, NULL)
+/* rt_mutex: priority inheritance doesn't matter without RT scheduling here */
+#define rt_mutex mutex
+#define rt_mutex_init(l) mutex_init(l)
+#define rt_mutex_lock(l) mutex_lock(l)
+#define rt_mutex_unlock(l) mutex_unlock(l)
 #define mutex_lock(l) pthread_mutex_lock(&(l)->m)
 #define mutex_unlock(l) pthread_mutex_unlock(&(l)->m)
 
@@ -179,6 +184,18 @@ bool kthread_queue_work(struct kthread_worker *wk, struct kthread_work *w);
 void kthread_flush_work(struct kthread_work *w);
 bool kthread_cancel_work_sync(struct kthread_work *w);
 struct kthread_worker *sim_kthread_worker(void);
+struct kthread_delayed_work {
+	struct kthread_work work;
+	struct kthread_worker *worker;
+	pthread_mutex_t lock;
+	pthread_cond_t cond;
+	u64 expires;
+	pthread_t thr;
+};
+void kthread_init_delayed_work(struct kthread_delayed_work *d, void (*f)(struct kthread_work *));
+bool kthread_mod_delayed_work(struct kthread_worker *wk, struct kthread_delayed_work *d, unsigned long ms);
+bool kthread_cancel_delayed_work_sync(struct kthread_delayed_work *d);
+void kthread_flush_worker(struct kthread_worker *wk);
 #define memcpy_flushcache(d, s, n) memcpy((d), (s), (n))
 #define queue_work_on(cpu, wq, w) queue_work((wq), (w))
 #define raw_smp_processor_id() 0

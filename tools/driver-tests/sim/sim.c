@@ -205,6 +205,63 @@ void kthread_flush_work(struct kthread_work *w)
 		pthread_cond_wait(&wk->cond, &wk->lock);
 	pthread_mutex_unlock(&wk->lock);
 }
+static void *kdwork_thread(void *arg)
+{
+	struct kthread_delayed_work *d = arg;
+	pthread_mutex_lock(&d->lock);
+	for (;;) {
+		while (!d->expires)
+			pthread_cond_wait(&d->cond, &d->lock);
+		u64 now = ktime_get_ns();
+		if (now >= d->expires) {
+			struct kthread_worker *wk = d->worker;
+			d->expires = 0;
+			pthread_mutex_unlock(&d->lock);
+			kthread_queue_work(wk, &d->work);
+			pthread_mutex_lock(&d->lock);
+			continue;
+		}
+		struct timespec ts = { (time_t)(d->expires / NSEC_PER_SEC), (long)(d->expires % NSEC_PER_SEC) };
+		pthread_cond_timedwait(&d->cond, &d->lock, &ts);
+	}
+	return NULL;
+}
+void kthread_init_delayed_work(struct kthread_delayed_work *d, void (*f)(struct kthread_work *))
+{
+	pthread_condattr_t a;
+	kthread_init_work(&d->work, f);
+	pthread_mutex_init(&d->lock, NULL);
+	pthread_condattr_init(&a);
+	pthread_condattr_setclock(&a, CLOCK_MONOTONIC);
+	pthread_cond_init(&d->cond, &a);
+	d->expires = 0;
+	d->worker = NULL;
+	pthread_create(&d->thr, NULL, kdwork_thread, d);
+}
+bool kthread_mod_delayed_work(struct kthread_worker *wk, struct kthread_delayed_work *d, unsigned long ms)
+{
+	/* like the kernel: never waits (the work may be re-arming itself) */
+	pthread_mutex_lock(&d->lock);
+	d->worker = wk;
+	d->expires = ktime_get_ns() + (u64)ms * NSEC_PER_MSEC;
+	pthread_cond_broadcast(&d->cond);
+	pthread_mutex_unlock(&d->lock);
+	return true;
+}
+bool kthread_cancel_delayed_work_sync(struct kthread_delayed_work *d)
+{
+	pthread_mutex_lock(&d->lock);
+	d->expires = 0;
+	pthread_mutex_unlock(&d->lock);
+	return kthread_cancel_work_sync(&d->work);
+}
+void kthread_flush_worker(struct kthread_worker *wk)
+{
+	pthread_mutex_lock(&wk->lock);
+	while (wk->head)
+		pthread_cond_wait(&wk->cond, &wk->lock);
+	pthread_mutex_unlock(&wk->lock);
+}
 bool kthread_cancel_work_sync(struct kthread_work *w)
 {
 	struct kthread_worker *wk = w->worker;
@@ -361,6 +418,7 @@ static _Atomic int src_w[NCH], src_h[NCH], src_il[NCH], src_present[NCH];	/* src
 static _Atomic u64 last_src_change[NCH];
 
 /* results */
+static atomic_long frames_hw_ch[NCH];
 static atomic_long frames_hw, delivered, torn_transition, torn_steady, dups, seq_err, ts_err,
 	err_bufs, stop_leaks, done_after_stop, nosig_frames, stalls, restarts;
 static atomic_long lat_hist[8];	/* <2,<4,<8,<16,<33,<66,<133,>=133 ms */
@@ -466,6 +524,7 @@ static void *hw_thread(void *a)
 				half = total / 2;
 			f++;
 			atomic_fetch_add(&frames_hw, 1);
+			atomic_fetch_add(&frames_hw_ch[ch], 1);
 			/* first half: data during its slot, interrupt at the end */
 			if (dma_lock_mode) pthread_rwlock_wrlock(&dma_lock[ch]);
 			memset(pdx->m_pbyVideoBuffer[ch], v, half);
@@ -706,6 +765,8 @@ static void stall_dump(int ch)
 /* ---- consumers ---- */
 struct consumer {
 	int ch, nbufs, proc_ms, stop_every;
+	int fixed_ms;		/* exactly this long per frame (instead of random proc_ms) */
+	atomic_long frames;	/* real (not no-signal) frames received */
 	struct hws_vfh_ctx ctx;
 	struct hwsvideo_buffer *bufs;
 };
@@ -759,6 +820,7 @@ static void *consumer_thread(void *a)
 
 	while (atomic_load(&run)) {
 		u32 last_seq = 0; u64 last_ts = 0; int last_v = -1, have_last = 0; long last_f = -1;
+		struct hwsvideo_buffer *held = NULL;
 
 		if (hostile) {
 			static const int outs[][2] = { {1920,1080},{1280,720},{720,480},{720,576},{800,600},{640,480},
@@ -816,6 +878,7 @@ static void *consumer_thread(void *a)
 					atomic_fetch_add(&ts_err, 1);
 				if (hostile) {
 					/* garbage in, garbage out: only safety and ordering are checked */
+				} else if (!is_nosig(p) && (atomic_fetch_add(&c->frames, 1), 0)) {
 				} else if (is_nosig(p)) {
 					atomic_fetch_add(&nosig_frames, 1);
 					last_v = -1;
@@ -869,6 +932,16 @@ static void *consumer_thread(void *a)
 				}
 				last_seq = b->vb.sequence; last_ts = vb->timestamp; have_last = 1;
 			}
+			if (c->fixed_ms) {
+				/* a display app: it keeps showing this frame until the next one
+				 * arrives, and only then gives the previous buffer back */
+				sleep_ns((u64)c->fixed_ms * NSEC_PER_MSEC);
+				if (held)
+					qbuf(c, held);
+				held = b;
+				n++;
+				continue;
+			}
 			if (c->proc_ms)
 				sleep_ns((u64)(rand_r(&seed) % (2 * c->proc_ms + 1)) * NSEC_PER_MSEC);
 			qbuf(c, b);
@@ -876,6 +949,7 @@ static void *consumer_thread(void *a)
 		}
 
 		/* STREAMOFF: every buffer must be back when stop_streaming returns */
+		held = NULL;	/* the app's own buffer: vb2 doesn't count it as queued */
 		hws_stop_streaming_multi(q);
 		pthread_mutex_lock(&q->lock);
 		if (q->owned_by_driver != 0)
@@ -904,6 +978,9 @@ int main(int argc, char **argv)
 		{ .ch = 0, .nbufs = 4, .proc_ms = 5,  .stop_every = 40 },
 		{ .ch = 1, .nbufs = 4, .proc_ms = 3,  .stop_every = 0 },
 		{ .ch = 1, .nbufs = 3, .proc_ms = 8,  .stop_every = 25 },
+		/* 2 buffers, 10 ms per frame: re-queues well before the next frame is
+		 * complete (16.7 ms at 60 fps), so it must get (nearly) every frame */
+		{ .ch = 1, .nbufs = 2, .fixed_ms = 10, .stop_every = 0 },
 	};
 	int ncons = sizeof(cons) / sizeof(cons[0]);
 	pthread_t ct[16];
@@ -947,8 +1024,8 @@ int main(int argc, char **argv)
 		pdx->copy_worker[ch] = sim_kthread_worker();
 		pdx->conv_worker[ch] = sim_kthread_worker();
 		kthread_init_work(&pdx->video[ch].videowork, video_data_process);
-		INIT_DELAYED_WORK(&pdx->video[ch].nosig_work, hws_nosig_work);
-		mutex_init(&pdx->direct_lock[ch]);
+		kthread_init_delayed_work(&pdx->video[ch].nosig_work, hws_nosig_work);
+		rt_mutex_init(&pdx->direct_lock[ch]);
 		INIT_LIST_HEAD(&pdx->direct_bufs[ch]);
 		kthread_init_work(&pdx->video[ch].fanout_work, hws_fanout_work);
 		kthread_init_work(&pdx->video[ch].copy_work, hws_copy_work);
@@ -1025,6 +1102,11 @@ int main(int argc, char **argv)
 
 	printf("fps=%d seconds=%d channels=%d consumers=%d\n", fps, seconds, NCH, ncons);
 	printf("frames from hw           %ld  (lost second-half IRQs %ld, duplicate first-half IRQs %ld)\n", frames_hw, lost_irqs, dup_irqs);
+	for (i = 0; i < ncons; i++)
+		if (cons[i].fixed_ms)
+			printf("steady app (ch%d, %d bufs, %d ms/frame) got %ld of %ld frames: %.0f%%\n",
+			       cons[i].ch, cons[i].nbufs, cons[i].fixed_ms, (long)cons[i].frames, (long)frames_hw_ch[cons[i].ch],
+			       frames_hw_ch[cons[i].ch] ? 100.0 * cons[i].frames / frames_hw_ch[cons[i].ch] : 0.0);
 	printf("buffers delivered (DONE) %ld  (no-signal frames %ld)\n", delivered, nosig_frames);
 	printf("stream restarts          %ld\n", restarts);
 	printf("torn/mixed, steady state %ld   <- must be 0\n", torn_steady);

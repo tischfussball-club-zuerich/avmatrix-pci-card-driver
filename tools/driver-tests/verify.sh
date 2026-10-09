@@ -29,6 +29,13 @@ for mode in race logic nodirect irqfaults; do for f in 60 240 480; do
 	grep -E "^frames|delivered|restarts|steady|duplicate|out of order|mod 100|sequence not|timestamp not|STREAMOFF|ERROR b|stalls|latency|driver stats" $o | sed 's/^/    /'
 	for k in "torn/mixed, steady state" "duplicate frames" "frames out of order" "sequence not increasing" "timestamp not increasing" "left in driver after STREAMOFF" "completed after STREAMOFF" "2 s stalls"; do
 		v=$(grep "$k" $o | grep -o '[0-9]\+' | tail -1); [ "${v:-1}" = 0 ] || { echo "    !! $k = $v"; fail=1; }; done
+	# an app that keeps showing its frame until the next one arrives (2 buffers,
+	# 10 ms per frame) must get most frames at 60 fps (it got half when the
+	# driver decided at the first half-frame whether anyone had a buffer)
+	if [ $f = 60 ]; then
+		p=$(grep -o "frames: [0-9]*%" $o | grep -o "[0-9]*"); echo "    steady 2-buffer app got ${p:-?}% of the frames"
+		[ "${p:-0}" -ge 75 ] || { echo "    !! steady 2-buffer app got only ${p:-0}% of the frames"; fail=1; }
+	fi
 	scan $o; [ $rc = 0 ] || fail=1
 done; done
 unset SIM_DMA_LOCK SIM_NO_DIRECT SIM_LOSE_IRQ SIM_DUP_IRQ

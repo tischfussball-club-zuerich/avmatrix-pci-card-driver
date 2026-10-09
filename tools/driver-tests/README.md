@@ -25,7 +25,9 @@ UndefinedBehaviorSanitizer and ThreadSanitizer, and python3.
   copies, ring, worker, direct path, fan-out, stream start/stop, format
   changes) on a small kernel-API shim (`shim.h`), driven by a simulated card
   at real interrupt timing with 2 channels and 5 apps that keep stopping and
-  restarting, plus signal loss and resolution changes. Every delivered
+  restarting (one of them a display-style app with 2 buffers that keeps its
+  frame until the next one arrives; at 60 fps it must get at least 75% of
+  the frames), plus signal loss and resolution changes. Every delivered
   buffer is checked: no torn frame, no duplicate, frames in order,
   sequence/timestamp increasing, every buffer back after STREAMOFF and none
   completed after it.

@@ -29,6 +29,7 @@
 #include <uapi/linux/sched/types.h>	/* struct sched_attr */
 #include <linux/timer.h>
 #include <linux/kthread.h>
+#include <linux/rtmutex.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/module.h>
@@ -338,6 +339,7 @@ struct hws_vfh_ctx {
 };
 /* a direct-path frame waiting for its copies to the other consumers */
 #define HWS_FANOUT_POOL 4
+#define HWS_INLINE_FANOUT 3	/* consumers a copy thread serves itself */
 struct hws_fanout {
 	struct list_head	node;
 	struct list_head	bufs;		/* first holds the frame, the rest get copies */
@@ -364,7 +366,7 @@ struct hws_video{
 	int						index;
 	struct kthread_work		videowork;	/* conversion/delivery, on conv_worker[index] */
 	u64				nosig_last_ns;	/* last "no signal" frame */
-	struct delayed_work		nosig_work;	/* paces "no signal" frames */
+	struct kthread_delayed_work	nosig_work;	/* paces "no signal" frames, on conv_worker */
 	/* direct-path fan-out to further consumers, off the IRQ thread */
 	struct kthread_work		fanout_work;	/* on conv_worker[index] */
 	struct kthread_work		copy_work;	/* half-frame copies, on copy_worker[index] */
@@ -457,7 +459,7 @@ struct hws_pcie_dev {
 	u32				m_half_peer[MAX_VID_CHANNELS][2];	/* other half's count at that IRQ */
 	u32				m_half1_cnt[MAX_VID_CHANNELS];	/* count of the first half copied for the current frame */
 	/* direct-to-buffer path: app buffers being filled straight from DMA (IRQ thread) */
-	struct mutex			direct_lock[MAX_VID_CHANNELS];
+	struct rt_mutex			direct_lock[MAX_VID_CHANNELS];	/* rt: the RT copy thread waits on it */
 	struct list_head		direct_bufs[MAX_VID_CHANNELS];
 	int				direct_out_size[MAX_VID_CHANNELS];
 	bool				direct_nt[MAX_VID_CHANNELS];	/* direct frame written with non-temporal stores */
