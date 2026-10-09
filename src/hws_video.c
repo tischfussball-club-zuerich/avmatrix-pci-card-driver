@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  */
 
@@ -18,8 +19,6 @@
 
 static void hws_adapters_init(struct hws_pcie_dev *dev);
 static void hws_get_video_param(struct hws_pcie_dev *dev,int index);
-//static void StartDma(int index);
-//static void StopDma(int index);
 static int StartVideoCapture(struct hws_pcie_dev *pdx,int index);
 static int StartAudioCapture(struct hws_pcie_dev *pdx,int index);
 static void StopAudioCapture(struct hws_pcie_dev *pdx,int index);
@@ -36,7 +35,7 @@ static void hws_snd_card_free(struct snd_card *card);
 static void hws_direct_reclaim(struct hws_pcie_dev *pdx, int ch, struct hws_vfh_ctx *ctx);
 static void hws_fanout_work(struct kthread_work *work);
 static void hws_fanout_drain(struct hws_video *v);
-void video_data_process(struct kthread_work *p_work);
+static void video_data_process(struct kthread_work *p_work);
 static void hws_hw_bringup(struct hws_pcie_dev *pdx);
 
 static int direct_io = 1;
@@ -162,7 +161,6 @@ static void hws_tstat_report(struct hws_pcie_dev *pdx)
 	}
 }
 
-//------------------------
 
 static	void VideoScaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h);
 static	void FHD_To_HD_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h);
@@ -185,7 +183,6 @@ static	void HD_To_SD_PAL_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_
 static	void V1280X1024_NTSC_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h);
 static	void V1280X1024_PAL_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h);
 static	void All_VideoScaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h);
-//---------------------------
 #define MAKE_ENTRY( __vend, __chip, __subven, __subdev, __configptr) {	\
 .vendor		= (__vend),					\
 .device		= (__chip),					\
@@ -212,7 +209,6 @@ static const struct pci_device_id hws_pci_table[] = {
 
 	{ }
 };
-//------------------
 static const v4l2_model_timing_t support_videofmt[]= {
 	[V4L2_MODEL_VIDEOFORMAT_1920X1080P60]	= V4L2_MODEL_TIMING(1920,1080,60,0),
 	[V4L2_MODEL_VIDEOFORMAT_1280X720P60]	= V4L2_MODEL_TIMING(1280,720,60,0),
@@ -228,13 +224,6 @@ static const v4l2_model_timing_t support_videofmt[]= {
 	[V4L2_MODEL_VIDEOFORMAT_1440X900P60]	= V4L2_MODEL_TIMING(1440,900,60,0),
 	[V4L2_MODEL_VIDEOFORMAT_1680X1050P60]	= V4L2_MODEL_TIMING(1680,1050,60,0),
     [V4L2_MODEL_VIDEOFORMAT_1080X1920P60]	= V4L2_MODEL_TIMING(1080,1920,60,0),
-	#if 0
-	[V4L2_MODEL_VIDEOFORMAT_1920X1200P60]	= V4L2_MODEL_TIMING(1920,1200,60,0),
-	[V4L2_MODEL_VIDEOFORMAT_2560X1080P60]	= V4L2_MODEL_TIMING(2560,1080,60,0),
-	[V4L2_MODEL_VIDEOFORMAT_2560X1440P60]	= V4L2_MODEL_TIMING(2560,1440,60,0),
-	[V4L2_MODEL_VIDEOFORMAT_3840X2160P60]	= V4L2_MODEL_TIMING(3840,2160,60,0),
-	[V4L2_MODEL_VIDEOFORMAT_4096X2160P60]	= V4L2_MODEL_TIMING(4096,2160,60,0),
-	#endif
 };
 static const framegrabber_pixfmt_t support_pixfmts[] = {
 
@@ -245,92 +234,8 @@ static const framegrabber_pixfmt_t support_pixfmts[] = {
 		.is_yuv   = true,
 		.pixfmt_out = YUYV,
 	},
-	#if 0
-	[FRAMEGRABBER_PIXFMT_UYVY]={ //UYVY
-	.name     = "4:2:2, packed, UYVY",
-	.fourcc   = V4L2_PIX_FMT_UYVY,
-	.depth    = 16,
-	.is_yuv   = true,
-	.pixfmt_out = UYVY,
-},
-[FRAMEGRABBER_PIXFMT_YVYU]={ //YVYU
-.name     = "4:2:2, packed, YVYU",
-.fourcc   = V4L2_PIX_FMT_YVYU,
-.depth    = 16,
-.is_yuv   = true,
-.pixfmt_out = YVYU,
-},
-
-[FRAMEGRABBER_PIXFMT_VYUY]={ //VYUY
-.name     = "4:2:2, packed, VYUY",
-.fourcc   = V4L2_PIX_FMT_VYUY,
-.depth    = 16,
-.is_yuv   = true,
-.pixfmt_out = VYUY,
-},
-
-[FRAMEGRABBER_PIXFMT_RGB565]={ //RGBP
-.name     = "RGB565 (LE)",
-.fourcc   = V4L2_PIX_FMT_RGB565, /* gggbbbbb rrrrrggg */
-.depth    = 16,
-.is_yuv   = false,
-.pixfmt_out = RGBP,
-},
-[FRAMEGRABBER_PIXFMT_RGB565X]={ //RGBR
-.name     = "RGB565 (BE)",
-.fourcc   = V4L2_PIX_FMT_RGB565X, /* rrrrrggg gggbbbbb */
-.depth    = 16,
-.is_yuv   = false,
-.pixfmt_out = RGBR,
-},
-[FRAMEGRABBER_PIXFMT_RGB555]={ //RGBO
-.name     = "RGB555 (LE)",
-.fourcc   = V4L2_PIX_FMT_RGB555, /* gggbbbbb arrrrrgg */
-.depth    = 16,
-.is_yuv   = false,
-.pixfmt_out = RGBO,
-},
-[FRAMEGRABBER_PIXFMT_RGB555X]={ //RGBQ
-.name     = "RGB555 (BE)",
-.fourcc   = V4L2_PIX_FMT_RGB555X, /* arrrrrgg gggbbbbb */
-.depth    = 16,
-.is_yuv   = false,
-.pixfmt_out = RGBQ,
-},
-[FRAMEGRABBER_PIXFMT_RGB24]={ //RGB3 index=8
-.name     = "RGB24 (LE)",
-.fourcc   = V4L2_PIX_FMT_RGB24, /* rgb */
-.depth    = 24,
-.is_yuv   = false,
-.pixfmt_out = RGB3,
-},
-
-[FRAMEGRABBER_PIXFMT_BGR24]={ //BGR3
-.name     = "RGB24 (BE)",
-.fourcc   = V4L2_PIX_FMT_BGR24, /* bgr */
-.depth    = 24,
-.is_yuv   = false,
-.pixfmt_out = BGR3,
-},
-[FRAMEGRABBER_PIXFMT_RGB32]={ //RGB4
-.name     = "RGB32 (LE)",
-.fourcc   = V4L2_PIX_FMT_RGB32, /* argb */
-.depth    = 32,
-.is_yuv   = false,
-.pixfmt_out = RGB4,
-},
-[FRAMEGRABBER_PIXFMT_BGR32]={ //BGR4
-.name     = "RGB32 (BE)",
-.fourcc   = V4L2_PIX_FMT_BGR32, /* bgra */
-.depth    = 32,
-.is_yuv   = false,
-.pixfmt_out = BGR4,
-},
-#endif
 };
 
-
-//-------------------------------------------
 
 static int v4l2_get_suport_VideoFormatIndex(struct v4l2_format *fmt)
 {
@@ -347,7 +252,7 @@ static int v4l2_get_suport_VideoFormatIndex(struct v4l2_format *fmt)
 	}
 	return videoIndex;
 }
-v4l2_model_timing_t *v4l2_model_get_support_videoformat(int index)
+static v4l2_model_timing_t *v4l2_model_get_support_videoformat(int index)
 {
 	if(index <0 ||index >=V4L2_MODEL_VIDEOFORMAT_NUM)
 		return NULL;
@@ -356,14 +261,14 @@ v4l2_model_timing_t *v4l2_model_get_support_videoformat(int index)
 }
 
 
-framegrabber_pixfmt_t *v4l2_model_get_support_pixformat(int index)
+static framegrabber_pixfmt_t *v4l2_model_get_support_pixformat(int index)
 {
 	if(index <0 ||index >=ARRAY_SIZE(support_pixfmts))
 		return NULL;
 
 	return (framegrabber_pixfmt_t *)&support_pixfmts[index];
 }
-const framegrabber_pixfmt_t *framegrabber_g_support_pixelfmt_by_fourcc(u32 fourcc)
+static const framegrabber_pixfmt_t *framegrabber_g_support_pixelfmt_by_fourcc(u32 fourcc)
 {
 	int i;
 	int pixfmt_index=-1;
@@ -388,22 +293,18 @@ static int hws_vidioc_querycap(struct file *file, void *priv, struct v4l2_capabi
 	struct hws_pcie_dev *dev = videodev->dev;
 	int vi_index;
 	vi_index = videodev->index+1+dev->m_Device_PortID*dev->m_nCurreMaxVideoChl;
-	//printk( "%s\n", __func__);
-	strcpy(cap->driver, KBUILD_MODNAME);
+	strscpy(cap->driver, KBUILD_MODNAME, sizeof(cap->driver));
 	sprintf(cap->card, "%s %d",HWS_VIDEO_NAME,vi_index);
 	/* unique per card, so apps and v4l2-compliance can tell boards apart */
 	snprintf(cap->bus_info, sizeof(cap->bus_info), "PCI:%s", pci_name(dev->pdev));
 	cap->device_caps =	V4L2_CAP_VIDEO_CAPTURE |V4L2_CAP_STREAMING;
 	cap->capabilities = cap->device_caps | V4L2_CAP_DEVICE_CAPS;
-	//printk( "%s(IN END  )\n", __func__);
 	return 0;
 }
 static int hws_vidioc_enum_fmt_vid_cap(struct file *file, void *priv_fh,struct v4l2_fmtdesc *f)
 {
 	struct hws_video *videodev = video_drvdata(file);
 	int index = f->index;
-	//printk( "%s(%d)\n", __func__,videodev->index);
-	//printk( "%s(f->index = %d)\n", __func__,f->index);
 
 	if(f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 	{
@@ -425,7 +326,6 @@ static int hws_vidioc_enum_fmt_vid_cap(struct file *file, void *priv_fh,struct v
 		{
 			pixfmt=v4l2_model_get_support_pixformat(f->index);
 			if(pixfmt ==NULL) return -EINVAL;
-			//printk("%s..pixfmt=%d.\n",__func__,f->index);
 			f->index = index;
 			f->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 			strscpy(f->description, pixfmt->name, sizeof(f->description));
@@ -434,29 +334,18 @@ static int hws_vidioc_enum_fmt_vid_cap(struct file *file, void *priv_fh,struct v
 	}
 	return 0;
 }
-void framegrabber_g_Curr_input_framesize(struct hws_video *dev,int *width,int *height)
-{
-	struct hws_pcie_dev *pdx = dev->dev;
-	int index = dev->index;
-	*width= pdx->m_pVCAPStatus[index][0].dwWidth;
-	*height=pdx->m_pVCAPStatus[index][0].dwHeight;
-}
-const framegrabber_pixfmt_t *framegrabber_g_out_pixelfmt(struct hws_video *dev)
+static const framegrabber_pixfmt_t *framegrabber_g_out_pixelfmt(struct hws_video *dev)
 {
 	return &support_pixfmts[dev->current_out_pixfmt];
 }
 static int hws_vidioc_g_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *fmt)
 {
 	struct hws_video *videodev = video_drvdata(file);
-	//struct v4l2_pix_format *pix = &fmt->fmt.pix;
 	const framegrabber_pixfmt_t *pixfmt;
 	v4l2_model_timing_t *p_SupportmodeTiming;
-	//printk( "%s(%d)\n", __func__,videodev->index);
-	//printk( "w=%d,h=%d\n",fmt->fmt.pix.width,fmt->fmt.pix.height);
 	pixfmt=framegrabber_g_out_pixelfmt(videodev);
 	if(pixfmt)
 	{
-		//framegrabber_g_Curr_input_framesize(videodev,&width,&height);
 		p_SupportmodeTiming = v4l2_model_get_support_videoformat(videodev->current_out_size_index);
 		if(p_SupportmodeTiming ==NULL) return -EINVAL;
 		fmt->fmt.pix.width=p_SupportmodeTiming->frame_size.width;
@@ -466,7 +355,6 @@ static int hws_vidioc_g_fmt_vid_cap(struct file *file, void *fh, struct v4l2_for
 		fmt->fmt.pix.bytesperline = (fmt->fmt.pix.width * pixfmt->depth) >> 3;
 		fmt->fmt.pix.sizeimage =	fmt->fmt.pix.height * fmt->fmt.pix.bytesperline;
 		fmt->fmt.pix.colorspace = V4L2_COLORSPACE_REC709;
-		//printk("%s....f->fmt.pix.width=%d.f->fmt.pix.height=%d.\n",__func__,fmt->fmt.pix.width,fmt->fmt.pix.height);
 		return 0;
 	}
 
@@ -491,9 +379,6 @@ static int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_f
 	v4l2_model_timing_t *pModeTiming;
 	struct v4l2_pix_format *pix = &f->fmt.pix;
 	const framegrabber_pixfmt_t *fmt;
-	//int TimeingIndex = f->index;
-	//printk( "%s(%d)\n", __func__,videodev->index);
-	//printk( "pix->height =%d  pix->width =%d \n", pix->height,pix->width);
 
     if (pix->pixelformat == 0) {
         if (framegrabber_g_support_pixelfmt_by_fourcc(videodev->pixfmt))
@@ -508,7 +393,7 @@ static int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_f
         pix->pixelformat = V4L2_PIX_FMT_YUYV;
         fmt = framegrabber_g_support_pixelfmt_by_fourcc(pix->pixelformat);
         if (!fmt) {
-            printk("%s.. format not support (even fallback)\n", __func__);
+            pr_debug("HwsCapture: %s: format not supported, not even the fallback\n", __func__);
             return -EINVAL;
         }
 	}
@@ -531,7 +416,6 @@ static int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_f
 		pix->sizeimage =pix->height * pix->bytesperline;
 		pix->colorspace = V4L2_COLORSPACE_REC709;//V4L2_COLORSPACE_SMPTE170M;
 		pix->priv = 0;
-		//return -EINVAL;
 		return 0;
 	}
 	pix->field = V4L2_FIELD_NONE;
@@ -542,11 +426,9 @@ static int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_f
 	pix->colorspace = V4L2_COLORSPACE_REC709;//V4L2_COLORSPACE_SMPTE170M;
 	pix->priv = 0;
 
-	//printk("%s<<pix->width=%d.pix->height=%d.\n",__func__,pix->width,pix->height);
 	return 0;
 
 
-	//----------------------------------
 	return 0;
 }
 /* true if any consumer of this node has buffers allocated */
@@ -574,7 +456,6 @@ static int vidioc_s_fmt_vid_cap(struct file *file, void *priv,struct v4l2_format
 	int err;
 	unsigned long flags;
 	struct hws_pcie_dev *pdx = videodev->dev;
-	//printk( "%s()\n", __func__);
 	err = hws_vidioc_try_fmt_vid_cap(file, priv, f);
 	if (err)
 		return err;
@@ -614,7 +495,7 @@ static int hws_input_fps(struct hws_video *videodev)
 }
 
 /* frames come at the input's rate; there is no frame rate to choose */
-int hws_vidioc_g_parm(struct file *file,void *fh, struct v4l2_streamparm *setfps)
+static int hws_vidioc_g_parm(struct file *file,void *fh, struct v4l2_streamparm *setfps)
 {
 	struct hws_video *videodev = video_drvdata(file);
 
@@ -628,48 +509,30 @@ int hws_vidioc_g_parm(struct file *file,void *fh, struct v4l2_streamparm *setfps
 }
 static int hws_vidioc_enum_framesizes(struct file *file, void *fh, struct v4l2_frmsizeenum *fsize)
 {
-	//struct hws_video *videodev = video_drvdata(file);
 	const framegrabber_pixfmt_t *pixfmt;
 	v4l2_model_timing_t *p_SupportmodeTiming;
 	int width=0,height=0;
-	int frameRate;
-	//printk( "%s(%d)-FrameIndex=[%d]\n", __func__,videodev->index,fsize->index);
-	//----------------------------
 	pixfmt=framegrabber_g_support_pixelfmt_by_fourcc(fsize->pixel_format);
 	if(pixfmt==NULL)
 	{
-		//printk("%s..\n",__func__);
 		return -EINVAL;
 	}
 	p_SupportmodeTiming = v4l2_model_get_support_videoformat(fsize->index);
 	if(p_SupportmodeTiming == NULL)
 	{
-		//printk("%s. invalid framesize[%d]\n",__func__,fsize->index);
 		return -EINVAL;
 	}
 	width = p_SupportmodeTiming->frame_size.width;
 	height = p_SupportmodeTiming->frame_size.height;
-	frameRate = p_SupportmodeTiming->refresh_rate;
 
-	//printk("%s...supportframesize[%d] width=%d height=%d Framerate=%d..\n",__func__,fsize->index,width,height,frameRate); //12
 	if((width ==0) || (height ==0))
 	{
-		//printk("%s. invalid framesize 2\n",__func__);
 		return -EINVAL;
 	}
 	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
 	fsize->pixel_format=pixfmt->fourcc;
 	fsize->discrete.width=width;
 	fsize->discrete.height=height;
-	//fsize->discrete.denominator = frameRate;
-	//fsize->discrete..numerator =1 ;
-	//-------------------------------
-	//width = videodev->current_out_width;
-	//height = videodev->curren_out_height;
-	//fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
-	//fsize->pixel_format=videodev->pixfmt;
-	//fsize->discrete.width=width;
-	//fsize->discrete.height=height;
 	return 0;
 
 
@@ -691,21 +554,9 @@ static int hws_vidioc_enum_input(struct file *file, void *priv,struct v4l2_input
 
 static int hws_vidioc_g_input(struct file *file, void *priv, unsigned int *i)
 {
-	//struct hws_video *videodev = video_drvdata(file);
 	int Index;
 	Index = *i;
-	//printk( "%s(%d)-index =%d\n", __func__,videodev->index,Index);
 
-	#if 0
-	if(Index <0 ||Index >=V4L2_MODEL_VIDEOFORMAT_NUM)
-	{
-	return   -EINVAL;
-}
-else
-{
-*i = Index;
-}
-#else
 if(Index >0)
 {
 	return   -EINVAL;
@@ -714,34 +565,15 @@ else
 {
 	*i = 0;
 }
-#endif
 return 0;
 }
 
 static int hws_vidioc_s_input(struct file *file, void *priv, unsigned int i)
 {
-	#if 0
-	struct hws_video *videodev = video_drvdata(file);
-
-	int Index;
-	v4l2_model_timing_t *p_SupportmodeTiming;
-	Index = i;
-	if(Index <0 ||Index >=V4L2_MODEL_VIDEOFORMAT_NUM)
-	{
-	return   -EINVAL;
-}
-p_SupportmodeTiming = v4l2_model_get_support_videoformat(Index);
-videodev->current_out_size_index = Index;
-videodev->current_out_width = p_SupportmodeTiming->frame_size.width;
-videodev->curren_out_height = p_SupportmodeTiming->frame_size.height;
-printk( "%s(%d)- %dx%d \n", __func__,i,videodev->current_out_width,videodev->curren_out_height);
-#endif
-//printk( "%s(%d)\n", __func__,i);
 return i ? -EINVAL : 0;
 }
-static ssize_t hws_read(struct file *file,char *buf,size_t count, loff_t *ppos)
+static ssize_t hws_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
-	//printk( "%s()\n", __func__);
 	return -EINVAL;	/* streaming I/O only */
 
 }
@@ -868,7 +700,6 @@ static int hws_release(struct file *file)
     return 0;
 }
 
-//-------------------
 /*
  * Picture controls through the V4L2 control framework (QUERYCTRL, G/S/TRY,
  * ext controls, defaults, events, ctrl classes all handled by the core).
@@ -947,28 +778,6 @@ static int hws_init_controls(struct hws_video *video)
 	video->ctrl_ready = true;
 	return 0;
 }
-#if 0
-static int hws_vidioc_streamon(struct file *file, void *priv, enum v4l2_buf_type i)
-{
-//struct hws_video *videodev = video_drvdata(file);
-//printk( "%s(ch-%d)\n", __func__,videodev->index);
-#if 0
-StartVideoCapture(videodev->dev,videodev->index);
-#endif
-return(vb2_ioctl_streamon(file,priv,i));
-
-}
-static int hws_vidioc_streamoff(struct file *file, void *priv, enum v4l2_buf_type i)
-{
-//struct hws_video *videodev = video_drvdata(file);
-//printk( "%s(ch-%d)\n", __func__,videodev->index);
-#if 0
-StopVideoCapture(videodev->dev,videodev->index);
-#endif
-return(vb2_ioctl_streamoff(file,priv,i));
-
-}
-#endif
 static int hws_vidioc_enum_frameintervals(struct file *file, void *fh,
 										  struct v4l2_frmivalenum *fival)
 {
@@ -986,7 +795,7 @@ static int hws_vidioc_enum_frameintervals(struct file *file, void *fh,
 	fival->discrete.denominator = hws_input_fps(videodev);
 	return 0;
 }
-int hws_vidioc_s_parm(struct file *file, void *fh,struct v4l2_streamparm *a)
+static int hws_vidioc_s_parm(struct file *file, void *fh,struct v4l2_streamparm *a)
 {
 	/* the rate follows the input; report what is delivered */
 	return hws_vidioc_g_parm(file, fh, a);
@@ -1181,7 +990,6 @@ static const struct v4l2_ioctl_ops hws_ioctl_fops = {
 
 static void hws_buffer_finish(struct vb2_buffer *vb)
 {
-	return;
 }
 
 /*
@@ -1353,27 +1161,12 @@ static const struct vb2_ops hwspcie_video_multi_qops = {
     .start_streaming= hws_start_streaming_multi,
     .stop_streaming = hws_stop_streaming_multi,
 };
-//-----------------------------------------
-const unsigned char  g_YUVColors [MAX_COLOR][3] = {
-	{128, 16, 128},     // BLACK
-	{128, 235 , 128},    // WHITE
-	{16, 211, 146},     // YELLOW
-	{166, 170, 16},     // CYAN
-	{54, 145, 34},      // GREEN
-	{202, 106, 222},    // MAGENTA
-	{90, 81, 240},      // RED
-	{240, 41, 109},     // BLUE
-	{128, 125, 128},    // GREY
-};
-
-
 static void SetNoVideoMem(uint8_t * pDest, int  w,int h)
 {
 	int x,y;
 	uint8_t *pST;
 	uint8_t *pNS;
 	pST = (uint8_t *)pDest;
-	//printk("SetNoVideoMem[%d-%d]\n",w,h);
 
 	for(x=0;x<w/2;x++)
 	{
@@ -1391,7 +1184,6 @@ static void SetNoVideoMem(uint8_t * pDest, int  w,int h)
 		pNS = pNS+w*2;
 	}
 }
-//---------------------------------------------------
 /*
  * Append one captured packet to the ALSA ring. Everything that touches the
  * runtime happens under ring_lock and only while the stream runs, so a
@@ -1439,7 +1231,7 @@ static void _deliver_samples(struct hws_audio *drv, const u8 *aud_data, u32 aud_
 		snd_pcm_period_elapsed(substream);
 }
 
-void audio_data_process(struct work_struct *p_work)
+static void audio_data_process(struct work_struct *p_work)
 {
 	struct hws_audio *drv = container_of(p_work, struct hws_audio, audiowork);
 	struct hws_pcie_dev *pdx = drv->dev;
@@ -1482,12 +1274,10 @@ void audio_data_process(struct work_struct *p_work)
 		spin_unlock_irqrestore(&pdx->audiolock[dwAudioCh], flags);
 	}
 }
-//-------------------------------
 static void FHD_To_800X600_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h)
 {
 	int x,y;
 	BYTE*pSrcBuf;
-	//   BYTE*pDestBuf;
 	int *pSrcData;
 	int *pDestData;
 	pSrcBuf = pSrc;
@@ -1534,8 +1324,6 @@ static void HD_To_800X600_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out
 	int y;
 	BYTE*pSrcBuf;
 	BYTE*pDestBuf;
-	//int *pSrcData;
-	//   int *pDestData;
 	pSrcBuf = pSrc;
 	pDestBuf = pOut;
 	for(y=0;y<(in_h-120);y++)
@@ -1548,11 +1336,8 @@ static void HD_To_800X600_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out
 }
 static void SD_NTSC_To_SD_PAL_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h)
 {
-	//int x,y;
 	BYTE*pSrcBuf;
 	BYTE*pDestBuf;
-	//int *pSrcData;
-	//int *pDestData;
 	DWORD dwI;
 	DWORD dwJ;
 	BYTE *pDstYUV;
@@ -1590,11 +1375,8 @@ static void SD_NTSC_To_SD_PAL_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int
 
 static void SD_PAL_To_SD_NTSC_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h)
 {
-	// int x,y;
 	BYTE*pSrcBuf;
 	BYTE*pDestBuf;
-	//   int *pSrcData;
-	//int *pDestData;
 	pSrcBuf = pSrc;
 	pDestBuf = pOut;
 	// PAL 720X576  NTSC 720X480
@@ -1627,7 +1409,6 @@ static void SD_NTSC_To_FHD_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int ou
 		}
 		pDestBuf +=out_w*2;
 	}
-	//---
 	for(y=0;y<(out_h-120);)
 	{
 		pDstYUV = pDestBuf;
@@ -1669,7 +1450,6 @@ static void SD_NTSC_To_FHD_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int ou
 		memcpy(pDestBuf,pDestBuf-(out_w*2),out_w*2);
 		pDestBuf += out_w*2;
 		y = y+2;
-		//------------------
 	}
 	//-- 60 line
 	for(y=0;y<60;y++)
@@ -1684,7 +1464,6 @@ static void SD_NTSC_To_FHD_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int ou
 		pDestBuf +=out_w*2;
 
 	}
-	//---
 }
 
 static void SD_PAL_To_FHD_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h)
@@ -1739,7 +1518,6 @@ static void SD_PAL_To_FHD_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out
 		memcpy(pDestBuf,pDestBuf-(out_w*2),out_w*2);
 		pDestBuf += out_w*2;
 		y = y+2;
-		//------------------
 	}
 
 
@@ -1750,8 +1528,6 @@ static void SD_PAL_To_HD_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_
 	int x,y;
 	BYTE*pSrcBuf;
 	BYTE*pDestBuf;
-	// int dwJ;
-	//   BYTE*pDstYUV;
 	pSrcBuf = pSrc;
 	pDestBuf = pOut;
 
@@ -1785,7 +1561,6 @@ static void SD_PAL_To_HD_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_
 		memcpy(pDestBuf,pDestBuf-(out_w*2),out_w*2);
 		pDestBuf += out_w*2;
 		y= y+2;
-		//------------------
 	}
 
 
@@ -1829,8 +1604,6 @@ void SD_NTSC_To_HD_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int 
 	BYTE*pDestBuf;
 	pSrcBuf = pSrc;
 	pDestBuf = pOut;
-	//   int dwJ;
-	//BYTE*pDstYUV;
 	// PAL 720X480   640X360-> 1280*720
 	pSrcBuf = pSrcBuf+60*in_w*2;
 	for(y=0;y<out_h;)
@@ -1860,7 +1633,6 @@ void SD_NTSC_To_HD_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int 
 		memcpy(pDestBuf,pDestBuf-(out_w*2),out_w*2);
 		pDestBuf += out_w*2;
 		y= y+2;
-		//------------------
 	}
 
 
@@ -1907,11 +1679,9 @@ void HD_To_FHD_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_
 
 	int x,y;
 	BYTE*pSrcBuf;
-	//BYTE*pDestBuf;
 	DWORD *pSrcData;
 	DWORD *pDestData;
 	int    out_w_size;
-	//BYTE*pSrcTmp;
 	BYTE*pDestTmp;
 	out_w_size = out_w*2;
 	pDestData = (DWORD *) pOut;
@@ -1960,7 +1730,6 @@ void FHD_To_SD_NTSC_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int
 	BYTE*pSrcBuf;
 	BYTE*pDestBuf;
 	BYTE *pSrcData;
-	//   BYTE *pDestData;
 	pSrcBuf = pSrc;
 	pDestBuf = pOut;
 	//-- 1920X1080 0->720X480
@@ -1992,13 +1761,11 @@ void FHD_To_SD_PAL_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int 
 	BYTE*pDestBuf;
 	BYTE *pSrcData;
 	BYTE*pDstYUV;
-	//   BYTE *pDestData;
 	int dwJ;
 	pSrcBuf = pSrc;
 	pDestBuf = pOut;
 
 	//-- 1920X1080 0->720X576
-	//-------------------
 	pDstYUV = pDestBuf;
 	for(dwJ=0; dwJ<18*out_w; dwJ++)
 	{
@@ -2006,7 +1773,6 @@ void FHD_To_SD_PAL_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int 
 		pDstYUV[1] = 0x80;
 		pDstYUV +=2;
 	}
-	//------------------
 	pDestBuf += 18*out_w*2;
 	for(y=0;y<540;)
 	{
@@ -2026,7 +1792,6 @@ void FHD_To_SD_PAL_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int 
 		pSrcBuf += in_w*4;
 		y= y+1;
 	}
-	//------------
 	pDstYUV = pDestBuf;
 	for(dwJ=0; dwJ<18*out_w; dwJ++)
 	{
@@ -2034,7 +1799,6 @@ void FHD_To_SD_PAL_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int 
 		pDstYUV[1] = 0x80;
 		pDstYUV +=2;
 	}
-	//------------
 }
 
 void HD_To_SD_NTSC_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h)
@@ -2042,8 +1806,6 @@ void HD_To_SD_NTSC_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int 
 	int y;
 	BYTE*pSrcBuf;
 	BYTE*pDestBuf;
-	//int *pSrcData;
-	// int *pDestData;
 	pSrcBuf = pSrc;
 	pDestBuf = pOut;
 	//-- 1280X720 ->720X480
@@ -2062,10 +1824,8 @@ void HD_To_SD_PAL_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int o
 	int y;
 	BYTE*pSrcBuf;
 	BYTE*pDestBuf;
-	//int dwJ;
 	pSrcBuf = pSrc;
 	pDestBuf = pOut;
-	//BYTE*pDstYUV;
 	//-- 1920X1080 0->720X576
 	pSrcBuf = pSrcBuf + 72*in_w*2;
 	for(y=0;y<out_h;)
@@ -2083,7 +1843,6 @@ void V1280X1024_NTSC_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,in
 	BYTE*pDestBuf;
 	pSrcBuf = pSrc;
 	pDestBuf = pOut;
-	//   BYTE*pDstYUV;
 	//-- 1280X1024 0->720X480
 	pSrcBuf = pSrcBuf + 272*in_w*2;
 	for(y=0;y<out_h;)
@@ -2102,7 +1861,6 @@ void V1280X1024_PAL_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int
 	BYTE*pDestBuf;
 	pSrcBuf = pSrc;
 	pDestBuf = pOut;
-	//   BYTE*pDstYUV;
 	//-- 1280x1024 0->720X576
 	pSrcBuf = pSrcBuf + 224*in_w*2;
 	for(y=0;y<out_h;)
@@ -2123,7 +1881,6 @@ static void VideoRotate90deg(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,i
 	BYTE *pDestData;
 	pSrcBuf = pSrc;
 	pDestBuf = pOut;
-	//DbgPrint("[MV]VideoRotate90deg %dX%d->%dX%d\n",in_w,in_h,out_w,out_h);
 	for(y=0;y<in_h;y++)
 	{
 		pSrcData = pSrcBuf;
@@ -2387,7 +2144,6 @@ static void hws_ymerge_packets(BYTE *d, const BYTE *up, const BYTE *s, int packe
 static void FillNV12ToYUY2(BYTE *pSrc,BYTE *pOut, int nw,int nh,int interlace)
 {
 	BYTE *pVideoMem = pOut ;// g_pD1TempBuffer;
-	//DWORD dwDstPitch = nw;
 	DWORD dwSrcPitch;
 	DWORD dwPacket;
 	BYTE *pSrc1;
@@ -2453,7 +2209,6 @@ static void FillNV12ToYUY2(BYTE *pSrc,BYTE *pOut, int nw,int nh,int interlace)
 	}
 	else
 	{
-		//DbgPrint("nh");
 		nh= nh/2;
 		for( dwI=0; dwI <nh; dwI++)
 		{
@@ -2511,12 +2266,10 @@ static void FillNV12ToYUY2(BYTE *pSrc,BYTE *pOut, int nw,int nh,int interlace)
 		}
 	}
 }
-//-----------
 static void SetDeInterlace(BYTE *pSrc,BYTE *pOut, int nw,int nh,int interlace)
 {
 	int dwSrcPitch = nw*2;
 	int h;
-	//DbgPrint("[MV]SetDeInterlace W=%d H=%d interlace=%d \n",nw,nh,interlace);
 	if(interlace==0)
 	{
 		memcpy(pOut,pSrc,nw*nh*2);
@@ -2536,11 +2289,9 @@ static void SetDeInterlace(BYTE *pSrc,BYTE *pOut, int nw,int nh,int interlace)
 	}
 
 }
-//----------------------------------------------------------------
 static void FillYUU2(BYTE *pSrc,BYTE *pOut, int nw,int nh,int interlace)
 {
 	BYTE *pVideoMem = pOut ;// g_pD1TempBuffer;
-	//	DWORD dwDstPitch = nw;
 	DWORD dwSrcPitch;
 	DWORD dwI;
 	DWORD dwPacket;
@@ -2566,7 +2317,6 @@ static void FillYUU2(BYTE *pSrc,BYTE *pOut, int nw,int nh,int interlace)
 		}
 		/* the last line has no next line for its chroma: black */
 		FillBlackYUYV(pDstYUV - nw*2, nw);
-		//---------------------------------
 	}
 	else
 	{
@@ -2579,20 +2329,16 @@ static void FillYUU2(BYTE *pSrc,BYTE *pOut, int nw,int nh,int interlace)
 			pSrc1 += dwPacket*24;
 			pNextLineSrc1 += dwPacket*24;
 			pDstYUV += dwPacket*32;
-			//------------------------------
 			memcpy(pDstYUV,(pDstYUV-nw*2),nw*2);
 			pDstYUV = pDstYUV+ nw*2;
-			//-----------------------------------
 		}
 		/* the last field line (shown twice) has no next line for its chroma: black */
 		FillBlackYUYV(pDstYUV - 2*nw*2, 2*nw);
-		//---------------------------------
 
 	}
 
 }
 
-//--------------------------------
 
 /*
  * Take at most one queued buffer from every streaming consumer, so each
@@ -2882,7 +2628,7 @@ static void hws_nosig_work(struct kthread_work *work)
     kthread_queue_work(videodev->dev->conv_worker[videodev->index], &videodev->videowork);
 }
 
-void video_data_process(struct kthread_work *p_work)
+static void video_data_process(struct kthread_work *p_work)
 {
     struct hws_video *videodev = container_of(p_work, struct hws_video, videowork);
     struct hws_pcie_dev *pdx = videodev->dev;
@@ -3085,7 +2831,6 @@ void video_data_process(struct kthread_work *p_work)
 static void hws_get_video_param(struct hws_pcie_dev *dev,int index)
 {
 
-	//printk( "%s(): %x \n", __func__, index);
 	int width,height;
 	width= dev->m_pVCAPStatus[index][0].dwWidth;
 	height=dev->m_pVCAPStatus[index][0].dwHeight;
@@ -3095,7 +2840,6 @@ static void hws_get_video_param(struct hws_pcie_dev *dev,int index)
 	dev->video[index].curren_out_height = height;
 	dev->video[index].current_out_framerate = 60;
 	dev->video[index].Interlaced = 0;
-	//printk( "%s(%dx%d):  \n", __func__, width,height);
 
 }
 
@@ -3118,7 +2862,7 @@ static int hws_video_register(struct hws_pcie_dev *dev)
 		video->v4l2_dev.release = hws_v4l2_dev_release;
 		err = v4l2_device_register(&dev->pdev->dev, &video->v4l2_dev);
 		if(err<0){
-			printk(KERN_ERR " v4l2_device_register %d error! \n", i);
+			dev_err(&dev->pdev->dev, "v4l2_device_register %d failed\n", i);
 			goto fail;
 		}
 		/* dropped by hws_v4l2_dev_release() */
@@ -3129,7 +2873,7 @@ static int hws_video_register(struct hws_pcie_dev *dev)
 		video->pixfmt = V4L2_PIX_FMT_YUYV;
 		err = hws_init_controls(video);
 		if (err) {
-			printk(KERN_ERR " control init %d failed: %d\n", i, err);
+			dev_err(&dev->pdev->dev, "control init %d failed: %d\n", i, err);
 			goto fail;
 		}
 		vdev->ctrl_handler = &video->ctrl_handler;
@@ -3155,7 +2899,7 @@ static int hws_video_register(struct hws_pcie_dev *dev)
 		err = video_register_device(vdev, VFL_TYPE_VIDEO,-1);
 		#endif
 		if(err!=0){
-			printk(KERN_ERR " video_register_device %d failed !!!!! \n", i);
+			dev_err(&dev->pdev->dev, "video_register_device %d failed\n", i);
 			goto fail;
 		}
 	}
@@ -3167,25 +2911,6 @@ fail:
 }
 
 /* HDMI 0x39[3:0] - CS_DATA[27:24] 0 for reserved values*/
-static const int cs_data_fs[] = {
-	44100,
-	0,
-	48000,
-	32000,
-	0,
-	0,
-	0,
-	0,
-	88200,
-	768000,
-	96000,
-	0,
-	176000,
-	0,
-	192000,
-	0,
-};
-#if 1
 static struct snd_pcm_hardware audio_pcm_hardware = {
 	.info 				=	(SNDRV_PCM_INFO_MMAP |
 	SNDRV_PCM_INFO_INTERLEAVED |
@@ -3205,23 +2930,7 @@ static struct snd_pcm_hardware audio_pcm_hardware = {
 	.periods_min 		=	2,
 	.periods_max 		=	255,
 };
-#else
-static struct snd_pcm_hardware audio_pcm_hardware ={
-	.info =  (SNDRV_PCM_INFO_INTERLEAVED |SNDRV_PCM_INFO_BLOCK_TRANSFER ),
-	.formats = (SNDRV_PCM_FMTBIT_S16_LE),
-	.rates = SNDRV_PCM_RATE_KNOT | SNDRV_PCM_RATE_48000,
-	.rate_min = 48000,
-	.rate_max = 48000,
-	.channels_min = 2,
-	.channels_max =2,
-	.period_bytes_min = HWS_AUDIO_CELL_SIZE,
-	.period_bytes_max = HWS_AUDIO_CELL_SIZE,
-	.periods_min      = 4,
-	.periods_max      = 4,
-	.buffer_bytes_max = HWS_AUDIO_CELL_SIZE*4,
-};
-#endif
-int hws_pcie_audio_open(struct snd_pcm_substream *substream)
+static int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 {
 	struct hws_audio *drv = snd_pcm_substream_chip(substream);
 	struct snd_pcm_runtime *runtime = substream->runtime;
@@ -3229,7 +2938,6 @@ int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 
 	unsigned long flags;
 
-	//printk(KERN_INFO "%s() index:%x\n",__func__,drv->index);
 	runtime->hw = audio_pcm_hardware;
 	spin_lock_irqsave(&drv->ring_lock, flags);
 	drv->sample_rate_out        = 48000;
@@ -3237,7 +2945,6 @@ int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 	drv->running                = false;
 	drv->substream = substream;
 	spin_unlock_irqrestore(&drv->ring_lock, flags);
-	//snd_pcm_hw_constraint_minmax(runtime,SNDRV_PCM_HW_PARAM_RATE,setrate,setrate);
 	return 0;
 }
 
@@ -3253,7 +2960,7 @@ static void hws_audio_sync(struct hws_audio *drv)
 	mutex_unlock(&pdx->irq_lock);
 }
 
-int hws_pcie_audio_close(struct snd_pcm_substream *substream)
+static int hws_pcie_audio_close(struct snd_pcm_substream *substream)
 {
 	struct hws_audio *drv = snd_pcm_substream_chip(substream);
 	unsigned long flags;
@@ -3266,24 +2973,20 @@ int hws_pcie_audio_close(struct snd_pcm_substream *substream)
 	hws_audio_sync(drv);
 	return 0;
 }
-int hws_pcie_audio_hw_params(struct snd_pcm_substream *substream, struct snd_pcm_hw_params *hw_params)
+static int hws_pcie_audio_hw_params(struct snd_pcm_substream *substream, struct snd_pcm_hw_params *hw_params)
 {
-	//printk(KERN_INFO "%s() \n",__func__);
 	return snd_pcm_lib_malloc_pages(substream, params_buffer_bytes(hw_params));
 }
 
-int hws_pcie_audio_hw_free(struct snd_pcm_substream *substream)
+static int hws_pcie_audio_hw_free(struct snd_pcm_substream *substream)
 {
-	//printk(KERN_INFO "%s() \n",__func__);
 	return snd_pcm_lib_free_pages(substream);
 }
 
-int hws_pcie_audio_prepare(struct snd_pcm_substream *substream)
+static int hws_pcie_audio_prepare(struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct hws_audio *drv = snd_pcm_substream_chip(substream);
-	//struct hws_pcie_dev *dev= drv->dev;
-	//int i;
 	unsigned long flags;
 
 	/* a delivery left over from the previous run must not land in the new one */
@@ -3299,7 +3002,7 @@ int hws_pcie_audio_prepare(struct snd_pcm_substream *substream)
 
 	return 0;
 }
-int hws_pcie_audio_trigger(struct snd_pcm_substream *substream, int cmd)
+static int hws_pcie_audio_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct hws_audio *chip = snd_pcm_substream_chip(substream);
 	struct hws_pcie_dev *dev= chip->dev;
@@ -3309,11 +3012,7 @@ int hws_pcie_audio_trigger(struct snd_pcm_substream *substream, int cmd)
 			/* shut down / being removed: the card stays off */
 			if (READ_ONCE(dev->removing))
 				return -ENODEV;
-			//HWS_PCIE_READ(HWS_DMA_BASE(chip->index), HWS_DMA_STATUS);
 			//start dma
-			//HWS_PCIE_WRITE(HWS_INT_BASE, HWS_DMA_MASK(chip->index), 0x00000001);
-			//HWS_PCIE_WRITE(HWS_DMA_BASE(chip->index), HWS_DMA_START, 0x00000001);
-			//printk(KERN_INFO "SNDRV_PCM_TRIGGER_START index:%x\n",chip->index);
 			/* reset the capture queue before deliveries are accepted again */
 			StartAudioCapture(dev,chip->index);
 			spin_lock_irqsave(&chip->ring_lock, flags);
@@ -3325,9 +3024,6 @@ int hws_pcie_audio_trigger(struct snd_pcm_substream *substream, int cmd)
 		case SNDRV_PCM_TRIGGER_STOP:
 		case SNDRV_PCM_TRIGGER_SUSPEND:
 			//stop dma
-			//HWS_PCIE_WRITE(HWS_INT_BASE, HWS_DMA_MASK(chip->index), 0x000000000);
-			//HWS_PCIE_WRITE(HWS_DMA_BASE(chip->index), HWS_DMA_START, 0x00000000);
-			//printk(KERN_INFO "SNDRV_PCM_TRIGGER_STOP index:%x\n",chip->index);
 			StopAudioCapture(dev,chip->index);
 			spin_lock_irqsave(&chip->ring_lock, flags);
 			chip->running = false;
@@ -3335,30 +3031,23 @@ int hws_pcie_audio_trigger(struct snd_pcm_substream *substream, int cmd)
 			break;
 		default:
 			return -EINVAL;
-			break;
 	}
 	return 0;
 }
-//-------------------------------------------------
 
 
-//-------------------------------------------------
 static snd_pcm_uframes_t hws_pcie_audio_pointer(struct snd_pcm_substream *substream)
 {
 	struct hws_audio *drv = snd_pcm_substream_chip(substream);
-	//struct snd_pcm_runtime *runtime = substream->runtime;
 	snd_pcm_uframes_t pos;
-	int dwAudioCh;
 	unsigned long flags;
-	dwAudioCh = drv->index;
-	//printk(KERN_INFO "%s() index:%x\n",__func__,dwAudioCh);
 	spin_lock_irqsave(&drv->ring_lock,flags);  //spin_lock
 	pos = drv->ring_wpos_byframes;
 	spin_unlock_irqrestore(&drv->ring_lock,flags); //spin_unlock
 	return pos;
 }
 
-struct snd_pcm_ops hws_pcie_pcm_ops ={
+static const struct snd_pcm_ops hws_pcie_pcm_ops ={
 	.open =			hws_pcie_audio_open,
 	.close = 		hws_pcie_audio_close,
 	.ioctl =		snd_pcm_lib_ioctl,
@@ -3387,7 +3076,7 @@ static int hws_audio_register(struct hws_pcie_dev *dev)
 		snprintf(pcm_name, sizeof(pcm_name), "%s %d PCM", HWS_AUDOI_NAME, i+ai_index);
 		ret = snd_card_new(&dev->pdev->dev, -1, card_id, THIS_MODULE, 0, &card);
 		if (ret < 0){
-			printk(KERN_ERR "%s() ERROR: snd_card_new failed <%d>\n",__func__, ret);
+			dev_err(&dev->pdev->dev, "snd_card_new failed: %d\n", ret);
 			goto fail;
 		}
 		/* from here on freeing the card drops this reference */
@@ -3400,7 +3089,7 @@ static int hws_audio_register(struct hws_pcie_dev *dev)
 
 		ret = snd_pcm_new(card,pcm_name,0,0,1,&pcm);
 		if (ret < 0){
-			printk(KERN_ERR "%s() ERROR: snd_pcm_new failed <%d>\n",__func__, ret);
+			dev_err(&dev->pdev->dev, "snd_pcm_new failed: %d\n", ret);
 			snd_card_free(card);
 			goto fail;
 		}
@@ -3418,13 +3107,12 @@ static int hws_audio_register(struct hws_pcie_dev *dev)
 			audio_pcm_hardware.buffer_bytes_max,
 			audio_pcm_hardware.buffer_bytes_max
 		);
-		//----------------------------
 		dev->audio[i].sample_rate_out        = 48000;
 		dev->audio[i].channels               = 2;
 		dev->audio[i].resampled_buf_size = dev->audio[i].sample_rate_out * 2/* sample bytes */ * dev->audio[i].channels /* channels */;
 		ret = snd_card_register(card);
 		if ( ret < 0) {
-			printk(KERN_ERR "%s() ERROR: snd_card_register failed\n",__func__);
+			dev_err(&dev->pdev->dev, "snd_card_register failed\n");
 			snd_card_free(card);
 			goto fail;
 		}
@@ -3435,30 +3123,18 @@ fail:
 	hws_audio_unregister(dev);
 	return ret;
 }
-//-------------------
-//static unsigned long video_data[MAX_VID_CHANNELS];
-//static unsigned long audio_data[MAX_VID_CHANNELS];
-
 
 
 static void  WRITE_REGISTER_ULONG (struct hws_pcie_dev *pdx,u32 RegisterOffset,u32 Value)
 {
-	//map_bar0_addr[RegisterOffset/4] = Value;
-	char *bar0;
-	bar0 = (char*)pdx->map_bar0_addr;
-	iowrite32(Value,bar0+RegisterOffset);
-	//map_bar0_addr[RegisterOffset/4] = Value;
+	iowrite32(Value, pdx->map_bar0_addr + RegisterOffset);
 
 }
 
 static u32 READ_REGISTER_ULONG (struct hws_pcie_dev *pdx,u32 RegisterOffset)
 {
-	char *bar0;
-	bar0 = (char*)pdx->map_bar0_addr;
-	//return(map_bar0_addr[RegisterOffset/4]);
-	return(ioread32(bar0+RegisterOffset));
+	return ioread32(pdx->map_bar0_addr + RegisterOffset);
 }
-//----------------------------------------------
 static int Check_Busy(struct hws_pcie_dev *pdx)
 {
 	u32  statusreg;
@@ -3476,15 +3152,14 @@ static int Check_Busy(struct hws_pcie_dev *pdx)
 		{
 			return 0;
 		}
-		msleep(10);
+		usleep_range(10000, 11000);	/* msleep(10) may take 20 ms: keep the timeout honest */
 	}
-	printk(KERN_WARNING "HwsCapture: DSP did not go idle, status %X\n", statusreg);
+	dev_warn(&pdx->pdev->dev, "DSP did not go idle, status %X\n", statusreg);
 	return -ETIMEDOUT;
 }
 
 static void StopDsp(struct hws_pcie_dev *pdx)
 {
-	//int j, i;
 	u32  statusreg;
 	statusreg = READ_REGISTER_ULONG(pdx,(u32)(CVBS_IN_BASE));
 	if (statusreg == 0xFFFFFFFF)
@@ -3523,7 +3198,6 @@ static void EnableVideoCapture(struct hws_pcie_dev *pdx,int index,int en)
 	WRITE_REGISTER_ULONG(pdx,( CVBS_IN_BASE + (2 * PCIE_BARADDROFSIZE)), status);
 	status = READ_REGISTER_ULONG(pdx,(CVBS_IN_BASE+2*PCIE_BARADDROFSIZE));
 	spin_unlock_irqrestore(&pdx->reg_lock, flags);
-	//printk("EnableVideoCapture[%d]=%X %d \n",index,status,pdx->m_bVCapStarted[index]);
 }
 static void EnableAudioCapture(struct hws_pcie_dev *pdx,int index,int en)
 {
@@ -3550,7 +3224,6 @@ static void EnableAudioCapture(struct hws_pcie_dev *pdx,int index,int en)
 	}
 	WRITE_REGISTER_ULONG(pdx,( CVBS_IN_BASE + (3 * PCIE_BARADDROFSIZE)), status);
 	spin_unlock_irqrestore(&pdx->reg_lock, flags);
-	//printk("EnableAudioCapture =%X",status);
 }
 
 /*
@@ -3573,8 +3246,6 @@ static int SetVideoFormteSize(struct hws_pcie_dev *pdx,int ch,int w,int h)
 {
 	int hf_size;
 	int down_size;
-	//int frame_size;
-	//int buf_cnt;
 
 	if(pdx->m_Device_SupportYV12 ==0)
 	{
@@ -3605,7 +3276,6 @@ static int SetVideoFormteSize(struct hws_pcie_dev *pdx,int ch,int w,int h)
 	pdx->m_format[ch].dwWidth = w;		 // Image Width
 	pdx->m_format[ch].HLAF_SIZE = hf_size;
 	pdx->m_format[ch].DWON_SIZE =down_size;
-	//DbgPrint("[MV-X1]-CH0 SetVideoFormteSize = %d %d \n",m_format[ch].HLAF_SIZE,m_format[ch].DWON_SIZE);
 
 	return 1;
 
@@ -3662,13 +3332,12 @@ static int  DmaMemAllocPool(struct hws_pcie_dev *pdx)
 	}
 	/* from here on DmaMemFreePool() releases whatever got allocated */
 	pdx->m_bBufferAllocate = TRUE;
-	//------------
 	for(i=0; i<pdx->m_nMaxChl; i++)
 	{
 		pdx->m_pbyVideoBuffer[i] = dma_alloc_coherent(&pdx->pdev->dev, pdx->m_MaxHWVideoBufferSize, &pdx->m_pbyVideo_phys[i], GFP_KERNEL);
 		if(pdx->m_pbyVideoBuffer[i]== NULL)
 		{
-			printk(KERN_ERR "HwsCapture: DMA buffer %d allocation failed\n", i);
+			dev_err(&pdx->pdev->dev, "DMA buffer %d allocation failed\n", i);
 			goto fail;
 		}
 		phy_addr = 	pdx->m_pbyVideo_phys[i];
@@ -3748,20 +3417,11 @@ static void hws_hw_stop(struct hws_pcie_dev *pdx)
 
 static void irq_teardown(struct hws_pcie_dev *lro)
 {
-	//int i;
 
-	//BUG_ON(!lro);
 
-	//if (lro->msix_enabled) {
-	//	for (i = 0; i < lro->irq_user_count; i++) {
-	//		printk("Releasing IRQ#%d\n", lro->entry[i].vector);
-	//		free_irq(lro->entry[i].vector, &lro->user_irq[i]);
-	//	}
-	//}
 	//else
 
 	if (lro->irq_line != -1) {
-		//printk("Releasing IRQ#%d\n", lro->irq_line);
 		free_irq(lro->irq_line, lro);
 	}
 }
@@ -3921,13 +3581,11 @@ static void hws_block_streams(struct hws_pcie_dev *dev)
 	}
 }
 
-//----------------------------
 static void hws_remove(struct pci_dev *pdev)
 {
 	int i;
 	struct hws_pcie_dev *dev =
 	(struct hws_pcie_dev*) pci_get_drvdata(pdev);
-	//----------------------------
 	if(dev == NULL || dev->map_bar0_addr == NULL) return;
 
 	/* surprise removal: don't touch registers of a card that is gone (some
@@ -3968,7 +3626,6 @@ static void hws_remove(struct pci_dev *pdev)
 	hws_video_release_v4l2(dev);
 	kref_put(&dev->kref, hws_dev_release);
 }
-//---------------------------------------
 static void CheckCardStatus(struct hws_pcie_dev *pdx)
 {
 	ULONG status;
@@ -4018,7 +3675,6 @@ static int  StartAudioCapture(struct hws_pcie_dev *pdx,int index)
 			CheckCardStatus(pdx);
 			EnableAudioCapture(pdx,index,1);
 		}
-		//DbgPrint("Re StartAudioCapture =%d",index);
 		return -1;
 	}
 	CheckCardStatus(pdx);
@@ -4054,9 +3710,7 @@ static int StartVideoCapture(struct hws_pcie_dev *pdx,int index)
 		}
 		return -1;
 	}
-	//--------------------
 	CheckCardStatus(pdx);
-	//--------------------
 	spin_lock_irqsave(&pdx->videoslock[index], flags);
 	for (j = 0; j<MAX_VIDEO_QUEUE; j++)
 	{
@@ -4089,61 +3743,26 @@ static int StartVideoCapture(struct hws_pcie_dev *pdx,int index)
 
 static void StopVideoCapture(struct hws_pcie_dev *pdx,int index)
 {
-	//int inc=0;
 
 	if(pdx->m_bVCapStarted[index] ==0) return;
-	//pdx->m_nVideoIndex[index] =0;
 	pdx->m_VideoInfo[index].dwisRuning = 0;
 	pdx->m_bVideoStop[index] = 1;
 	pdx->m_pVideoEvent[index] = 0;
 	pdx->m_bChangeVideoSize[index] = 0;
-	#if 0
-	while(1)
-	{
-	if(pdx->m_bVideoStop[index] ==0)
-	{
-	break;
-}
-inc++;
-if(inc >2000)
-{
-break;
-}
-msleep(10);
-}
-#endif
 EnableVideoCapture(pdx,index,0);
 pdx->m_bVCapIntDone[index] = 0;
 }
 static void StopAudioCapture(struct hws_pcie_dev *pdx,int index)
 {
-	//int inc=0;
 	if(pdx->m_bAudioRun[index] ==0) return;
 	pdx->m_bAudioRun[index] = 0;
 	pdx->m_bAudioStop[index] = 1;
 	pdx->m_nAudioBufferIndex[index] =0;
 	pdx->m_AudioInfo[index].dwisRuning =0;
-	#if 0
-	while(1)
-	{
-	if(pdx->m_bAudioStop[index] ==0)
-	{
-	break;
-}
-inc++;
-if(inc >2000)
-{
-break;
-}
-msleep(10);
-}
-#endif
 EnableAudioCapture(pdx,index,0);
 }
-//-----------------------------
 
 
-//-----------------------------
 /* the "not yet rewritten" marker can sit at any byte offset for odd line pitches */
 static inline u32 hws_get_mark(const void *p)
 {
@@ -4633,7 +4252,6 @@ static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder,int mVideoB
 			pdx->m_half1_ts[nDecoder] = t_irq;
 		}
 	}
-	//-------------------------------
 	if(vi->dwisRuning ==1)
 	{
 		int dret = hws_direct_half(pdx, nDecoder, mVideoBufIndex, pDmaSrcBuf, halfsize,
@@ -4734,8 +4352,7 @@ static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder,int mVideoB
 	hws_put_mark(pMask);
 	return committed ? 0 : 1;
 }
-//------------------------------------
-int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh,int half)
+static int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh,int half)
 {
 	int i=0;
 	BYTE *bBuf = NULL;
@@ -4752,7 +4369,6 @@ int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh,int half)
 		pSrcBuf =  pdx->m_pbyAudioBuffer[dwAudioCh];
 	}
 
-	//-----------------------------------------------------
 	nIndex = -1;
 	if(pdx->m_AudioInfo[dwAudioCh].dwisRuning ==1)
 	{
@@ -4807,7 +4423,7 @@ int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh,int half)
 	return 0;
 }
 
-int SetAudioQuene( struct hws_pcie_dev *pdx,int dwAudioCh,int half)
+static int SetAudioQuene( struct hws_pcie_dev *pdx,int dwAudioCh,int half)
 {
 	int status =-1;
 	if(!pdx->m_bACapStarted[dwAudioCh])
@@ -4871,14 +4487,11 @@ static int SetQuene(struct hws_pcie_dev  *pdx,int nDecoder,int half)
 
 		return -1 ;
 	}
-	//-------------------
 	if(pdx->m_DeviceHW_Version ==0)
 	{
 		atomic_inc(&pdx->m_dwSWFrameRate[nDecoder]);
 	}
-	//-------------------
 	pdx->m_nVideoBusy[nDecoder] = 1;
-	//-------------------------------
 	if(pdx->m_bVCapStarted[nDecoder] == TRUE)
 	{
 		status = MemCopyVideoToSteam(pdx,nDecoder,half);
@@ -4925,7 +4538,6 @@ static void hws_video_dpc(struct hws_pcie_dev *pdx, int i)
 		}
 	}
 }
-//-----------------------------
 /*
  * Hard IRQ: acknowledge every source, note which DMA halves finished and when,
  * and wake the IRQ thread. The multi-megabyte copies run in the thread
@@ -5094,22 +4706,15 @@ static void hws_copy_work(struct kthread_work *work)
 
 static struct hws_pcie_dev *alloc_dev_instance(struct pci_dev *pdev)
 {
-	//int i;
 	struct hws_pcie_dev *lro;
 
 	BUG_ON(!pdev);
 
 	/* allocate zeroed device book keeping structure */
 	lro = kzalloc(sizeof(struct hws_pcie_dev), GFP_KERNEL);
-	if (!lro) {
-		printk("Could not kzalloc(hws_pcie_dev).\n");
+	if (!lro)
 		return NULL;
-	}
 
-	//lro->magic = MAGIC_DEVICE;
-	//lro->config_bar_idx = -1;
-	//lro->user_bar_idx = -1;
-	//lro->bypass_bar_idx = -1;
 	lro->irq_line = -1;
 
 	/* create a device to driver reference */
@@ -5117,14 +4722,8 @@ static struct hws_pcie_dev *alloc_dev_instance(struct pci_dev *pdev)
 	/* create a driver to device reference; held until the last file is closed
 	 * (querycap and vb2 use pdev after an unbind) */
 	lro->pdev = pci_dev_get(pdev);
-	//printk("probe() lro = 0x%p\n", lro);
 
 	/* Set up data user IRQ data structures */
-	//for (i = 0; i < MAX_USER_IRQ; i++) {
-	//	lro->user_irq[i].lro = lro;
-	//	spin_lock_init(&lro->user_irq[i].events_lock);
-	//	init_waitqueue_head(&lro->user_irq[i].events_wq);
-	//}
 
 	return lro;
 }
@@ -5132,32 +4731,17 @@ static struct hws_pcie_dev *alloc_dev_instance(struct pci_dev *pdev)
 
 static void SetDMAAddress(struct hws_pcie_dev *pdx)
 {
-	//-------------------------------------
 
 	u32 Addrmsk;
 	u32 AddrLowmsk;
-	//u32 AddrPageSize;
-	//u32 Addr2PageSize;
 	u32 PhyAddr_A_Low;
 	u32 PhyAddr_A_High;
 
-	//u32 PhyAddr_A_Low2;
-	//u32 PhyAddr_A_High2;
-	//u32 PCI_Addr2;
 
 	u32 PCI_Addr;
-	//u32 AVALON_Addr;
 	u32 cnt;
-	//u64 m_tmp64cnt = 0;
-	//u32 RDAvalon = 0;
-	//u32 m_AddreeSpace = 0;
 	int i = 0;
-	u32 m_ReadTmp;
-	u32 m_ReadTmp2;
-	//u32 m_ReadTmp3;
-	//u32 m_ReadTmp4;
 	DWORD halfframeLength=0;
-	//DWORD m_Valude;
 	PhyAddr_A_High = 0;
 	PhyAddr_A_Low=0;
 	PCI_Addr =0;
@@ -5168,12 +4752,10 @@ static void SetDMAAddress(struct hws_pcie_dev *pdx)
 	Addrmsk = PCI_E_BAR_ADD_MASK;
 	AddrLowmsk = PCI_E_BAR_ADD_LOWMASK;
 
-	//printk("[MV]1DispatchCreate :Addrmsk = %X  AddrPageSize =%X Addr2PageSize =%X \n", Addrmsk, AddrPageSize, Addr2PageSize);
 
 	cnt = 0x208;  // Table address
 	for (i = 0; i< pdx->m_nMaxChl; i++)
 	{
-		//printk("[MV] pdx->m_pbyVideoBuffer[%d]=%x\n", i, pdx->m_pbyVideoBuffer[i]);
 		if (pdx->m_pbyVideoBuffer[i])
 		{
 			PhyAddr_A_Low = pdx->m_dwVideoBuffer[i];
@@ -5183,51 +4765,37 @@ static void SetDMAAddress(struct hws_pcie_dev *pdx)
 			PhyAddr_A_Low = (PhyAddr_A_Low&Addrmsk);
 
 
-			//printk("[MV]1-pdx->m_dwVideoBuffer[%d]-%X\n",i,pdx->m_dwVideoBuffer[i]);
-			//-------------------------------------------------------------------------------
 			WRITE_REGISTER_ULONG(pdx,(PCI_ADDR_TABLE_BASE + cnt),PhyAddr_A_High);
 			WRITE_REGISTER_ULONG(pdx,(PCI_ADDR_TABLE_BASE + cnt+PCIE_BARADDROFSIZE),PhyAddr_A_Low);  //Entry 0
-			//----------------------------------------
-			m_ReadTmp =  READ_REGISTER_ULONG(pdx,(PCI_ADDR_TABLE_BASE + cnt));
-			m_ReadTmp2 = READ_REGISTER_ULONG(pdx,(PCI_ADDR_TABLE_BASE + cnt+PCIE_BARADDROFSIZE));
-			//printk("[MV]1-PCI_Addr[%d] :PhyAddr_A_Low  %X=%X  PhyAddr_A_High %X=%X\n", i, PhyAddr_A_Low, m_ReadTmp2, PhyAddr_A_High, m_ReadTmp);
+			(void)READ_REGISTER_ULONG(pdx,(PCI_ADDR_TABLE_BASE + cnt));
+			(void)READ_REGISTER_ULONG(pdx,(PCI_ADDR_TABLE_BASE + cnt+PCIE_BARADDROFSIZE));
 
 
-			//--------------------------
 			WRITE_REGISTER_ULONG(pdx,( CBVS_IN_BUF_BASE + (i*PCIE_BARADDROFSIZE)), ((i+1)*PCIEBAR_AXI_BASE)+PCI_Addr); //Buffer 1 address
 			halfframeLength = pdx->m_format[i].HLAF_SIZE/16;
 			WRITE_REGISTER_ULONG(pdx,( CBVS_IN_BUF_BASE2 + (i*PCIE_BARADDROFSIZE)),halfframeLength); //Buffer 1 address
 
 
-			m_ReadTmp =  READ_REGISTER_ULONG(pdx,(  CBVS_IN_BUF_BASE + (i*PCIE_BARADDROFSIZE)));
-			m_ReadTmp2 = READ_REGISTER_ULONG(pdx,(  CBVS_IN_BUF_BASE2 + (i*PCIE_BARADDROFSIZE)));
-			//printk("[MV]1-Avalone [X64]BUF[%d]:BUF1=%X  BUF2=%X\n", i,  m_ReadTmp,  m_ReadTmp2);
+			(void)READ_REGISTER_ULONG(pdx,(  CBVS_IN_BUF_BASE + (i*PCIE_BARADDROFSIZE)));
+			(void)READ_REGISTER_ULONG(pdx,(  CBVS_IN_BUF_BASE2 + (i*PCIE_BARADDROFSIZE)));
 
-			//---------------------------
 
 		}
 		cnt +=8;
-		#if 1
 		if(pdx->m_pbyAudioBuffer[i])
 		{
 			PhyAddr_A_Low = pdx->m_dwAudioBuffer[i];
 			PhyAddr_A_High = pdx->m_dwAudioBufferHigh[i];
 			PCI_Addr = (PhyAddr_A_Low&AddrLowmsk);
 			PhyAddr_A_Low = (PhyAddr_A_Low&Addrmsk);
-			//printk("[X1]Audio:PCI_Addr =%X\n",PCI_Addr);
-			//printk("[X1]Audio:-------- - LOW=%X  HIGH =%X\n",pdx->m_dwAudioBuffer[i],pdx->m_dwAudioBufferHigh[i]);
 			WRITE_REGISTER_ULONG(pdx,(CBVS_IN_BUF_BASE + ((8+i)*PCIE_BARADDROFSIZE)), ((i+1)*PCIEBAR_AXI_BASE+PCI_Addr)); //Buffer 1 address
-			m_ReadTmp = READ_REGISTER_ULONG(pdx,(CBVS_IN_BUF_BASE + ((8+i)*PCIE_BARADDROFSIZE)));
-			//printk("[X1]Audio:[%d] :--------BUF1: %X=%X\n",i,(PCIEBAR_AXI_BASE+PCI_Addr),m_ReadTmp);
+			(void)READ_REGISTER_ULONG(pdx,(CBVS_IN_BUF_BASE + ((8+i)*PCIE_BARADDROFSIZE)));
 		}
-		#endif
 	}
 	hws_enable_card_irqs(pdx); //enable PCI Interruput
-	//WRITE_REGISTER_ULONG(PCIEBR_EN_REG_BASE, 0xFFFFFFFF);
 
 }
 
-//-----------------------------------
 static void ChangeVideoSize(struct hws_pcie_dev *pdx,int ch,int w,int h,int interlace)
 {
 	int j;
@@ -5271,7 +4839,6 @@ static int Get_Video_Status(struct hws_pcie_dev *pdx,unsigned int  ch)
 	int interlace=0;
 	int offset;
 	int no_video;
-	//int check_res=0;
 	int video_hdcp;
 	unsigned char br;
 	unsigned char co;
@@ -5289,7 +4856,7 @@ static int Get_Video_Status(struct hws_pcie_dev *pdx,unsigned int  ch)
 		if (pdx->m_lost_reads < 3 && ++pdx->m_lost_reads == 3)
 		{
 			WRITE_ONCE(pdx->m_PciDeviceLost, 1);
-			printk(KERN_WARNING "HwsCapture: card stopped responding\n");
+			dev_warn(&pdx->pdev->dev, "card stopped responding\n");
 		}
 		/* gone: "no signal"; a glitch so far: keep what we had */
 		return READ_ONCE(pdx->m_PciDeviceLost) ? 1 : READ_ONCE(pdx->m_curr_No_Video[ch]);
@@ -5300,26 +4867,22 @@ static int Get_Video_Status(struct hws_pcie_dev *pdx,unsigned int  ch)
 		/* it is back (link retrained); CheckVideFmt re-arms the streaming channels */
 		WRITE_ONCE(pdx->m_PciDeviceLost, 0);
 		pdx->m_recovered = 1;
-		printk(KERN_INFO "HwsCapture: card responds again\n");
+		dev_info(&pdx->pdev->dev, "card responds again\n");
 	}
 	active_video = ((value&0xFF)>>ch)&0x01;
 	interlace = value>>8;
 	interlace = ((interlace&0xFF)>>ch)&0x01;
-	//printk("[MV][%d] active_video %d\n",ch,active_video);
 	if(active_video >0)
 	{
 		if(pdx->m_DeviceHW_Version>0)
 		{
 			offset = 110 + ch;
 			frame_rate = READ_REGISTER_ULONG(pdx,(DWORD)(CVBS_IN_BASE + (offset*PCIE_BARADDROFSIZE)));
-			//DbgPrint("[MV][%d] Frame= %d\n",ch,frame_rate);
 			if(frame_rate !=pdx->m_pVCAPStatus[ch][0].dwFrameRate )
 			{
 				pdx->m_pVCAPStatus[ch][0].dwFrameRate = frame_rate;
 			}
-			//-------------------
 			offset = 120 + ch;
-			//DbgPrint("[MV][%d] active_video %d\n",ch,interlace);
 			value =  READ_REGISTER_ULONG(pdx,(DWORD)(CVBS_IN_BASE + (offset*PCIE_BARADDROFSIZE)));
 			out_res_w = value&0xFFFF;
 			out_res_h = (value>>16)&0xFFFF;
@@ -5328,21 +4891,15 @@ static int Get_Video_Status(struct hws_pcie_dev *pdx,unsigned int  ch)
 				out_value = pdx->m_pVCAPStatus[ch][0].dwOutHeight;
 				out_value =(out_value<<16)|pdx->m_pVCAPStatus[ch][0].dwOutWidth;
 				WRITE_REGISTER_ULONG(pdx,(DWORD)(CVBS_IN_BASE + (offset*PCIE_BARADDROFSIZE)), out_value);
-				//DbgPrint("[MV][%d] out_res_w=%d out_res_h=%d\n",ch,out_res_w,out_res_h);
-				//DbgPrint("[MV][%d] out_w=%d out_h=%d \n",ch,m_pVCAPStatus[ch][0].dwOutWidth,m_pVCAPStatus[ch][0].dwOutHeight );
 			}
 			offset = 130 + ch;
 			out_frame_rate = READ_REGISTER_ULONG(pdx,(DWORD)(CVBS_IN_BASE + (offset*PCIE_BARADDROFSIZE)));
 			if(out_frame_rate !=pdx->m_pVCAPStatus[ch][0].dwOutFrameRate )
 			{
 				WRITE_REGISTER_ULONG(pdx,(DWORD)(CVBS_IN_BASE + (offset*PCIE_BARADDROFSIZE)), pdx->m_pVCAPStatus[ch][0].dwOutFrameRate);
-				//DbgPrint("[MV][%d]  out_rate=%d ?=%d \n",ch,out_frame_rate,m_pVCAPStatus[ch][0].dwOutFrameRate );
 
 			}
-			//---------------------------------
-			//-----------------------------------------
 			offset = 91 + ch*2;
-			//DbgPrint("[MV][%d] active_video %d\n",ch,interlace);
 			value =  READ_REGISTER_ULONG(pdx,(DWORD)(CVBS_IN_BASE + (offset*PCIE_BARADDROFSIZE)));
 			br = value&0xFF;
 			co= (value>>8)&0xFF;
@@ -5356,12 +4913,10 @@ static int Get_Video_Status(struct hws_pcie_dev *pdx,unsigned int  ch)
 				out_value  = (out_value<<8)|pdx->m_contrast[ch];
 				out_value  = (out_value<<8)|pdx->m_brightness[ch];
 				WRITE_REGISTER_ULONG(pdx,(DWORD)(CVBS_IN_BASE + (offset*PCIE_BARADDROFSIZE)), out_value);
-				//DbgPrint("[MV][%d] value=%X ?=%X\n",ch,value,out_value);
 			}
 			value =  READ_REGISTER_ULONG(pdx,(DWORD)(CVBS_IN_BASE + (8*PCIE_BARADDROFSIZE)));
 			video_hdcp = ((value&0xFF)>>ch)&0x01;
 			pdx->m_pVCAPStatus[ch][0].dwhdcp = video_hdcp;
-			//DbgPrint("[MV][%d]support hdcp %d\n",ch,video_hdcp);
 		}
 		else if (ktime_get_ns() - pdx->m_sw_rate_t0[ch] >= NSEC_PER_SEC)  //---------------
 		{
@@ -5399,9 +4954,7 @@ static int Get_Video_Status(struct hws_pcie_dev *pdx,unsigned int  ch)
 				}
 			}
 		}
-		//------------------------------------------------
 		offset = 90 + ch*2;
-		//DbgPrint("[MV][%d] active_video %d\n",ch,interlace);
 		value =  READ_REGISTER_ULONG(pdx,(DWORD)(CVBS_IN_BASE + (offset*PCIE_BARADDROFSIZE)));
 		res_w = value&0xFFFF;
 		res_h = (value>>16)&0xFFFF;
@@ -5417,7 +4970,6 @@ static int Get_Video_Status(struct hws_pcie_dev *pdx,unsigned int  ch)
 		}
 
 		no_video = 0;
-		//printk("[MV-X1]-[ch-%d]W=%d H=%d interlace =%d %dx%d \n",ch,res_w,res_h,interlace,pdx->m_pVCAPStatus[ch][0].dwWidth, pdx->m_pVCAPStatus[ch][0].dwHeight);
 	}
 	else
 	{
@@ -5430,40 +4982,11 @@ static int Get_Video_Status(struct hws_pcie_dev *pdx,unsigned int  ch)
 
 static void CheckVideFmt (struct hws_pcie_dev *pdx)
 {
-	//PAGED_CODE();
 	int i;
-	//DWORD value;
-	//DWORD SetData;
-	//	int ret=0;
-	//int nNeed_ReInit =0;
-	//	unsigned char mark=1;
 
 
 	for(i =0; i<pdx->m_nCurreMaxVideoChl;i++)
 	{
-		#if 0
-		value =  ReadDevReg((DWORD)(CVBS_IN_BASE + ((91+i*2)*PCIE_BARADDROFSIZE)));
-		m_brightness[i] = value&0xFF;
-		m_contrast[i] =  (value>>8)&0xFF;
-		m_hue[i] = (value>>16)&0xFF;
-		m_saturation[i] = (value>>24)&0xFF;
-		//DbgPrint("[MV]value[%d]= %X\n",i,value);
-		if((g_contrast[i] != m_contrast[i])||(g_brightness[i] != m_brightness[i])||(g_saturation[i] != m_saturation[i])||(g_hue[i] != m_hue[i]))
-		{
-
-		//DbgPrint("[MV]m_brightness[%d]= %d %d \n",i,m_brightness[i],g_brightness[i]);
-		//DbgPrint("[MV]m_contrast[%d]= %d %d\n",i,m_contrast[i],g_contrast[i]);
-		//DbgPrint("[MV]m_hue[%d]= %d %d \n",i,m_hue[i],g_hue[i]);
-		//DbgPrint("[MV]m_saturation[%d]= %d %d \n",i,m_saturation[i],g_saturation[i] );
-		SetData = g_saturation[i]<<24;
-		SetData  |=g_hue[i]<<16;
-		SetData  |=g_contrast[i]<<8;
-		SetData  |=g_brightness[i];
-		//DbgPrint("[MV]value[%d]= %X %X\n",i,value,SetData);
-		WriteDevReg((DWORD)(CVBS_IN_BASE + ((91+i*2)*PCIE_BARADDROFSIZE)), SetData);
-
-	}
-	#endif
 	{
 		int was = READ_ONCE(pdx->m_curr_No_Video[i]);
 		int now = Get_Video_Status(pdx,i);
@@ -5506,19 +5029,16 @@ static void CheckVideFmt (struct hws_pcie_dev *pdx)
 			mutex_unlock(&pdx->video[ch].engine_lock);
 		}
 	}
-	//---------------
 	if((pdx->m_curr_No_Video[i] ==0x1)&&(pdx->m_bVCapStarted[i]==TRUE))
 	{
-		//printk("[MV]check NoVideo End: [%d]\n",i);
 		kthread_queue_work(pdx->conv_worker[i], &pdx->video[i].videowork);
 	}
-	//-----------------
 
 	}
 
 }
 
-int MainKsThreadHandle(void *arg)
+static int MainKsThreadHandle(void *arg)
 {
 	int need_check=0;
 	int i=0;
@@ -5584,7 +5104,6 @@ int MainKsThreadHandle(void *arg)
 		 * reads per channel). Returns early when kthread_stop() wakes us */
 		schedule_timeout_interruptible(HZ / 4);
 	}
-	//printk("MainKsThreadHandle Exit");
 	return 0;
 }
 static void StartKSThread(struct hws_pcie_dev *pdx)
@@ -5592,15 +5111,11 @@ static void StartKSThread(struct hws_pcie_dev *pdx)
 	pdx->mMain_tsk = kthread_run(MainKsThreadHandle,(void*)pdx,"hws-status");
 	if (IS_ERR(pdx->mMain_tsk))
 	{
-		printk(KERN_ERR "HwsCapture: cannot start status thread\n");
+		dev_err(&pdx->pdev->dev, "cannot start status thread\n");
 		pdx->mMain_tsk = NULL;
 	}
 
 }
-
-
-
-//------------------------------
 
 
 #ifndef arch_msi_check_device
@@ -5615,10 +5130,9 @@ static int msi_msix_capable(struct pci_dev *dev, int type)
 {
 	struct pci_bus *bus;
 	int ret;
-	//printk("msi_msix_capable in \n");
 	if (!dev || dev->no_msi)
 	{
-		printk("msi_msix_capable no_msi exit \n");
+		dev_dbg(&dev->dev, "%s: MSI disabled\n", __func__);
 		return 0;
 	}
 
@@ -5626,7 +5140,7 @@ static int msi_msix_capable(struct pci_dev *dev, int type)
 	{
 		if (bus->bus_flags & PCI_BUS_FLAGS_NO_MSI)
 		{
-			printk("msi_msix_capable PCI_BUS_FLAGS_NO_MSI \n");
+			dev_dbg(&dev->dev, "%s: bus has no MSI\n", __func__);
 			return 0;
 		}
 	}
@@ -5638,7 +5152,7 @@ static int msi_msix_capable(struct pci_dev *dev, int type)
 	ret = pci_find_capability(dev, type);
 	if (!ret)
 	{
-		printk("msi_msix_capable pci_find_capability =%d\n",ret);
+		dev_dbg(&dev->dev, "%s: pci_find_capability = %d\n", __func__, ret);
 		return 0;
 	}
 
@@ -5648,34 +5162,20 @@ static int msi_msix_capable(struct pci_dev *dev, int type)
 
 static int probe_scan_for_msi(struct hws_pcie_dev *lro, struct pci_dev *pdev)
 {
-	//int i;
 	int rc = 0;
-	//int req_nvec = MAX_NUM_ENGINES + MAX_USER_IRQ;
 
-	//BUG_ON(!lro);
-	//BUG_ON(!pdev);
-	//if (msi_msix_capable(pdev, PCI_CAP_ID_MSIX)) {
-	//		printk("Enabling MSI-X\n");
 	//		for (i = 0; i < req_nvec; i++)
-	//			lro->entry[i].entry = i;
-	//
-	//		rc = pci_enable_msix(pdev, lro->entry, req_nvec);
 	//		if (rc < 0)
-	//			printk("Couldn't enable MSI-X mode: rc = %d\n", rc);
 
-	//		lro->msix_enabled = 1;
-	//		lro->msi_enabled = 0;
-	//	}
 	//else
 
 	if (msi_msix_capable(pdev, PCI_CAP_ID_MSI)) {
 		/* enable message signalled interrupts */
-		//printk("pci_enable_msi()\n");
 		rc = pci_enable_msi(pdev);
 		if (rc < 0)
 		{
 			/* not fatal: fall back to the legacy interrupt line */
-			printk("Couldn't enable MSI mode: rc = %d, using INTx\n", rc);
+			dev_info(&pdev->dev, "couldn't enable MSI (%d), using INTx\n", rc);
 			lro->msi_enabled = 0;
 			rc = 0;
 		}
@@ -5685,7 +5185,6 @@ static int probe_scan_for_msi(struct hws_pcie_dev *lro, struct pci_dev *pdev)
 		}
 		lro->msix_enabled = 0;
 	} else {
-		//printk("MSI/MSI-X not detected - using legacy interrupts\n");
 		lro->msi_enabled = 0;
 		lro->msix_enabled = 0;
 	}
@@ -5694,30 +5193,20 @@ static int probe_scan_for_msi(struct hws_pcie_dev *lro, struct pci_dev *pdev)
 }
 
 
-
 static int irq_setup(struct hws_pcie_dev *lro, struct pci_dev *pdev)
 {
 	int rc = 0;
 	u32 irq_flag;
 	u8 val;
-	//void *reg;
-	//u32 w;
 
-	//BUG_ON(!lro);
 
-	//if (lro->msix_enabled) {
-	//	rc = msix_irq_setup(lro);
-	//}
 	//else
 	{
 		if (!lro->msi_enabled){
 			pci_read_config_byte(pdev, PCI_INTERRUPT_PIN, &val);
-			//printk("Legacy Interrupt register value = %d\n", val);
 		}
-		//irq_flag = lro->msi_enabled ? 0 : IRQF_SHARED;
 		/* a legacy INTx line may be shared with other devices; an MSI vector is ours */
 		irq_flag = lro->msi_enabled ? 0 : IRQF_SHARED;
-		//irq_flag = IRQF_SHARED;
 
 		/*
 		 * No IRQF_ONESHOT unless a sharer of the line insists: a masked line
@@ -5731,12 +5220,10 @@ static int irq_setup(struct hws_pcie_dev *lro, struct pci_dev *pdev)
 						  irq_flag | IRQF_ONESHOT, pci_name(pdev), lro);
 		if (rc)
 		{
-			//printk("Couldn't use IRQ#%d, rc=%d\n", pdev->irq, rc);
 		}
 		else
 		{
 			lro->irq_line = (int)pdev->irq;
-			//printk("Using IRQ#%d with  MSI_EN=%d \n", pdev->irq,lro->msi_enabled);
 		}
 	}
 
@@ -5757,7 +5244,7 @@ static void enable_pcie_relaxed_ordering(struct pci_dev *dev)
 	pcie_capability_set_word(dev, PCI_EXP_DEVCTL, PCI_EXP_DEVCTL_RELAX_EN);
 }
 #else
-static void __devinit enable_pcie_relaxed_ordering(struct pci_dev *dev)
+static void enable_pcie_relaxed_ordering(struct pci_dev *dev)
 {
 	u16 v;
 	int pos;
@@ -5770,12 +5257,10 @@ static void __devinit enable_pcie_relaxed_ordering(struct pci_dev *dev)
 	}
 }
 #endif
-//--------------------------------------
 static void InitVideoSys(struct hws_pcie_dev *pdx,int set)
 {
 	// init decoder
 	int i,j;
-	//	DWORD dwRest=0;
 	DWORD m_Valude;
 	if(pdx->m_bStartRun&&(set==0)) return;
 	WRITE_REGISTER_ULONG(pdx,( CVBS_IN_BASE + (0 * PCIE_BARADDROFSIZE)), 0X00);
@@ -5791,7 +5276,6 @@ static void InitVideoSys(struct hws_pcie_dev *pdx,int set)
 				pdx->m_pVCAPStatus[i][j].byField = 0;
 				pdx->m_pVCAPStatus[i][j].dwinterlace =0;
 			}
-			//pdx->m_nVideoIndex[i] =0;
 			pdx->m_nAudioBufferIndex[i] =0;
 			EnableVideoCapture(pdx,i,0);
 			EnableAudioCapture(pdx,i,0);
@@ -5801,19 +5285,15 @@ static void InitVideoSys(struct hws_pcie_dev *pdx,int set)
 
 	hws_enable_card_irqs(pdx);
 	//start Run
-	//---------------------------------------------
 	WRITE_REGISTER_ULONG(pdx,CVBS_IN_BASE, 0x80000000);
-	//DelayUs(500);
 	m_Valude= 0x00FFFFFF;
 	m_Valude |= 0x80000000;
 	WRITE_REGISTER_ULONG(pdx,CVBS_IN_BASE, m_Valude);
 	WRITE_REGISTER_ULONG(pdx,(CVBS_IN_BASE + (0 * PCIE_BARADDROFSIZE)), 0X13);
 	pdx->m_bStartRun = 1;
-	//--------------------------------------------------
 
 }
 
-//-------------------------------------
 static void SetHardWareInfo(struct hws_pcie_dev *pdx)
 {
 	switch (pdx->dwDeviceID)
@@ -5857,7 +5337,6 @@ static void SetHardWareInfo(struct hws_pcie_dev *pdx)
 			break;
 		}
 	}
-	//-----------------------
 	if(pdx->m_Device_Version>121)
 	{
 		if((pdx->dwDeviceID==0x8501)&&(pdx->m_Device_Version==122))
@@ -5866,39 +5345,30 @@ static void SetHardWareInfo(struct hws_pcie_dev *pdx)
 		}
 		else
 		{
-			//DWORD m_ReadTmp;
 			pdx->m_DeviceHW_Version =1;
 			//--- set DMA_MAX_SIZE
 			WRITE_REGISTER_ULONG(pdx,(CVBS_IN_BASE + (9 * PCIE_BARADDROFSIZE)), (MAX_VIDEO_SCLAER_SIZE/16));
-			//m_ReadTmp = ReadDevReg((DWORD)(CVBS_IN_BASE + (9 * PCIE_BARADDROFSIZE)));
-			//DbgPrint("[MV]DMA_MAX_SIZE =%d\n",m_ReadTmp);
 		}
 	}
 	else
 	{
 		pdx->m_DeviceHW_Version =0;
 	}
-	//------------------
 
 
 }
 static int ReadChipId(struct hws_pcie_dev *pdx)
 {
-	//  CCIR_PACKET      reg;
-	//int Chip_id1 = 0;
 	int ret=0;
-	//int reg_vaule = 0;
-	//int nResult;
 	int i;
 	//------read Dvice Version
 	ULONG m_dev_ver;
 	ULONG m_tmpVersion;
 	ULONG m_tmpHWKey;
-	//ULONG m_OEM_code_data;
 	m_dev_ver= READ_REGISTER_ULONG(pdx,CVBS_IN_BASE+(88*PCIE_BARADDROFSIZE));
 	if (m_dev_ver == 0xFFFFFFFF)
 	{
-		printk(KERN_ERR "HwsCapture: card does not respond (reads all ones)\n");
+		dev_err(&pdx->pdev->dev, "card does not respond (reads all ones)\n");
 		return -ENODEV;
 	}
 
@@ -5909,15 +5379,12 @@ static int ReadChipId(struct hws_pcie_dev *pdx)
 	pdx->m_Device_SupportYV12 = ((m_dev_ver>>28)&0x0F);
 	if (pdx->m_Device_SupportYV12 > 2)
 	{
-		printk(KERN_WARNING "HwsCapture: unknown pixel layout %u, treating as YUYV\n", pdx->m_Device_SupportYV12);
+		dev_warn(&pdx->pdev->dev, "unknown pixel layout %u, treating as YUYV\n", pdx->m_Device_SupportYV12);
 		pdx->m_Device_SupportYV12 = 0;
 	}
 	m_tmpHWKey =  m_dev_ver>>24;
 	m_tmpHWKey = m_tmpHWKey&0x0F;
 	pdx->m_Device_PortID = m_tmpHWKey&0x03;
-	//n_VideoModle =	READ_REGISTER_ULONG(pdx,0x4000+(4*PCIE_BARADDROFSIZE));
-	//n_VideoModle = (n_VideoModle>>8)&0xFF;
-	//pdx->m_IsHDModel = 1;
 	pdx->m_MaxHWVideoBufferSize = MAX_MM_VIDEO_SIZE;
 	pdx->m_nMaxChl  = 4;
 	pdx->m_bBufferAllocate = FALSE;
@@ -5926,19 +5393,14 @@ static int ReadChipId(struct hws_pcie_dev *pdx)
 	pdx->m_bStartRun = 0;
 	pdx->m_PciDeviceLost =0;
 
-	//--------
 	for( i=0; i<MAX_VID_CHANNELS; i++)
 	{
 		SetVideoFormteSize(pdx,i,1920,1080);
 	}
-	//-------
 	WRITE_REGISTER_ULONG(pdx,CVBS_IN_BASE,0x0);
-	//ssleep(100);
 	WRITE_REGISTER_ULONG(pdx,CVBS_IN_BASE,0x10);
-	//ssleep(500);
-	//-------
 	SetHardWareInfo(pdx);
-	printk("************[HW]-[VIDV]=[%d]-[%d]-[%d] ************\n",  pdx->m_Device_Version, pdx->m_Device_SubVersion,pdx->m_Device_PortID );
+	dev_info(&pdx->pdev->dev, "hardware version %d.%d, port id %d\n", pdx->m_Device_Version, pdx->m_Device_SubVersion, pdx->m_Device_PortID);
 	return ret;
 
 }
@@ -5983,7 +5445,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 
 	gdev->dwDeviceID = gdev->pdev->device;
 	gdev->dwVendorID = gdev->pdev->vendor;
-	printk("MV360: Device =%X VID =%X\n",gdev->dwDeviceID,gdev->dwVendorID);
+	dev_info(&pdev->dev, "AVMatrix capture card %04x:%04x\n", gdev->dwVendorID, gdev->dwDeviceID);
 	err = pci_enable_device(pdev);
 	if (err) {
 		dev_err(&pdev->dev, "%s: pci_enable_device failed: %d\n",
@@ -6011,7 +5473,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 
 	gdev->info.mem[0].internal_addr = ioremap(pci_resource_start(pdev, 0),
 											  pci_resource_len(pdev, 0));
-	gdev->map_bar0_addr = (u32 *)gdev->info.mem[0].internal_addr;
+	gdev->map_bar0_addr = gdev->info.mem[0].internal_addr;
 	if (!gdev->info.mem[0].internal_addr) {
 		err = -ENOMEM;
 		goto err_msi;
@@ -6024,7 +5486,6 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		goto err_unmap;
 	/* only now that the card is reset may it master the bus */
 	pci_set_master(pdev);
-	//---------------
 	for (i = 0; i<MAX_VID_CHANNELS; i++)
 	{
 		gdev->m_nRDVideoIndex[i] =0;
@@ -6038,7 +5499,6 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		gdev->m_bVCapStarted[i] = 0;
 		gdev->m_bVideoStop[i]=0;
 		gdev->video_data[i] =0;
-		//----------------------
 		gdev->m_contrast[i] =0x80 ;
 		gdev->m_brightness[i] = 0x80;
 		gdev->m_saturation[i] = 0x80;
@@ -6061,13 +5521,11 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 			gdev->m_pVCAPStatus[i][j].dwFrameRate = 60;
 			gdev->m_pVCAPStatus[i][j].dwOutWidth = 1920 ;
 			gdev->m_pVCAPStatus[i][j].dwOutHeight = 1080;
-			//------------------
 			gdev->m_VideoInfo[i].m_pVideoBufData[j] = NULL;
 			gdev->m_VideoInfo[i].m_pVideoBufData1[j] = NULL;
 			gdev->m_VideoInfo[i].m_pVideoBufData2[j] = NULL;
 			gdev->m_VideoInfo[i].m_pVideoBufData3[j] = NULL;
 			gdev->m_VideoInfo[i].pStatusInfo[j].byLock= MEM_UNLOCK;
-			//----------------
 		}
 		//--------audio
 		gdev->m_pAudioEvent[i] = 0;

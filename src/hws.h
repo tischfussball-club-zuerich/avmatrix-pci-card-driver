@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
 
 */
@@ -67,14 +68,13 @@
 #include <linux/uio.h>
 #include <linux/ioctl.h>
 #include <linux/delay.h>
-#include <linux/semaphore.h>   
-#include <linux/sched.h>    
-#include <linux/wait.h>   
+#include <linux/semaphore.h>
+#include <linux/sched.h>
+#include <linux/wait.h>
 #include <linux/kref.h>
 #include <linux/freezer.h>
 
 
-//---------------------------------------------
 #define MAX_USER_IRQ 1
 #define XDMA_CHANNEL_NUM_MAX (1)
 #define MAX_NUM_ENGINES (XDMA_CHANNEL_NUM_MAX * 2)
@@ -88,14 +88,14 @@
 #define CTL_REG_ACC_BASE 0x0
 #define PCI_ADDR_TABLE_BASE CTL_REG_ACC_BASE
 
-#define INT_EN_REG_BASE  PCI_BUS_ACCESS_BASE+0x134
-#define PCIEBR_EN_REG_BASE  PCI_BUS_ACCESS_BASE+0x148
-#define PCIE_INT_DEC_REG_BASE PCI_BUS_ACCESS_BASE+0x138
+#define INT_EN_REG_BASE  (PCI_BUS_ACCESS_BASE+0x134)
+#define PCIEBR_EN_REG_BASE  (PCI_BUS_ACCESS_BASE+0x148)
+#define PCIE_INT_DEC_REG_BASE (PCI_BUS_ACCESS_BASE+0x138)
 
 
 #define CVBS_IN_BASE 0x04000
-#define CBVS_IN_BUF_BASE CVBS_IN_BASE+ 16*PCIE_BARADDROFSIZE
-#define CBVS_IN_BUF_BASE2 CVBS_IN_BASE+ 50*PCIE_BARADDROFSIZE
+#define CBVS_IN_BUF_BASE (CVBS_IN_BASE+ 16*PCIE_BARADDROFSIZE)
+#define CBVS_IN_BUF_BASE2 (CVBS_IN_BASE+ 50*PCIE_BARADDROFSIZE)
 
 #define MAX_L_VIDEO_SIZE			0x200000	//2M
 
@@ -103,37 +103,31 @@
 #define HALF_VIDEO_PKSIZE           1
 
 
-
 #define PCI_E_BAR_PAGE_SIZE 0x20000000
 #define PCI_E_BAR_ADD_MASK 0xE0000000
 #define PCI_E_BAR_ADD_LOWMASK 0x1FFFFFFF
 
-#define MAX_DMA_AUDIO_PK_SIZE      128*16*2
+#define MAX_DMA_AUDIO_PK_SIZE      (128*16*2)
 
 #ifndef TRUE
 #define TRUE 1
 #define FALSE 0
-#endif 
+#endif
 #define MEM_LOCK					1
 #define MEM_UNLOCK					0
 #define MEM_READING					2	/* worker is copying out of this slot */
 
 
 typedef unsigned int DWORD;
-//typedef int LONG;
 typedef unsigned int ULONG;
 typedef unsigned char BYTE;
 typedef unsigned char BOOL;
 
 
-
-
-
-
 #define PAGESIZE					4096
 
 
-#define MAX_AUDIO_CAP_SIZE			10*1024			// 16KHz*2Byte*8channel/4(0.25sec)/4096(pagesize)
+#define MAX_AUDIO_CAP_SIZE			(10*1024)			// 16KHz*2Byte*8channel/4(0.25sec)/4096(pagesize)
 #define MAX_AUDIO_QURE_INDEX        8
 #define MAX_AUDIO_LINE   4
 #define MAX_AUDIO_SUBCHANNEL		24
@@ -149,14 +143,14 @@ typedef unsigned char BOOL;
 #define MAX_VIDEO_QUEUE				4
 #define MAX_AUDIO_QUEUE				8
 
-#define CUR_AUDIO_PACKET_LENGTH		4096+34						// 250ms,  2*16,000=32,000 -> 1s
-#define AUDIO_ONE_QUEUE_SIZE		8*CUR_AUDIO_PACKET_LENGTH
+#define CUR_AUDIO_PACKET_LENGTH		(4096+34)						// 250ms,  2*16,000=32,000 -> 1s
+#define AUDIO_ONE_QUEUE_SIZE		(8*CUR_AUDIO_PACKET_LENGTH)
 
 #define MAX_MM_VIDEO_SIZE			0x400000	//4M
 
 #define MAX_VIDEO_HW_W 1920
 #define MAX_VIDEO_HW_H 1080
-#define MAX_VIDEO_SCLAER_SIZE 1920*1080*2
+#define MAX_VIDEO_SCLAER_SIZE (1920*1080*2)
 
 struct TMemParam
 {
@@ -167,7 +161,6 @@ struct TMemParam
 typedef struct tagDATA_BUFFER_MSG
 {
 	DWORD dwHandle;
-	/////////////////////////
 	unsigned char m_bVideo;
 	int    nSubNum;
 	unsigned char   nEvenOrOdd;  // 0x00 even  0x01 odd
@@ -200,16 +193,16 @@ typedef struct TAG_VCAP_STATUS_INFO
 	DWORD		bySize;
 	DWORD		byField;
 	DWORD		byPath;
-	DWORD       dwWidth; 
+	DWORD       dwWidth;
 	DWORD       dwHeight;
 	DWORD       dwFrameRate;
-	DWORD       dwOutWidth; 
+	DWORD       dwOutWidth;
 	DWORD       dwOutHeight;
 	DWORD       dwOutFrameRate;
 	DWORD	    dwinterlace;
 	DWORD       dwhdcp;
 }VCAP_STATUS_INFO, *PVCAP_STATUS_INFO;
-typedef struct 
+typedef struct
 {
 	uint8_t		*m_pVideoBufData[MAX_VIDEO_QUEUE];
 	uint8_t     *m_pVideoData_area[MAX_VIDEO_QUEUE];
@@ -231,7 +224,7 @@ typedef struct
 	DWORD		dwisRuning;
 }ACAP_VIDEO_INFO, *PACAP_VIDEO_INFO;
 
-typedef struct 
+typedef struct
 {
 	uint8_t		*m_pAudioBufData[MAX_AUDIO_QUEUE];
 	uint8_t     *m_pAudioData_area[MAX_AUDIO_QUEUE];
@@ -241,15 +234,13 @@ typedef struct
 }ACAP_AUDIO_INFO, *PACAP_AUDIO_INFO;
 
 
-
-
-typedef enum 
+typedef enum
 {
    StandardNone				= 0x80000000,
    StandardNTSC				= 0x00000001,
    StandardPAL				= 0x00000002,
    StandardSECAM			= 0x00000004,
-} VideoStandard_t;  
+} VideoStandard_t;
 
 typedef struct tagRECT
 {
@@ -268,8 +259,8 @@ typedef struct tagVIDEO_INFO
 	DWORD	dwWidth;		// Image Width
 	DWORD	dwHeight;		// Image Height
 	DWORD	nFrame1;		// NTSC : 1~30, PAL : 101~125(1~25)
-	DWORD	HLAF_SIZE;		 
-	DWORD	DWON_SIZE;		
+	DWORD	HLAF_SIZE;
+	DWORD	DWON_SIZE;
 }VIDEO_INFO,*PVIDEO_INFO;
 
 
@@ -287,7 +278,6 @@ enum DVRS_HW_TYPES {
 #define DVRS_HW_IOCGET_CAPUTURE  _IOWR(DVRS_HW_IOC_MAGIC, IOCTL_DVRS_MAP_GET_CAPTURE,	 struct TMemParam)
 #define DVRS_HW_IOCSET_FORMATE  _IOWR(DVRS_HW_IOC_MAGIC, IOCTL_DVRS_MAP_SET_FORMATE,	 struct TMemParam)
 
-//--------------------
 
 #define HWS_PCIE_WRITE(__addr, __offst, __data)	writel((__data), (dev->mmio + (__addr + __offst)))
 #define HWS_PCIE_READ(__addr, __offst)		readl((dev->mmio + (__addr + __offst)))
@@ -312,9 +302,8 @@ struct hwsvideo_buffer {
 struct hws_dmabuf{
 	unsigned int			size;
 	__le32					*cpu;
-	dma_addr_t				dma;	
+	dma_addr_t				dma;
 };
-
 
 
 /*
@@ -376,18 +365,16 @@ struct hws_video{
 	int				fanout_inflight;	/* queued or being completed; fanout_lock */
 	struct hws_fanout		fanout_pool[HWS_FANOUT_POOL];
 	int						Interlaced;
-	//------------------------
-	//------------------------
 	int current_out_width;
 	int curren_out_height;
 	int current_out_framerate;
 	int current_out_pixfmt;
 	int current_out_size_index;
 };
-	
+
 struct hws_audio{
 	struct hws_pcie_dev		*dev;
-	struct snd_card 		*card;	
+	struct snd_card 		*card;
 	struct snd_pcm_substream *substream;
 	struct work_struct		audiowork;
 	int						pos;
@@ -406,7 +393,7 @@ struct hws_audio{
     u16                         channels;
     u16                         bits_per_sample;
 };
-	
+
 
 /*
  * Per-channel frame pipeline timing stats (timing_debug module param).
@@ -473,8 +460,7 @@ struct hws_pcie_dev {
 	struct work_struct		audio_work;
 	spinlock_t				videoslock[MAX_VID_CHANNELS];
 	spinlock_t				audiolock[MAX_VID_CHANNELS];
-	//----------------------------
-	u32 *map_bar0_addr;
+	void __iomem *map_bar0_addr;
 	struct workqueue_struct *wq;
 	unsigned long video_data[MAX_VID_CHANNELS];
  	unsigned long audio_data[MAX_VID_CHANNELS];
@@ -491,16 +477,15 @@ struct hws_pcie_dev {
 	u64				m_half1_ts[MAX_VID_CHANNELS];	/* IRQ time of that first half */
 	u32				m_fmt_cnt0[MAX_VID_CHANNELS];
 	u64				m_sw_rate_t0[MAX_VID_CHANNELS];	/* status thread: start of the frame-rate count */	/* videoslock: second-half count at the last format change */
-	//-----------------------------
 	//spinlock_t lock; /* guards command register accesses */
-	int irq_count;	/* interrupt counter */	
-	int irq_line;		/* flag if irq allocated successfully */	
-	int msi_enabled;	/* flag if msi was enabled for the device */	
-	int msix_enabled;	/* flag if msi-x was enabled for the device */	
-	int irq_user_count;/* user interrupt count */     
+	int irq_count;	/* interrupt counter */
+	int irq_line;		/* flag if irq allocated successfully */
+	int msi_enabled;	/* flag if msi was enabled for the device */
+	int msix_enabled;	/* flag if msi-x was enabled for the device */
+	int irq_user_count;/* user interrupt count */
 	int m_PciDeviceLost;
-	struct msix_entry entry[32];	
-	/* msi-x vector/entry table */	
+	struct msix_entry entry[32];
+	/* msi-x vector/entry table */
 	u32 dwDeviceID;
 	u32 dwVendorID;
 	u32 m_Device_Version;
@@ -510,31 +495,26 @@ struct hws_pcie_dev {
 	u32  m_Device_SupportYV12;
 	u32 m_Device_SubVersion;
 	u32 m_Device_PortID;
-	//int  m_IsHDModel; // 0 SD 1. 720p 2 1080p 3 2K 4 4K
 	int  m_MaxHWVideoBufferSize;
 	int m_nMaxChl;
 	int m_nCurreMaxVideoChl;
 	int m_nCurreMaxLineInChl;
 	uint8_t m_bStartRun;	// Use for start run for check i2c
-	//------------------
 	dma_addr_t   		m_pbyVideo_phys[MAX_VID_CHANNELS] ;
     uint8_t		*m_pbyVideoBuffer[MAX_VID_CHANNELS];
 	uint8_t     *m_pbyVideoBuffer_area[MAX_VID_CHANNELS];
 	u32		    m_dwVideoBuffer[MAX_VID_CHANNELS];
 	u32		    m_dwVideoHighBuffer[MAX_VID_CHANNELS];
-	//uint8_t     *m_pVideoData[MAX_VID_CHANNELS][MAX_VIDEO_QUEUE];
-	//uint8_t     *m_pVideoData_area[MAX_VID_CHANNELS][MAX_VIDEO_QUEUE];
 	VCAP_STATUS_INFO    m_pVCAPStatus[MAX_VID_CHANNELS][MAX_VIDEO_QUEUE];
 	ACAP_VIDEO_INFO m_VideoInfo[MAX_VID_CHANNELS];
 
 	VIDEO_INFO      	m_format[MAX_VID_CHANNELS];
-	
+
 	ACAP_AUDIO_INFO     m_AudioInfo[MAX_VID_CHANNELS];
 	uint8_t				m_bChangeVideoSize[MAX_VID_CHANNELS];
-	
-	struct task_struct *mMain_tsk; 
+
+	struct task_struct *mMain_tsk;
 	int m_curr_No_Video[MAX_VID_CHANNELS];
-	//------------------
 	dma_addr_t   		m_pbyAudio_phys[MAX_VID_CHANNELS] ;
 	uint8_t     *m_pbyAudioBuffer[MAX_VID_CHANNELS];
 	uint8_t		*m_pbyUserAudioBuffer[MAX_VID_CHANNELS];
@@ -548,7 +528,6 @@ struct hws_pcie_dev {
 	uint8_t	 m_bACapStarted[MAX_VID_CHANNELS];
 	uint8_t     m_nVideoBusy[MAX_VID_CHANNELS];
 	uint8_t   m_bVideoStop[MAX_VID_CHANNELS];
-	//int       m_nVideoIndex[MAX_VID_CHANNELS];
 	int       m_nRDVideoIndex[MAX_VID_CHANNELS];
 	int        m_nVideoBufferIndex[MAX_VID_CHANNELS];
 	int       m_nVideoHalfDone[MAX_VID_CHANNELS];
@@ -562,14 +541,13 @@ struct hws_pcie_dev {
 	uint8_t m_bAudioStop[MAX_VID_CHANNELS];
 	int       m_nRDAudioIndex[MAX_VID_CHANNELS];
 	u32       m_dwAudioPTKSize;
-	//-----------------------------
 	atomic_t m_dwSWFrameRate[MAX_VID_CHANNELS];	/* half-frames since the last rate measurement */
 
 	ULONG m_contrast[MAX_VID_CHANNELS];
 	ULONG m_brightness[MAX_VID_CHANNELS];
 	ULONG m_saturation[MAX_VID_CHANNELS];
 	ULONG m_hue[MAX_VID_CHANNELS];
-	
+
 };
 
 #endif

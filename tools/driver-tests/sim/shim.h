@@ -52,6 +52,8 @@ extern atomic_long sim_ratelimited_warnings;
 #define cond_resched() sched_yield()
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
+#define __iomem
+#define __user
 #define READ_ONCE(x) (*(volatile __typeof__(x) *)&(x))
 #define WRITE_ONCE(x, v) (*(volatile __typeof__(x) *)&(x) = (v))
 #define rmb() atomic_thread_fence(memory_order_acquire)
@@ -237,7 +239,13 @@ struct v4l2_fh { int dummy; };
 struct v4l2_ctrl_handler { int dummy; };	/* only embedded; the capture core never uses it */
 struct v4l2_device { int dummy; void (*release)(struct v4l2_device *); };
 struct video_device { int dummy; };
-struct pci_dev { unsigned short device, vendor; };
+struct device { int unused; };
+struct pci_dev { unsigned short device, vendor; struct device dev; };
+/* the device argument isn't evaluated: pdx->pdev is NULL in the simulation */
+#define dev_err(d, ...) fprintf(stderr, __VA_ARGS__)
+#define dev_warn(d, ...) fprintf(stderr, __VA_ARGS__)
+#define dev_info(d, ...) fprintf(stderr, __VA_ARGS__)
+#define dev_dbg(d, ...) do { } while (0)
 struct uio_info { struct { void *internal_addr; unsigned long addr, size; int memtype; } mem[1]; };
 struct snd_card; struct task_struct;
 /* just enough ALSA for the driver's audio delivery path */
