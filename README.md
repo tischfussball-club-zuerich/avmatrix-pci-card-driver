@@ -257,6 +257,16 @@ frames (a 33 ms gap at 60 fps) with equal card and driver frame counts come
 from the card or source, not the driver: the card skips a frame now and then,
 most likely because the source's clock differs slightly from the card's.
 
+**Memory leaks:** `tools/test-on-card.sh --leak` runs `tools/leak-check.sh`
+instead of the card check. It repeats the allocation-heavy paths many times:
+300 open/stream/close cycles per channel (with mmap and user-pointer buffers,
+at the input size and scaled), 100 audio open/close cycles per card, and 10
+unload/reload cycles of the driver. After a warm-up it checks that vmalloc
+memory, the video buffers and the unreclaimable slab memory come back to
+where they started, and if the kernel has `kmemleak`, that kmemleak finds
+nothing from the driver. It takes about 10 minutes; `CYCLES`, `ACYCLES` and
+`RELOADS` change the counts.
+
 For frame pacing over a longer time, run
 `sudo tools/stutter-monitor.py --device /dev/video0` while capturing; it
 reports dropped, duplicated and late frames together with likely system causes
@@ -450,7 +460,7 @@ have also been verified on a VC42 (see [Status](#status)).
   applications that keep restarting, signal loss, mode changes, lost and
   duplicate interrupts, hostile hardware returning garbage) that checks every
   delivered frame, plus ThreadSanitizer.
-- **`tools/card-check.sh` / `tools/test-on-card.sh`** for the real card (see
+- **`tools/card-check.sh`, `tools/leak-check.sh`, `tools/test-on-card.sh`** for the real card (see
   [Testing on your card](#testing-on-your-card)).
 
 ## For developers
@@ -460,7 +470,8 @@ have also been verified on a VC42 (see [Status](#status)).
 - `tools/driver-tests/`: the userspace test suite; run
   `tools/driver-tests/verify.sh src` (about 30 minutes, prints `RESULT: PASS`
   or `FAIL`); see its README.
-- `tools/card-check.sh`, `tools/test-on-card.sh`: checks on the real card.
+- `tools/card-check.sh`, `tools/leak-check.sh`, `tools/test-on-card.sh`:
+  checks on the real card.
 - `tools/stutter-monitor.py`: frame pacing and system monitor.
 - `doc/`: the vendor's original user guide.
 

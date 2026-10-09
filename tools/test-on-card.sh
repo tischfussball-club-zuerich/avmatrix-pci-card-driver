@@ -12,13 +12,20 @@
 #
 #   tools/test-on-card.sh            # test, then restore the original driver
 #   tools/test-on-card.sh --keep     # leave the new driver loaded afterwards
+#   tools/test-on-card.sh --leak     # memory leak check (tools/leak-check.sh) instead
 #   DUR=60 tools/test-on-card.sh     # longer captures (each phase)
 #
 # A reboot always brings back the installed driver.
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
-KEEP=0
-[ "${1:-}" = "--keep" ] && KEEP=1
+KEEP=0; LEAK=0
+for a in "$@"; do
+	case "$a" in
+	--keep) KEEP=1 ;;
+	--leak) LEAK=1 ;;
+	*) echo "unknown option $a (--keep, --leak)"; exit 2 ;;
+	esac
+done
 BUILD=""
 SWAPPED=0
 LOG=$PWD/test-on-card-$(date +%Y%m%d-%H%M%S).log
@@ -141,7 +148,12 @@ kmsg_since | grep -i hwscapture | sed 's/^/   /'
 
 # ---------------------------------------------------------------- test
 say ""
-sudo env DUR="${DUR:-10}" ${SCALE_DUR:+SCALE_DUR=$SCALE_DUR} SKIP_COMPLIANCE="${SKIP_COMPLIANCE:-0}" "$HERE/tools/card-check.sh"
+if [ $LEAK = 1 ]; then
+	# with the module file, so it can also unload and reload the driver
+	sudo env HWS_KO="$BUILD/HwsCapture.ko" ${CYCLES:+CYCLES=$CYCLES} ${ACYCLES:+ACYCLES=$ACYCLES} ${RELOADS:+RELOADS=$RELOADS} "$HERE/tools/leak-check.sh"
+else
+	sudo env DUR="${DUR:-10}" ${SCALE_DUR:+SCALE_DUR=$SCALE_DUR} SKIP_COMPLIANCE="${SKIP_COMPLIANCE:-0}" "$HERE/tools/card-check.sh"
+fi
 rc=$?
 
 say ""
