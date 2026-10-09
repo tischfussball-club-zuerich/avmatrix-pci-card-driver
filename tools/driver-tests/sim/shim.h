@@ -31,6 +31,8 @@ typedef int32_t s32; typedef int64_t s64; typedef uint32_t __le32; typedef u64 d
 typedef u64 __le64;
 #define cpu_to_le64(x) ((__le64)(x))
 #define le64_to_cpu(x) ((u64)(x))
+typedef unsigned int __le32;
+#define le32_to_cpu(x) ((u32)(x))
 typedef u64 v4l2_std_id; typedef unsigned int __poll_t;
 #define U64_MAX UINT64_MAX
 #define NSEC_PER_SEC 1000000000ULL
@@ -55,6 +57,7 @@ extern atomic_long sim_ratelimited_warnings;
 #define rmb() atomic_thread_fence(memory_order_acquire)
 #define smp_rmb() atomic_thread_fence(memory_order_acquire)
 #define smp_wmb() atomic_thread_fence(memory_order_release)
+#define wmb() atomic_thread_fence(memory_order_release)
 #define smp_store_release(p, v) do { atomic_thread_fence(memory_order_release); WRITE_ONCE(*(p), (v)); } while (0)
 #define smp_load_acquire(p) ({ __typeof__(*(p)) ___v = READ_ONCE(*(p)); atomic_thread_fence(memory_order_acquire); ___v; })
 #define max_t(t, a, b) ((t)(a) > (t)(b) ? (t)(a) : (t)(b))
@@ -63,6 +66,7 @@ extern atomic_long sim_ratelimited_warnings;
 #define div_u64(a, b) ((u64)(a) / (b))
 #define div64_u64(a, b) ((u64)(a) / (b))
 #define msecs_to_jiffies(ms) (ms)
+#define nsecs_to_jiffies(ns) ((unsigned long)((ns) / NSEC_PER_MSEC))	/* jiffies are ms here */
 
 static inline u64 ktime_get_ns(void)
 {
@@ -160,6 +164,8 @@ struct kthread_worker { struct task_struct *task; };
 #define kthread_init_work(w, f) INIT_WORK((w), (f))
 #define kthread_queue_work(wk, w) queue_work(NULL, (w))
 #define kthread_flush_work(w) flush_work(w)
+#define kthread_cancel_work_sync(w) cancel_work_sync(w)
+#define memcpy_flushcache(d, s, n) memcpy((d), (s), (n))
 #define queue_work_on(cpu, wq, w) queue_work((wq), (w))
 #define raw_smp_processor_id() 0
 bool flush_work(struct work_struct *w);

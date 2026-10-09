@@ -1,7 +1,8 @@
 # HwsCapture: Linux driver for AVMatrix VC41 / VC42 PCIe capture cards
 
-Kernel driver (`HwsCapture`) for the AVMatrix VC41 and VC42 HDMI capture cards
-and other boards built on the same HWS chip. Each input appears as a V4L2 video
+Kernel driver (`HwsCapture`) for the AVMatrix VC41 (4× 3G-SDI) and VC42
+(4× HDMI) capture cards and the other boards built on the same HWS chip
+(VC22, VC21, VC11 and single-channel variants). Each input appears as a V4L2 video
 device (`/dev/videoN`, card name `HVideo N`) and an ALSA capture card
 (`HAudio N`), so it works with OBS, ffmpeg, GStreamer, VLC and similar apps.
 
@@ -20,19 +21,26 @@ and includes the additions from the AVMatrix 2026-05-19 driver release.
 The driver binds to these PCI devices (subsystem `8888:0007`). Find yours with
 `lspci -nn | grep -iE '1f33|8888'`.
 
-| PCI ID (vendor:device) | Video channels created |
-|---|---|
-| `8888:9534`, `1f33:6524`, `8888:8524`, `1f33:8524` | 4 |
-| `1f33:8534`, `1f33:8554`, `8888:8504`, `1f33:8504`, `8888:6504`, `8888:8521` | 4 |
-| `8888:8532` | 2 |
-| `8888:8512`, `1f33:6502` | 2 |
-| `8888:8501` | 1 |
+| PCI ID (vendor:device) | Video channels created | Card models |
+|---|---|---|
+| `8888:9534`, `1f33:6524`, `8888:8524`, `1f33:8524` | 4 | VC42 (4× HDMI), VC41 (4× 3G-SDI) |
+| `1f33:8534`, `1f33:8554`, `8888:8504`, `1f33:8504`, `8888:6504`, `8888:8521` | 4 | VC42 (4× HDMI), VC41 (4× 3G-SDI) |
+| `8888:8532` | 2 | VC22 (2× HDMI), VC21 (2× SDI) |
+| `8888:8512`, `1f33:6502` | 2 | VC22 (2× HDMI), VC21 (2× SDI) |
+| `8888:8501` | 1 | single-channel series, e.g. VC11 (3G-SDI / HDMI) and VC12 variants |
 
-The VC41 and VC42 are among these IDs; AVMatrix does not publish which product
-uses which ID, so check `lspci -nn` on your machine. Every channel gets one
+Known exact mappings: `8888:8504` is the **VC42** (4× HDMI); `8888:8501` is the
+single-channel series. For the other IDs AVMatrix doesn't publish which
+product uses which; check `lspci -nn` on your machine. Every channel gets one
 video device and one audio card.
 
-**Input:** up to 1920×1080 progressive, or interlaced up to 1080i.
+**Not supported by this driver:** the **VC12-4K** (`8888:8581`, 1× 4K HDMI).
+Its ID isn't in this driver's table, and this driver only handles inputs up to
+1920×1080; use a driver made for that card, such as
+[GloriousEggroll/AVMATRIX-VC12-4K-CAPTURE](https://github.com/GloriousEggroll/AVMATRIX-VC12-4K-CAPTURE).
+
+**Input:** HDMI or SDI (depending on the card), up to 1920×1080 progressive,
+or interlaced up to 1080i.
 The card reports the input frame rate; the driver passes frames through at
 that rate.
 
@@ -167,6 +175,7 @@ with a file `/etc/modprobe.d/hwscapture.conf` containing e.g.
 | Parameter | Default | Meaning |
 |---|---|---|
 | `direct_io` | `1` | Copy frames straight from the card into the application's buffer when no conversion is needed. Set to `0` to always go through the driver's internal ring. |
+| `nt_copy` | `0` | `1`: on the direct path, write frames into the application's buffer with non-temporal stores that bypass the CPU cache. May help with several channels at once, may cost if the app reads each frame right away; measure on your system. |
 | `timing_debug` | `0` | `1`: log per-second frame statistics for each channel to the kernel log; `2`: also warn about late frames. |
 
 ## Updating
@@ -233,7 +242,7 @@ sudo depmod -a
 |---|---|
 | Installer: "missing kernel development packages" | Install the headers for the running kernel (step 1); reboot if the kernel was just updated. |
 | `modprobe: ERROR ... Key was rejected by service` | Secure Boot: enroll the DKMS key (see [Secure Boot](#secure-boot)). |
-| No `/dev/video*` device | `lspci -nn` must list the card with an ID from the table above; check `sudo dmesg` for errors. |
+| No `/dev/video*` device | `lspci -nn` must list the card with an ID from the table above (the VC12-4K, `8888:8581`, needs a different driver); check `sudo dmesg` for errors. |
 | Picture shows "no signal" (blue) | No or unsupported input signal. Check the source and cable; inputs above 1920×1080 are not supported. |
 | Stutter or dropped frames | Run the checks in [Checking that it works](#checking-that-it-works). Test with `direct_io=0` to rule out the fast path. |
 | Module does not unload (`in use`) | Close all applications using the video or audio devices, including PipeWire clients, or reboot. |
@@ -277,7 +286,8 @@ compile tests; none of it has been confirmed on a card yet.
   detected, and after a storm (1000 empty interrupts within 100 ms) the
   card's interrupts are paused for a second.
 - **Reboot/kexec:** there was no shutdown handler, so the card kept DMAing
-  and could hold a shared interrupt line asserted into the next kernel.
+  and could hold a shared interrupt line asserted into the next kernel. The
+  handler also works when hibernation powers off (frozen status thread).
 
 ### Hangs and freezes
 
@@ -292,7 +302,7 @@ compile tests; none of it has been confirmed on a card yet.
   probe instead of falling back to legacy interrupts.
 - **Signal loss mid-frame** left an application's buffer stuck.
 - **A card that was gone at resume** and came back later was never
-  re-initialized; it now gets the full bring-up.
+  re-initialized (and never noticed); it now gets the full bring-up.
 - **A dead card** (all registers read as ones) was accepted at probe and never
   detected at runtime, while a single bad read marked it lost forever. It is
   now detected reliably and recovers automatically.
@@ -319,7 +329,10 @@ compile tests; none of it has been confirmed on a card yet.
 - **Big copies ran in softirq,** delaying network, timer and disk work. Each
   channel now has its own copy thread (lowest real-time priority), so with
   4 channels the copies (up to ~1 GB/s at 4×1080p60) run on 4 CPUs instead
-  of queuing behind each other on one; audio no longer waits behind video.
+  of queuing behind each other on one. Conversion and delivery also run on
+  one real-time thread per channel, so a busy encoder can't delay frames.
+- **Audio** is delivered straight from the interrupt thread, without an
+  extra wakeup per packet, and no longer waits behind video copies.
 - **Interlaced input** (1080i, 576i, 480i) shown at the input size is now
   copied straight from DMA into the application's buffer with the lines
   doubled, instead of going through the ring and the worker.
@@ -333,8 +346,12 @@ compile tests; none of it has been confirmed on a card yet.
   250 ms instead of up to 1 s.
 - **ALSA xruns:** the minimum period was below the card's 4096-byte packet,
   the BATCH flag was missing and a stale packet played at start.
-- **Faster converters** (byte-identical output): 1080p→720p 0.43→0.19 ms,
-  720p→1080p 0.33→0.24 ms, YV12 1080p 0.77→0.53 ms, NV12 1080p 0.65→0.36 ms.
+- **Faster converters** (byte-identical output; userspace, kernel compiler
+  flags): 1080p→720p 0.43→0.19 ms, 720p→1080p 0.33→0.24 ms, YV12 1080p
+  0.77→0.53 ms, NV12 1080p 0.65→0.37 ms per frame.
+- **No signal / no free buffer:** nothing is copied from the card while
+  there's no signal, the "no signal" picture is limited to ~30 fps, and
+  frames no application has a buffer for aren't copied at all.
 - **Log flooding** from paths applications can trigger is rate-limited.
 
 ### Correctness and compatibility

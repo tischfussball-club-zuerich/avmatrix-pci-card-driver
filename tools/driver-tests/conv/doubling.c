@@ -5,6 +5,8 @@
 #include <string.h>
 typedef unsigned char BYTE;
 #define min(a,b) ((a)<(b)?(a):(b))
+#define memcpy_flushcache(d, s, n) memcpy((d), (s), (n))
+#include <stdbool.h>
 #include "doubling.inc"
 int main(void)
 {
@@ -18,8 +20,8 @@ int main(void)
 		/* every split point the driver can produce (multiples of 2048) plus odd ones */
 		for (int half = 1; half < field; half += (half < 5000 ? 1 : 2048)) {
 			memset(b, 0xEE, field * 2);
-			hws_copy_doubled(b, src, 0, half, pitch);
-			hws_copy_doubled(b, src + half, half, field - half, pitch);
+			hws_copy_doubled(b, src, 0, half, pitch, half & 1);	/* both store kinds */
+			hws_copy_doubled(b, src + half, half, field - half, pitch, half & 1);
 			n++;
 			if (memcmp(a, b, field * 2)) { bad++; if (bad < 5) printf("MISMATCH %dx%d split %d\n", w, h, half); }
 		}

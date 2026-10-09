@@ -21,6 +21,7 @@
 atomic_long sim_ratelimited_warnings;
 static int timing_debug = 2;	/* exercise the diagnostic paths too */
 static int direct_io = 1;
+static int nt_copy = 1;	/* the non-temporal variant of the direct path (plain memcpy here) */
 
 /* ------------------------------------------------------------ fake MMIO */
 #define NREG (0x6000 / 4)
@@ -804,7 +805,6 @@ int main(int argc, char **argv)
 	pdx->m_nMaxChl = 4;
 	pdx->m_nCurreMaxVideoChl = NCH;
 	pdx->wq = &dummy_wq;
-	pdx->auwq = &dummy_wq;
 	pdx->m_dwAudioPTKSize = MAX_DMA_AUDIO_PK_SIZE;
 	spin_lock_init(&pdx->reg_lock);
 	mutex_init(&pdx->pm_lock);

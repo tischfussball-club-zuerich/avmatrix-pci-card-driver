@@ -11,8 +11,8 @@ grep -q "faults: 0" $S/conv/out.txt || fail=1
 python3 -I - $SRC/hws_video.c > $S/conv/doubling.inc <<'PY'
 import re, sys
 s = open(sys.argv[1]).read()
-for name in ("SetDeInterlace", "hws_copy_doubled"):
-    print(re.search(r"^static void " + name + r"\(.*?^\}\n", s, re.S | re.M).group(0))
+for name in ("SetDeInterlace", "hws_dcopy", "hws_copy_doubled"):
+    print(re.search(r"^static (?:inline )?void " + name + r"\(.*?^\}\n", s, re.S | re.M).group(0))
 PY
 (cd $S/conv && gcc -O1 -fsanitize=address,undefined -w -o dbl doubling.c && ./dbl > dbl.txt 2>&1); echo "== interlaced direct path: $(cat $S/conv/dbl.txt | tail -1)"; scan $S/conv/dbl.txt
 grep -q "mismatches: 0" $S/conv/dbl.txt || fail=1

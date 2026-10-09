@@ -2,6 +2,8 @@
 #include <string.h>
 #include <stdint.h>
 typedef unsigned long long u64; typedef unsigned long long __le64;
+typedef unsigned int u32; typedef unsigned int __le32;
+#define le32_to_cpu(x) ((u32)(x))
 #define cpu_to_le64(x) ((__le64)(x))
 #define le64_to_cpu(x) ((u64)(x))
 typedef unsigned int DWORD; typedef unsigned char BYTE; typedef unsigned char BOOL;

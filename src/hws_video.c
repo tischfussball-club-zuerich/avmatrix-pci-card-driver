@@ -42,6 +42,25 @@ module_param(direct_io, int, 0644);
 MODULE_PARM_DESC(direct_io, "Copy frames straight from DMA into app buffers when no conversion is needed (default 1)");
 
 //------------------------ frame pipeline timing diagnostics
+/*
+ * Direct path with non-temporal stores: the 4 MB per frame written into the
+ * app's buffer bypasses the CPU cache instead of evicting everything else
+ * from it. Can help with several channels; can cost if the app reads the
+ * frame right away on the same CPU. Off by default: measure on your system.
+ */
+static int nt_copy;
+module_param(nt_copy, int, 0644);
+MODULE_PARM_DESC(nt_copy, "Direct path: write frames with non-temporal stores, bypassing the CPU cache (default 0)");
+
+/* direct path into an app buffer */
+static inline void hws_dcopy(void *dst, const void *src, size_t n, bool nt)
+{
+	if (nt)
+		memcpy_flushcache(dst, src, n);
+	else
+		memcpy(dst, src, n);
+}
+
 static int timing_debug;
 module_param(timing_debug, int, 0644);
 MODULE_PARM_DESC(timing_debug, "Frame timing diagnostics: 0=off, 1=per-second summary, 2=also warn on late frames");
@@ -1262,7 +1281,9 @@ static int hws_start_streaming_multi(struct vb2_queue *q, unsigned int count)
     mutex_lock(&pdx->pm_lock);
     if (videodev->engine_users++ == 0 && !pdx->suspended) {
         /* a worker run left over from the previous session must not race the ring reset */
-        flush_work(&videodev->videowork);
+        /* (a half-frame copy of that session first: it may queue the worker) */
+        kthread_flush_work(&videodev->copy_work);
+        kthread_flush_work(&videodev->videowork);
         StartVideoCapture(pdx, videodev->index);
     }
     mutex_unlock(&pdx->pm_lock);
@@ -1298,7 +1319,7 @@ static void hws_stop_streaming_multi(struct vb2_queue *q)
      * The worker may be filling a buffer it already took from this fh. Wait for
      * it, otherwise vb2 frees the buffer memory while it is still being written.
      */
-    flush_work(&videodev->videowork);
+    kthread_flush_work(&videodev->videowork);
 
     mutex_lock(&videodev->engine_lock);
     mutex_lock(&pdx->pm_lock);
@@ -1308,7 +1329,7 @@ static void hws_stop_streaming_multi(struct vb2_queue *q)
         StopVideoCapture(pdx, videodev->index);
         /* cancel, let a racing worker run finish (it may re-arm), cancel again */
         cancel_delayed_work_sync(&videodev->nosig_work);
-        flush_work(&videodev->videowork);
+        kthread_flush_work(&videodev->videowork);
         cancel_delayed_work_sync(&videodev->nosig_work);
     }
     mutex_unlock(&pdx->pm_lock);
@@ -2299,6 +2320,15 @@ static inline void hws_yuyv_packet(BYTE *d, const BYTE *s, const BYTE *a, const 
 	memcpy(d, q, sizeof(q));
 }
 
+/* one line of packets; a/b advance with the luma (they are this line or the next) */
+static inline void hws_yuyv_line(BYTE *d, const BYTE *s, const BYTE *a, const BYTE *b, DWORD packets)
+{
+	DWORD j;
+
+	for (j = 0; j < packets; j++, d += 32, s += 24, a += 24, b += 24)
+		hws_yuyv_packet(d, s, a, b);
+}
+
 static inline u64 hws_le64_load(const BYTE *p)
 {
 	__le64 v;
@@ -2361,9 +2391,7 @@ static void FillNV12ToYUY2(BYTE *pSrc,BYTE *pOut, int nw,int nh,int interlace)
 	BYTE *pSrc1;
 	BYTE *pDstYUV = (BYTE *)pVideoMem;
 	BYTE *pNextLineSrc1;
-	DWORD dwJ;
 	BYTE bLineSel=0;
-	BOOL bUVSel;
 	DWORD dwI;
 	dwSrcPitch = nw*12/8;
 	dwPacket = dwSrcPitch/24;
@@ -2379,20 +2407,12 @@ static void FillNV12ToYUY2(BYTE *pSrc,BYTE *pOut, int nw,int nh,int interlace)
 			{
 				case 0:
 				{
-					bUVSel =0;
 					pNextLineSrc1 = (BYTE *)pSrc1+dwSrcPitch+nw; //  line2
-					for( dwJ=0; dwJ<dwPacket; dwJ++)
-					{
-
-						/* 16 pixels; chroma for the odd bytes alternates between this line and the next */
-						if(bUVSel)
-							hws_yuyv_packet(pDstYUV, pSrc1, pNextLineSrc1, pSrc1);
-						else
-							hws_yuyv_packet(pDstYUV, pSrc1, pSrc1, pNextLineSrc1);
-						pSrc1+=24;
-						pNextLineSrc1 +=24;
-						pDstYUV+=32;
-					}
+					/* 16 pixels per packet; chroma from this line and line 2 */
+					hws_yuyv_line(pDstYUV, pSrc1, pSrc1, pNextLineSrc1, dwPacket);
+					pSrc1 += dwPacket*24;
+					pNextLineSrc1 += dwPacket*24;
+					pDstYUV += dwPacket*32;
 					break;
 				}
 				case 1:
@@ -2439,20 +2459,12 @@ static void FillNV12ToYUY2(BYTE *pSrc,BYTE *pOut, int nw,int nh,int interlace)
 			{
 				case 0:
 				{
-					bUVSel =0;
 					pNextLineSrc1 = (BYTE *)pSrc1+dwSrcPitch+nw; //  line2
-					for( dwJ=0; dwJ<dwPacket; dwJ++)
-					{
-
-						/* 16 pixels; chroma for the odd bytes alternates between this line and the next */
-						if(bUVSel)
-							hws_yuyv_packet(pDstYUV, pSrc1, pNextLineSrc1, pSrc1);
-						else
-							hws_yuyv_packet(pDstYUV, pSrc1, pSrc1, pNextLineSrc1);
-						pSrc1+=24;
-						pNextLineSrc1 +=24;
-						pDstYUV+=32;
-					}
+					/* 16 pixels per packet; chroma from this line and line 2 */
+					hws_yuyv_line(pDstYUV, pSrc1, pSrc1, pNextLineSrc1, dwPacket);
+					pSrc1 += dwPacket*24;
+					pNextLineSrc1 += dwPacket*24;
+					pDstYUV += dwPacket*32;
 					memcpy(pDstYUV,pDstYUV-(nw*2),nw*2); // copy up line
 					pDstYUV = pDstYUV+ nw*2;
 					break;
@@ -2528,7 +2540,7 @@ static void FillYUU2(BYTE *pSrc,BYTE *pOut, int nw,int nh,int interlace)
 	BYTE *pVideoMem = pOut ;// g_pD1TempBuffer;
 	//	DWORD dwDstPitch = nw;
 	DWORD dwSrcPitch;
-	DWORD dwI,dwJ;
+	DWORD dwI;
 	DWORD dwPacket;
 	BYTE *pSrc1  = (BYTE *)pSrc;
 	BYTE *pDstYUV = (BYTE *)pVideoMem;
@@ -2542,73 +2554,36 @@ static void FillYUU2(BYTE *pSrc,BYTE *pOut, int nw,int nh,int interlace)
 	{
 		for( dwI=0; dwI <nh; dwI++)
 		{
+			/* chroma for the odd bytes alternates between this line and the next */
 			bUVSel = (dwI&0x1);
-			for( dwJ=0; dwJ<dwPacket; dwJ++)
-			{
-				/* 16 pixels; chroma for the odd bytes alternates between this line and the next */
-				if(bUVSel)
-					hws_yuyv_packet(pDstYUV, pSrc1, pNextLineSrc1, pSrc1);
-				else
-					hws_yuyv_packet(pDstYUV, pSrc1, pSrc1, pNextLineSrc1);
-
-				pSrc1+=24;
-				pNextLineSrc1 +=24;
-				pDstYUV+=32;
-
-			}
+			hws_yuyv_line(pDstYUV, pSrc1, bUVSel ? pNextLineSrc1 : pSrc1,
+				      bUVSel ? pSrc1 : pNextLineSrc1, dwPacket);
+			pSrc1 += dwPacket*24;
+			pNextLineSrc1 += dwPacket*24;
+			pDstYUV += dwPacket*32;
 		}
-		//--------------------------------
-		#if 1
-		pDstYUV -= 1*nw*2;
-		for( dwI=0; dwI <1; dwI++)
-		{
-			for(  dwJ=0; dwJ<nw; dwJ++)
-			{
-				pDstYUV[0] = 0x10;
-				pDstYUV[1] = 0x80;
-				pDstYUV +=2;
-			}
-		}
-
-		#endif
+		/* the last line has no next line for its chroma: black */
+		FillBlackYUYV(pDstYUV - nw*2, nw);
 		//---------------------------------
 	}
 	else
 	{
 		for( dwI=0; dwI <(nh/2); dwI++)
 		{
+			/* chroma for the odd bytes alternates between this line and the next */
 			bUVSel = (dwI&0x1);
-			for( dwJ=0; dwJ<dwPacket; dwJ++)
-			{
-				/* 16 pixels; chroma for the odd bytes alternates between this line and the next */
-				if(bUVSel)
-					hws_yuyv_packet(pDstYUV, pSrc1, pNextLineSrc1, pSrc1);
-				else
-					hws_yuyv_packet(pDstYUV, pSrc1, pSrc1, pNextLineSrc1);
-
-				pSrc1+=24;
-				pNextLineSrc1 +=24;
-				pDstYUV+=32;
-
-			}
+			hws_yuyv_line(pDstYUV, pSrc1, bUVSel ? pNextLineSrc1 : pSrc1,
+				      bUVSel ? pSrc1 : pNextLineSrc1, dwPacket);
+			pSrc1 += dwPacket*24;
+			pNextLineSrc1 += dwPacket*24;
+			pDstYUV += dwPacket*32;
 			//------------------------------
 			memcpy(pDstYUV,(pDstYUV-nw*2),nw*2);
 			pDstYUV = pDstYUV+ nw*2;
 			//-----------------------------------
 		}
-		//--------------------------------
-		#if 1
-		pDstYUV -= 2*nw*2;
-		for( dwI=0; dwI <2; dwI++)
-		{
-			for(  dwJ=0; dwJ<nw; dwJ++)
-			{
-				pDstYUV[0] = 0x10;
-				pDstYUV[1] = 0x80;
-				pDstYUV +=2;
-			}
-		}
-		#endif
+		/* the last field line (shown twice) has no next line for its chroma: black */
+		FillBlackYUYV(pDstYUV - 2*nw*2, 2*nw);
 		//---------------------------------
 
 	}
@@ -2653,6 +2628,27 @@ static int hws_take_buffers(struct hws_video *videodev, struct list_head *list)
  * cost the others frames. Returns 0 if no consumer has a buffer queued and
  * INT_MAX if nobody streams.
  */
+/* does any streaming consumer have a buffer queued? */
+static bool hws_any_queued(struct hws_video *videodev)
+{
+    struct hws_vfh_ctx *ctx;
+    unsigned long flags;
+    bool any = false;
+
+    spin_lock_irqsave(&videodev->consumers_lock, flags);
+    list_for_each_entry(ctx, &videodev->consumers, node) {
+        if (!ctx->streaming)
+            continue;
+        spin_lock(&ctx->qlock);
+        any = !list_empty(&ctx->buf_queue);
+        spin_unlock(&ctx->qlock);
+        if (any)
+            break;
+    }
+    spin_unlock_irqrestore(&videodev->consumers_lock, flags);
+    return any;
+}
+
 static int hws_min_queued(struct hws_video *videodev)
 {
     struct hws_vfh_ctx *ctx;
@@ -2864,10 +2860,10 @@ static void hws_nosig_work(struct work_struct *work)
 {
     struct hws_video *videodev = container_of(to_delayed_work(work), struct hws_video, nosig_work);
 
-    queue_work(videodev->dev->wq, &videodev->videowork);
+    kthread_queue_work(videodev->dev->conv_worker[videodev->index], &videodev->videowork);
 }
 
-void video_data_process(struct work_struct *p_work)
+void video_data_process(struct kthread_work *p_work)
 {
     struct hws_video *videodev = container_of(p_work, struct hws_video, videowork);
     struct hws_pcie_dev *pdx = videodev->dev;
@@ -2909,6 +2905,18 @@ void video_data_process(struct work_struct *p_work)
         out_size = nWidth * nHeight * 2;
 
         if (no_video) {
+            u64 now = ktime_get_ns();
+
+            /* ~30 fps whoever wakes us (status poll, timer, a late frame) */
+            if (round == 0 && now - videodev->nosig_last_ns < 30 * NSEC_PER_MSEC) {
+                spin_unlock_irqrestore(&pdx->videoslock[nDecoder], devflags);
+                if (READ_ONCE(pdx->m_bVCapStarted[nDecoder]))
+                    /* +1: rounding down could re-arm with 0 and spin until the next tick */
+                    mod_delayed_work(pdx->wq, &videodev->nosig_work,
+                                     nsecs_to_jiffies(videodev->nosig_last_ns + 33 * NSEC_PER_MSEC - now) + 1);
+                return;
+            }
+            videodev->nosig_last_ns = now;
             /* drop captured frames; deliver one "no signal" frame per run */
             for (i = 0; i < MAX_VIDEO_QUEUE; i++)
                 if (vi->pStatusInfo[i].byLock == MEM_LOCK)
@@ -3214,6 +3222,15 @@ int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 	return 0;
 }
 
+/* deliveries run in the IRQ thread: wait for one in progress */
+static void hws_audio_sync(struct hws_audio *drv)
+{
+	int irq = READ_ONCE(drv->dev->irq_line);
+
+	if (irq != -1)
+		synchronize_irq(irq);
+}
+
 int hws_pcie_audio_close(struct snd_pcm_substream *substream)
 {
 	struct hws_audio *drv = snd_pcm_substream_chip(substream);
@@ -3224,7 +3241,7 @@ int hws_pcie_audio_close(struct snd_pcm_substream *substream)
 	drv->substream = NULL;
 	spin_unlock_irqrestore(&drv->ring_lock, flags);
 	/* a delivery that already passed the check must finish before the runtime goes */
-	flush_work(&drv->audiowork);
+	hws_audio_sync(drv);
 	return 0;
 }
 int hws_pcie_audio_hw_params(struct snd_pcm_substream *substream, struct snd_pcm_hw_params *hw_params)
@@ -3248,7 +3265,7 @@ int hws_pcie_audio_prepare(struct snd_pcm_substream *substream)
 	unsigned long flags;
 
 	/* a delivery left over from the previous run must not land in the new one */
-	flush_work(&drv->audiowork);
+	hws_audio_sync(drv);
 	spin_lock_irqsave(&drv->ring_lock, flags);
 	drv->ring_size_byframes = runtime->buffer_size;
 	drv->ring_wpos_byframes = 0;
@@ -3727,21 +3744,24 @@ static void hws_dev_release(struct kref *kref)
 	struct hws_pcie_dev *pdx = container_of(kref, struct hws_pcie_dev, kref);
 	int i;
 
-	/* the copy threads queue onto wq: gone first (idle by now; this also flushes) */
+	/* the copy threads queue conversions: gone first (idle by now; this also flushes) */
 	for (i = 0; i < MAX_VID_CHANNELS; i++)
 		if (pdx->copy_worker[i])
 			kthread_destroy_worker(pdx->copy_worker[i]);
+	/* a conversion run may re-arm nosig_work, which queues a conversion */
+	for (i = 0; pdx->wq && i < MAX_VID_CHANNELS; i++)
+		cancel_delayed_work_sync(&pdx->video[i].nosig_work);
+	for (i = 0; i < MAX_VID_CHANNELS; i++)
+		if (pdx->conv_worker[i])
+			kthread_destroy_worker(pdx->conv_worker[i]);
 	/* backstop: destroy_workqueue() doesn't wait for a timer that hasn't fired.
 	 * The works are initialized before wq is created, so wq tells us they are. */
 	for (i = 0; pdx->wq && i < MAX_VID_CHANNELS; i++) {
 		cancel_delayed_work_sync(&pdx->video[i].nosig_work);
-		cancel_work_sync(&pdx->video[i].videowork);
 		cancel_work_sync(&pdx->video[i].fanout_work);
 	}
 	if (pdx->wq)
 		destroy_workqueue(pdx->wq);
-	if (pdx->auwq)
-		destroy_workqueue(pdx->auwq);
 	pci_dev_put(pdx->pdev);
 	kfree(pdx);
 }
@@ -3822,7 +3842,7 @@ static void hws_quiesce(struct hws_pcie_dev *dev)
 		 * the first cancel; once videowork is idle nothing can, so cancel again.
 		 */
 		cancel_delayed_work_sync(&dev->video[i].nosig_work);
-		cancel_work_sync(&dev->video[i].videowork);
+		kthread_cancel_work_sync(&dev->video[i].videowork);
 		cancel_delayed_work_sync(&dev->video[i].nosig_work);
 		cancel_work_sync(&dev->audio[i].audiowork);
 	}
@@ -4016,6 +4036,9 @@ static int StartVideoCapture(struct hws_pcie_dev *pdx,int index)
 	pdx->m_pVideoEvent[index] = 1;
 	pdx->m_nVideoBusy[index] =0;
 	pdx->video_data[index]  =0;
+	/* the frame-rate window starts with the capture, not at the last stop */
+	atomic_set(&pdx->m_dwSWFrameRate[index], 0);
+	pdx->m_sw_rate_t0[index] = ktime_get_ns();
 	EnableVideoCapture(pdx,index,1);
 	return 0;
 }
@@ -4225,7 +4248,7 @@ static void hws_direct_complete(struct hws_pcie_dev *pdx, int ch, struct list_he
  * every line doubled, exactly as SetDeInterlace() does. Half-frames aren't
  * line-aligned, so a range can start and end mid-line.
  */
-static void hws_copy_doubled(BYTE *dst, const BYTE *src, int off, int len, int pitch)
+static void hws_copy_doubled(BYTE *dst, const BYTE *src, int off, int len, int pitch, bool nt)
 {
 	while (len > 0)
 	{
@@ -4233,8 +4256,8 @@ static void hws_copy_doubled(BYTE *dst, const BYTE *src, int off, int len, int p
 		int n = min(len, pitch - col);
 		BYTE *d = dst + (size_t)line * 2 * pitch + col;
 
-		memcpy(d, src, n);
-		memcpy(d + pitch, src, n);
+		hws_dcopy(d, src, n, nt);
+		hws_dcopy(d + pitch, src, n, nt);
 		src += n;
 		off += n;
 		len -= n;
@@ -4292,11 +4315,12 @@ static int hws_direct_half(struct hws_pcie_dev *pdx, int ch, int half, BYTE *src
 		}
 		pdx->direct_out_size[ch] = out_size;
 		pdx->direct_il[ch] = interlace != 0;
+		pdx->direct_nt[ch] = READ_ONCE(nt_copy) != 0;	/* the same for both halves */
 		pdx->direct_frame[ch] = true;
 		if (interlace)
-			hws_copy_doubled(first->mem, src, 0, halfsize, nw * 2);
+			hws_copy_doubled(first->mem, src, 0, halfsize, nw * 2, pdx->direct_nt[ch]);
 		else
-			memcpy(first->mem, src, halfsize);
+			hws_dcopy(first->mem, src, halfsize, pdx->direct_nt[ch]);
 
 		/* see the overrun check in MemCopyVideoToSteam() */
 		smp_rmb();
@@ -4334,9 +4358,11 @@ static int hws_direct_half(struct hws_pcie_dev *pdx, int ch, int half, BYTE *src
 		return 1;
 	}
 	if (interlace)
-		hws_copy_doubled(first->mem, src, halfsize, copysize, nw * 2);
+		hws_copy_doubled(first->mem, src, halfsize, copysize, nw * 2, pdx->direct_nt[ch]);
 	else
-		memcpy(first->mem + halfsize, src, copysize);
+		hws_dcopy(first->mem + halfsize, src, copysize, pdx->direct_nt[ch]);
+	if (pdx->direct_nt[ch])
+		wmb();	/* non-temporal stores are weakly ordered: done before the buffer is */
 	smp_rmb();
 	if (READ_ONCE(pdx->m_half_cnt[ch][1]) != peer_at_irq || hws_copy_too_late(pdx, ch, t_irq))
 	{
@@ -4419,6 +4445,13 @@ static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder,int mVideoB
 		return -1;
 	pdx->m_half_done_cnt[nDecoder][mVideoBufIndex] = cnt_self;
 
+	/* no signal: the worker shows the "no signal" picture; nothing to copy */
+	if (READ_ONCE(pdx->m_curr_No_Video[nDecoder]))
+	{
+		pdx->m_nVideoHalfDone[nDecoder] = 0;
+		return -1;
+	}
+
 	/* one consistent view of the input format (see ChangeVideoSize) */
 	spin_lock_irqsave(&pdx->videoslock[nDecoder], flags);
 	nw = pdx->m_pVCAPStatus[nDecoder][0].dwWidth ;
@@ -4495,6 +4528,14 @@ static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder,int mVideoB
 			{
 				pdx->m_nVideoHalfDone[nDecoder] =0;
 			}
+		}
+		else if (!hws_any_queued(&pdx->video[nDecoder]))
+		{
+			/* no app has a free buffer: the frame couldn't be delivered anyway */
+			atomic_inc(&pdx->tstats[nDecoder].no_app_buf);
+			pdx->m_nVideoHalfDone[nDecoder] = 0;
+			hws_put_mark(pMask);
+			return -1;
 		}
 		else if ((s32)(peer_at_irq - fmt_cnt0) <= 0)
 		{
@@ -4678,7 +4719,8 @@ int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh,int half)
 			pdx->m_AudioInfo[dwAudioCh].pStatusInfo[nIndex].dwLength = pdx->m_dwAudioPTKSize ;
 			pdx->m_AudioInfo[dwAudioCh].pStatusInfo[nIndex].byLock = MEM_LOCK;
 			spin_unlock_irqrestore(&pdx->audiolock[dwAudioCh], flags);
-			queue_work(pdx->auwq,&pdx->audio[dwAudioCh].audiowork);
+			/* deliver right here in the IRQ thread: no extra wakeup per packet */
+			audio_data_process(&pdx->audio[dwAudioCh].audiowork);
 		}
 		else
 		{
@@ -4755,7 +4797,7 @@ static int SetQuene(struct hws_pcie_dev  *pdx,int nDecoder,int half)
 	//-------------------
 	if(pdx->m_DeviceHW_Version ==0)
 	{
-		pdx->m_dwSWFrameRate[nDecoder]++;
+		atomic_inc(&pdx->m_dwSWFrameRate[nDecoder]);
 	}
 	//-------------------
 	pdx->m_nVideoBusy[nDecoder] = 1;
@@ -4800,9 +4842,8 @@ static void hws_video_dpc(struct hws_pcie_dev *pdx, int i)
 				pdx->m_bChangeVideoSize[i] = 0;
 				continue;
 			}
-			/* coalescing is harmless: the worker drains every ready slot. Near
-			 * this CPU (unbound wq: same cache domain), the frame is in its cache */
-			if (!queue_work_on(raw_smp_processor_id(), pdx->wq, &pdx->video[i].videowork))
+			/* coalescing is harmless: the worker drains every ready slot */
+			if (!kthread_queue_work(pdx->conv_worker[i], &pdx->video[i].videowork))
 				atomic_inc(&pdx->tstats[i].wq_coalesced);
 		}
 	}
@@ -5135,8 +5176,10 @@ static void ChangeVideoSize(struct hws_pcie_dev *pdx,int ch,int w,int h,int inte
 	spin_lock_irqsave(&pdx->reg_lock, flags);
 	WRITE_REGISTER_ULONG(pdx,(DWORD)(CBVS_IN_BUF_BASE2 + (ch*PCIE_BARADDROFSIZE)), halfframeLength); //Buffer 1 address
 	spin_unlock_irqrestore(&pdx->reg_lock, flags);
-	/* again: a second half that came before the new length reached the card proves nothing */
+	/* again: a second half that came before the new length reached the card
+	 * proves nothing, and a first half accepted in between must not pair */
 	spin_lock_irqsave(&pdx->videoslock[ch], flags);
+	pdx->m_fmt_gen[ch]++;
 	pdx->m_fmt_cnt0[ch] = READ_ONCE(pdx->m_half_cnt[ch][0]);
 	spin_unlock_irqrestore(&pdx->videoslock[ch], flags);
 }
@@ -5247,29 +5290,28 @@ static int Get_Video_Status(struct hws_pcie_dev *pdx,unsigned int  ch)
 		{
 			/* half-frames counted over (at least) one second, whatever the poll rate */
 			u64 now = ktime_get_ns();
-			u64 cnt = div64_u64((u64)pdx->m_dwSWFrameRate[ch] * NSEC_PER_SEC,
-					    now - pdx->m_sw_rate_t0[ch]);
+			u64 rate = div64_u64((u64)atomic_xchg(&pdx->m_dwSWFrameRate[ch], 0) * NSEC_PER_SEC,
+					     max_t(u64, now - pdx->m_sw_rate_t0[ch], 1));
 
 			pdx->m_sw_rate_t0[ch] = now;
-			pdx->m_dwSWFrameRate[ch] = (DWORD)cnt;
-			if(pdx->m_dwSWFrameRate[ch]>10)
+			if(rate>10)
 			{
-				if(pdx->m_dwSWFrameRate[ch]>(55*2))
+				if(rate>(55*2))
 				{
 					pdx->m_pVCAPStatus[ch][0].dwFrameRate =60;
 
 				}
-				else if(pdx->m_dwSWFrameRate[ch]>(45*2))
+				else if(rate>(45*2))
 				{
 					pdx->m_pVCAPStatus[ch][0].dwFrameRate =50;
 
 				}
-				else if(pdx->m_dwSWFrameRate[ch]>(25*2))
+				else if(rate>(25*2))
 				{
 					pdx->m_pVCAPStatus[ch][0].dwFrameRate =30;
 
 				}
-				else if(pdx->m_dwSWFrameRate[ch]>(20*2))
+				else if(rate>(20*2))
 				{
 					pdx->m_pVCAPStatus[ch][0].dwFrameRate =25;
 
@@ -5279,8 +5321,6 @@ static int Get_Video_Status(struct hws_pcie_dev *pdx,unsigned int  ch)
 					pdx->m_pVCAPStatus[ch][0].dwFrameRate =60;
 				}
 			}
-			//DbgPrint("[MV]m_dwSWFrameRate=[%d]=%d ?%d \n",ch,m_pVCAPStatus[ch][0].dwFrameRate,m_dwSWFrameRate[ch]);
-			pdx->m_dwSWFrameRate[ch] =0;
 		}
 		//------------------------------------------------
 		offset = 90 + ch*2;
@@ -5347,7 +5387,18 @@ static void CheckVideFmt (struct hws_pcie_dev *pdx)
 
 	}
 	#endif
-	WRITE_ONCE(pdx->m_curr_No_Video[i], Get_Video_Status(pdx,i));
+	{
+		int was = READ_ONCE(pdx->m_curr_No_Video[i]);
+		int now = Get_Video_Status(pdx,i);
+
+		WRITE_ONCE(pdx->m_curr_No_Video[i], now);
+		if (was && !now)
+		{
+			/* signal back: count the frame rate from here, not across the gap */
+			atomic_set(&pdx->m_dwSWFrameRate[i], 0);
+			pdx->m_sw_rate_t0[i] = ktime_get_ns();
+		}
+	}
 	if (pdx->m_recovered)
 	{
 		int ch;
@@ -5372,7 +5423,7 @@ static void CheckVideFmt (struct hws_pcie_dev *pdx)
 	if((pdx->m_curr_No_Video[i] ==0x1)&&(pdx->m_bVCapStarted[i]==TRUE))
 	{
 		//printk("[MV]check NoVideo End: [%d]\n",i);
-		queue_work(pdx->wq,&pdx->video[i].videowork);
+		kthread_queue_work(pdx->conv_worker[i], &pdx->video[i].videowork);
 	}
 	//-----------------
 
@@ -5387,11 +5438,21 @@ int MainKsThreadHandle(void *arg)
 	unsigned int tick = 0;
 	struct hws_pcie_dev *pdx = (struct hws_pcie_dev *)(arg);
 
-	/* frozen before the card is suspended, so it never polls a powered-down card */
+	/*
+	 * Frozen before the card is suspended, so it never polls a powered-down
+	 * card. kthread_freezable_should_stop() also leaves the freezer when
+	 * kthread_stop() comes while frozen (remove during resume), where a plain
+	 * try_to_freeze() would never return.
+	 */
 	set_freezable();
-	while(1)
+	while (!kthread_freezable_should_stop(NULL))
 	{
-		try_to_freeze();
+		/* shutdown stopped the card: leave it alone */
+		if (READ_ONCE(pdx->removing))
+		{
+			schedule_timeout_interruptible(HZ / 4);
+			continue;
+		}
 
 		/* card interrupts paused by the storm guard: try again after a second */
 		if (smp_load_acquire(&pdx->irq_storm_off) && !READ_ONCE(pdx->removing) &&
@@ -5400,13 +5461,16 @@ int MainKsThreadHandle(void *arg)
 			unsigned long flags;
 
 			mutex_lock(&pdx->pm_lock);
-			/* suspended: resume re-enables them; card lost: retry once it's back */
-			if (!pdx->suspended && !READ_ONCE(pdx->m_PciDeviceLost))
+			/* suspended: resume re-enables them; card lost: retry once it's back;
+			 * shut down meanwhile: the card stays off */
+			if (!pdx->suspended && !READ_ONCE(pdx->m_PciDeviceLost) && !READ_ONCE(pdx->removing))
 			{
+				/* flag first: the guard must be able to act on the first interrupt */
+				WRITE_ONCE(pdx->irq_storm_off, false);
+				smp_mb();
 				spin_lock_irqsave(&pdx->reg_lock, flags);
 				WRITE_REGISTER_ULONG(pdx, INT_EN_REG_BASE, 0x3ffff);
 				spin_unlock_irqrestore(&pdx->reg_lock, flags);
-				WRITE_ONCE(pdx->irq_storm_off, false);
 			}
 			mutex_unlock(&pdx->pm_lock);
 		}
@@ -5420,7 +5484,10 @@ int MainKsThreadHandle(void *arg)
 			}
 		}
 		tick++;
-		if(need_check==1)
+		/* also when a card that was gone at resume is back (config-space check
+		 * only until then): CheckVideFmt notices it and re-inits it */
+		if(need_check==1 ||
+		   (READ_ONCE(pdx->need_bringup) && pci_device_is_present(pdx->pdev)))
 		{
 			CheckVideFmt(pdx);
 			if(timing_debug && tick % 4 == 0)
@@ -5429,11 +5496,6 @@ int MainKsThreadHandle(void *arg)
 		/* 4 Hz: a mode change is noticed within 250 ms (cheap: a few register
 		 * reads per channel). Returns early when kthread_stop() wakes us */
 		schedule_timeout_interruptible(HZ / 4);
-		if(kthread_should_stop())
-		{
-			break;
-		}
-
 	}
 	//printk("MainKsThreadHandle Exit");
 	return 0;
@@ -5794,6 +5856,17 @@ static int ReadChipId(struct hws_pcie_dev *pdx)
 
 }
 
+static struct kthread_worker *hws_create_worker(const char *fmt, int ch)
+{
+	struct kthread_worker *w = kthread_create_worker(0, fmt, ch);
+
+	if (!IS_ERR(w)) {
+		sched_set_fifo_low(w->task);
+		wake_up_process(w->task);
+	}
+	return w;
+}
+
 static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 {
 	struct hws_pcie_dev *gdev;
@@ -5869,7 +5942,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		gdev->m_brightness[i] = 0x80;
 		gdev->m_saturation[i] = 0x80;
 		gdev->m_hue[i] = 0x80;
-		gdev->m_dwSWFrameRate[i] =0;
+		atomic_set(&gdev->m_dwSWFrameRate[i], 0);
 		gdev->m_pbyVideoBuffer[i] = NULL;
 		gdev->m_VideoInfo[i].dwisRuning= 0;
 		gdev->m_VideoInfo[i].m_nVideoIndex= 0;
@@ -5920,7 +5993,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		spin_lock_init(&gdev->video[i].consumers_lock);
 		INIT_LIST_HEAD(&gdev->video[i].consumers);
 		gdev->video[i].engine_users = 0;
-		INIT_WORK(&gdev->video[i].videowork,video_data_process);
+		kthread_init_work(&gdev->video[i].videowork, video_data_process);
 		INIT_DELAYED_WORK(&gdev->video[i].nosig_work,hws_nosig_work);
 		mutex_init(&gdev->direct_lock[i]);
 		INIT_LIST_HEAD(&gdev->direct_bufs[i]);
@@ -5945,22 +6018,25 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	 * Each work item still never runs concurrently with itself.
 	 */
 	gdev->wq = alloc_workqueue("hws", WQ_HIGHPRI | WQ_UNBOUND, 0);
-	gdev->auwq = alloc_workqueue("hws-audio", WQ_HIGHPRI | WQ_UNBOUND, 0);
-	if (!gdev->wq || !gdev->auwq) {
+	if (!gdev->wq) {
 		err = -ENOMEM;
 		goto err_unmap;
 	}
 	for (i = 0; i < MAX_VID_CHANNELS; i++) {
-		struct kthread_worker *w = kthread_create_worker(0, "hws-copy%d", i);
-
-		if (IS_ERR(w)) {
-			err = PTR_ERR(w);
+		/* lowest RT priority: ahead of normal tasks (an encoder can't delay
+		 * frames), behind every IRQ thread. Not started by
+		 * kthread_create_worker() since 6.14, hence wake_up_process(). */
+		gdev->copy_worker[i] = hws_create_worker("hws-copy%d", i);
+		gdev->conv_worker[i] = hws_create_worker("hws-conv%d", i);
+		if (IS_ERR(gdev->copy_worker[i]) || IS_ERR(gdev->conv_worker[i])) {
+			err = IS_ERR(gdev->copy_worker[i]) ? PTR_ERR(gdev->copy_worker[i]) :
+							     PTR_ERR(gdev->conv_worker[i]);
+			if (IS_ERR(gdev->copy_worker[i]))
+				gdev->copy_worker[i] = NULL;
+			if (IS_ERR(gdev->conv_worker[i]))
+				gdev->conv_worker[i] = NULL;
 			goto err_unmap;	/* hws_dev_release() destroys the ones made */
 		}
-		gdev->copy_worker[i] = w;
-		/* lowest RT priority: ahead of normal tasks, behind every IRQ thread */
-		sched_set_fifo_low(w->task);
-		wake_up_process(w->task);	/* not started by kthread_create_worker() since 6.14 */
 	}
 
 	err = DmaMemAllocPool(gdev);
@@ -6073,7 +6149,7 @@ static int __maybe_unused hws_suspend(struct device *dev)
 		hws_direct_reclaim(pdx, i, NULL);
 		flush_work(&pdx->video[i].fanout_work);
 		cancel_delayed_work_sync(&pdx->video[i].nosig_work);
-		flush_work(&pdx->video[i].videowork);
+		kthread_flush_work(&pdx->video[i].videowork);
 		cancel_delayed_work_sync(&pdx->video[i].nosig_work);
 		flush_work(&pdx->audio[i].audiowork);
 	}
@@ -6125,11 +6201,21 @@ static SIMPLE_DEV_PM_OPS(hws_pm_ops, hws_suspend, hws_resume);
 static void hws_shutdown(struct pci_dev *pdev)
 {
 	struct hws_pcie_dev *dev = pci_get_drvdata(pdev);
+	int i;
 
 	if (!dev || !dev->map_bar0_addr)
 		return;
 	WRITE_ONCE(dev->removing, true);	/* no new streams, no re-arming */
-	StopKSThread(dev);
+	/*
+	 * The status thread isn't stopped: when hibernation powers off it is
+	 * frozen and would never exit. It sees "removing" and stays away.
+	 * A stream start that is already past its "removing" check finishes
+	 * before we stop the card (engine_lock), so it can't switch it back on.
+	 */
+	for (i = 0; i < dev->m_nCurreMaxVideoChl; i++) {
+		mutex_lock(&dev->video[i].engine_lock);
+		mutex_unlock(&dev->video[i].engine_lock);
+	}
 	mutex_lock(&dev->pm_lock);
 	if (!pci_device_is_present(pdev))
 		WRITE_ONCE(dev->m_PciDeviceLost, 1);

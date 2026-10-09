@@ -361,7 +361,8 @@ struct hws_video{
 	struct v4l2_ctrl_handler	ctrl_handler;	/* picture controls; freed with v4l2_dev */
 	bool				ctrl_ready;
 	int						index;
-	struct work_struct		videowork;
+	struct kthread_work		videowork;	/* conversion/delivery, on conv_worker[index] */
+	u64				nosig_last_ns;	/* last "no signal" frame */
 	struct delayed_work		nosig_work;	/* paces "no signal" frames */
 	/* direct-path fan-out to further consumers, off the IRQ thread */
 	struct work_struct		fanout_work;
@@ -457,6 +458,7 @@ struct hws_pcie_dev {
 	struct mutex			direct_lock[MAX_VID_CHANNELS];
 	struct list_head		direct_bufs[MAX_VID_CHANNELS];
 	int				direct_out_size[MAX_VID_CHANNELS];
+	bool				direct_nt[MAX_VID_CHANNELS];	/* direct frame written with non-temporal stores */
 	bool				direct_il[MAX_VID_CHANNELS];	/* direct frame is interlaced: line-doubled */
 	bool				direct_frame[MAX_VID_CHANNELS];	/* first half of the frame in flight went direct */
 	struct hws_timing_stats		tstats[MAX_VID_CHANNELS];
@@ -470,7 +472,6 @@ struct hws_pcie_dev {
 	//----------------------------
 	u32 *map_bar0_addr;
 	struct workqueue_struct *wq;
-	struct workqueue_struct *auwq;
 	unsigned long video_data[MAX_VID_CHANNELS];
  	unsigned long audio_data[MAX_VID_CHANNELS];
 	unsigned long			m_audio_pending[MAX_VID_CHANNELS];	/* bit n: audio half n done */
@@ -479,6 +480,8 @@ struct hws_pcie_dev {
 	u32				m_half1_gen[MAX_VID_CHANNELS];	/* m_fmt_gen when the first half was copied */
 	/* one RT thread per channel copies its half-frames, so channels don't queue behind each other */
 	struct kthread_worker		*copy_worker[MAX_VID_CHANNELS];
+	/* one RT thread per channel converts and delivers frames from the ring */
+	struct kthread_worker		*conv_worker[MAX_VID_CHANNELS];
 	u32				m_half_seq[MAX_VID_CHANNELS][2];	/* hard IRQ: odd while ts/cnt/peer change */
 	u32				m_half_done_cnt[MAX_VID_CHANNELS][2];	/* copy thread: last completion handled */
 	u64				m_half1_ts[MAX_VID_CHANNELS];	/* IRQ time of that first half */
@@ -556,7 +559,7 @@ struct hws_pcie_dev {
 	int       m_nRDAudioIndex[MAX_VID_CHANNELS];
 	u32       m_dwAudioPTKSize;
 	//-----------------------------
-	int m_dwSWFrameRate[MAX_VID_CHANNELS];
+	atomic_t m_dwSWFrameRate[MAX_VID_CHANNELS];	/* half-frames since the last rate measurement */
 
 	ULONG m_contrast[MAX_VID_CHANNELS];
 	ULONG m_brightness[MAX_VID_CHANNELS];
