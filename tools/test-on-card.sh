@@ -126,7 +126,9 @@ if [ $ORIG_LOADED = 1 ]; then
 	sudo rmmod HwsCapture || die "can't unload the current driver (still in use?), nothing was changed"
 fi
 SWAPPED=1
-DMESG_START=$(sudo dmesg | wc -l)
+# timestamps, not line counts: a full kernel log buffer drops old lines as new ones come
+DMESG_START=$(sudo dmesg | tail -1 | sed -n 's/^\[ *\([0-9.]*\)\].*/\1/p')
+kmsg_since() { sudo dmesg | awk -v t="${DMESG_START:-0}" 'match($0, /^\[ *[0-9.]+\]/) { v = substr($0, RSTART + 1, RLENGTH - 2); gsub(/ /, "", v); if (v + 0 > t + 0) print }'; }
 if ! out=$(sudo insmod "$BUILD/HwsCapture.ko" timing_debug=1 2>&1); then
 	say "$out"
 	echo "$out" | grep -qi 'key was rejected' && say "   Secure Boot is on: the module must be signed (install with dkms-install.sh, see README) or Secure Boot disabled"
@@ -135,7 +137,7 @@ fi
 [ "$(cat /sys/module/HwsCapture/srcversion 2>/dev/null)" = "$NEW_SRC" ] || die "the loaded module is not the one just built"
 say "== new driver loaded:"
 sleep 3	# let udev create the device nodes
-sudo dmesg | tail -n +$((DMESG_START + 1)) | grep -i hwscapture | sed 's/^/   /'
+kmsg_since | grep -i hwscapture | sed 's/^/   /'
 
 # ---------------------------------------------------------------- test
 say ""
@@ -144,5 +146,5 @@ rc=$?
 
 say ""
 say "== all kernel messages during the test"
-sudo dmesg | tail -n +$((DMESG_START + 1)) | sed 's/^/   /' | tail -60
+kmsg_since | sed 's/^/   /' | tail -60
 exit $rc

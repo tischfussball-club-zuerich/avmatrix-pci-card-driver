@@ -21,8 +21,12 @@ SCALE_DUR=${SCALE_DUR:-$(( DUR < 10 ? DUR : 10 ))}
 SKIP_COMPLIANCE=${SKIP_COMPLIANCE:-0}
 TMP=$(mktemp -d /tmp/hws-check.XXXXXX)
 trap 'rm -rf "$TMP"' EXIT
+# kernel messages after a point in time. Timestamps, not line counts: once the
+# kernel's log buffer is full, old lines drop out as new ones arrive.
+dmesg_now() { dmesg 2>/dev/null | tail -1 | sed -n 's/^\[ *\([0-9.]*\)\].*/\1/p'; }
+dmesg_since() { dmesg 2>/dev/null | awk -v t="${1:-0}" 'match($0, /^\[ *[0-9.]+\]/) { v = substr($0, RSTART + 1, RLENGTH - 2); gsub(/ /, "", v); if (v + 0 > t + 0) print }'; }
 # only kernel messages from this run count
-dmesg_ok=1; dmesg_start=$(dmesg 2>/dev/null | wc -l); dmesg >/dev/null 2>&1 || dmesg_ok=0
+dmesg_ok=1; dmesg >/dev/null 2>&1 || dmesg_ok=0; dmesg_start=$(dmesg_now)
 fail=0
 say() { printf '%s\n' "$*"; }
 bad() { printf '  !! %s\n' "$*"; fail=1; }
@@ -118,7 +122,7 @@ if [ ${#sig_nodes[@]} -gt 0 ]; then
 	thr() { local p t=0; for p in $(pgrep '^hws-(copy|conv)'); do
 			t=$((t + $(awk '{ print $14 + $15 }' /proc/$p/stat 2>/dev/null || echo 0))); done; echo $t; }
 	read -r tot0 idle0 < <(cpu); thr0=$(thr)
-	par_start=$(dmesg 2>/dev/null | wc -l)
+	par_start=$(dmesg_now)
 	pids=()
 	for d in "${sig_nodes[@]}"; do
 		n=$(awk -v f="${FPS[$d]}" -v t="$DUR" 'BEGIN { printf "%d", f * t }')
@@ -147,7 +151,7 @@ if [ ${#sig_nodes[@]} -gt 0 ]; then
 	# frames the card completed vs. frames the driver took in (timing_debug=1):
 	# equal = a late frame never came from the card; more card frames = lost in the driver
 	if [ $dmesg_ok = 1 ]; then
-		cmp=$(dmesg | tail -n +$((par_start + 1)) | awk '
+		cmp=$(dmesg_since "$par_start" | awk '
 			/HwsCapture ch[0-9]+: in .*frames card [0-9]+ in [0-9]+/ {
 				ch = $0; sub(/.*HwsCapture /, "", ch); sub(/:.*/, "", ch)
 				m = $0; sub(/.*frames card /, "", m); split(m, v, /[ |]+/)
@@ -173,7 +177,7 @@ say ""
 if [ $dmesg_ok = 0 ]; then
 	say "== kernel messages: not readable (run as root, or: sudo dmesg | grep -i hwscapture)"
 else
-	new=$(dmesg | tail -n +$((dmesg_start + 1)))
+	new=$(dmesg_since "$dmesg_start")
 	# per-second statistics of this driver (timing_debug=1): sum the drop counters
 	stats=$(printf '%s\n' "$new" | awk '
 		/HwsCapture ch[0-9]+: in / { ch = $0; sub(/.*HwsCapture /, "", ch); sub(/:.*/, "", ch)
