@@ -238,6 +238,114 @@ sudo depmod -a
 | Stutter or dropped frames | Run the checks in [Checking that it works](#checking-that-it-works). Test with `direct_io=0` to rule out the fast path. |
 | Module does not unload (`in use`) | Close all applications using the video or audio devices, including PipeWire clients, or reboot. |
 
+## Changes compared to the official driver
+
+Compared to the latest official AVMatrix driver (2026-05-19 release) and the
+GloriousEggroll repository, this version fixes the following. All of it is
+verified by code review, the userspace tests in `tools/driver-tests` and
+compile tests; none of it has been confirmed on a card yet.
+
+### Crashes and memory corruption
+
+- **Interlaced inputs** (480i, 576i, 720i) made the deinterlacer write twice
+  the frame size into the application's buffer.
+- **YV12/NV12 boards** read before the output buffer for widths that are not a
+  multiple of 16 (e.g. 1366). Over all input/output size combinations the
+  original converters faulted in 2,210 of 26,832; now in none.
+- **Changing the format while streaming** overflowed buffers (`S_FMT` now
+  returns `-EBUSY`), and `S_FMT` raced buffer allocation on another file handle.
+- **NULL pointer crash** when the HDMI signal came back.
+- **Divide-by-zero** on a 0×0 resolution during mode switches, and in
+  `S_PARM` when an application passed a zero numerator.
+- **Use-after-free on STREAMOFF/close:** the worker wasn't waited for, USERPTR
+  buffers were handed back before all applications had their copy, and
+  `poll()` could read freed memory.
+- **Blocking `DQBUF` crashed** on kernels older than 7.0 (`mutex_unlock(NULL)`).
+- **Audio:** buffer overflow with small ALSA buffers, and writes into freed
+  memory after close.
+- **Unbind/remove** freed memory still used by interrupts, workers and open
+  files (lifetime is now reference-counted); a wedged card could keep DMAing
+  into freed buffers; registers were accessed after unmap (probe error path,
+  control writes racing remove); on surprise removal the driver now stops
+  touching a card that is gone.
+- **Probe:** failures were reported as success (and crashed on remove), the
+  interrupt could fire before setup, and partial failures unregistered devices
+  that were never registered and leaked sound cards.
+- **Hard lockup in the interrupt handler:** interrupt sources the driver
+  didn't handle were never acknowledged, so a level-triggered line kept the
+  CPU in the handler. All sources are acknowledged now; a stuck status bit is
+  detected, and after a storm the card's interrupts are paused for a second.
+
+### Hangs and freezes
+
+- **Blocking `DQBUF` held a per-device lock,** so other applications and
+  threads froze in uninterruptible sleep.
+- **Stopping a hung card looped forever;** it now times out.
+- **Removing the device** waited for every audio application to close.
+- **Interrupt acknowledgements were lost** (bits added with `+=`), stalling
+  channels; channels could switch each other off through an unlocked shared
+  register.
+- **Shared interrupt lines were refused,** and a failed MSI setup aborted
+  probe instead of falling back to legacy interrupts.
+- **Signal loss mid-frame** left an application's buffer stuck.
+- **A dead card** (all registers read as ones) was accepted at probe and never
+  detected at runtime, while a single bad read marked it lost forever. It is
+  now detected reliably and recovers automatically.
+
+### Stutter, dropped frames and latency
+
+- **Same size in and out (the common case):** frames are copied straight from
+  the card's DMA memory into the application's buffer: 1 copy instead of 2,
+  and no worker wakeup. Several applications on one channel are served by a
+  separate worker, so they don't hold up the capture.
+- **One frame filled all of an application's buffers,** causing bursts of
+  duplicates followed by gaps.
+- **Frame conversion ran with interrupts disabled** (0.2–0.9 ms per buffer).
+- **The backlog grew without limit** (up to ~50 ms). The worker now drains the
+  ring and skips to the newest frame when an application is short of buffers.
+- **Torn frames:** ring slots were overwritten while being read, half-frame
+  interrupts were dropped while a copy was busy, frames mixed two resolutions
+  during a mode switch, and halves the card overwrote mid-copy were shown.
+  These are now detected and dropped (in a 480 fps stress simulation: 148 torn
+  frames per minute before, 0 after). Lost or duplicated half-frame interrupts
+  are handled.
+- **Big copies ran in softirq,** delaying network, timer and disk work; they
+  now run in a preemptible threaded interrupt.
+- **Workers:** one wakeup per frame instead of two, on high-priority workers
+  that run the channels in parallel instead of one shared thread.
+- **Timestamps** now come from the frame's interrupt instead of worker
+  scheduling; sequence numbers are per application and always increase, so a
+  gap means a real drop.
+- **The no-signal picture** came once per second; now at about 30 fps.
+- **ALSA xruns:** the minimum period was below the card's 4096-byte packet,
+  the BATCH flag was missing and a stale packet played at start.
+- **Faster converters** (byte-identical output): 1080p→720p 0.43→0.19 ms,
+  720p→1080p 0.33→0.24 ms, YV12 1080p 0.77→0.53 ms, NV12 1080p 0.65→0.36 ms.
+- **Log flooding** from paths applications can trigger is rate-limited.
+
+### Correctness and compatibility
+
+- **Suspend/resume** was missing, so the card came back unconfigured.
+- **Picture controls** (brightness, contrast, saturation, hue) never reached
+  the hardware; they now use the kernel's control framework, so `v4l2-ctl`
+  lists them, and the hue default is right.
+- **V4L2 reporting:** the real input frame rate instead of a fixed 60, no fake
+  analog TV standard, "no signal" status in `ENUM_INPUT`, and a unique
+  `bus_info` (`PCI:<address>`) so tools can tell cards apart.
+- **Portrait output (1080×1920)** from 4:2:0 boards was scaled with width and
+  height swapped.
+- **PCI setup:** explicit 32-bit DMA mask, PCI regions requested, bus
+  mastering enabled only after the card reset, and Relaxed Ordering no longer
+  forced on root ports where the kernel disables it as broken.
+- **Memory:** the 16 × 4 MB ring buffers no longer need physically contiguous
+  memory (which failed after long uptime), and applications can no longer
+  allocate oversized buffers through `CREATE_BUFS`.
+- **Scalers:** small inputs were centred with U/V swapped and junk pixels at
+  the edge, NV12 read stale bytes past the frame, an unaligned read in the
+  1080p→720p scaler, and unknown pixel layouts were sized inconsistently.
+- **32-bit builds:** link errors and torn 64-bit timestamps; deprecated
+  tasklets replaced by a threaded interrupt.
+
 ## For developers
 
 - `src/`: driver source (`hws_video.c`, `hws.h`, `hws_reg.h`) and the DKMS

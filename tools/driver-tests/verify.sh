@@ -24,6 +24,17 @@ for mode in race logic nodirect irqfaults; do for f in 60 240 480; do
 	scan $o; [ $rc = 0 ] || fail=1
 done; done
 unset SIM_DMA_LOCK SIM_NO_DIRECT SIM_LOSE_IRQ SIM_DUP_IRQ
+for f in 60 240; do
+	o=$S/sim/out_hostile_$f.txt
+	SIM_HOSTILE=1 ASAN_OPTIONS=detect_leaks=0 timeout 300 $S/sim/sim $f 45 > $o 2>&1; rc=$?
+	echo "== sim $f fps, mode=hostile (1 s phases of garbage registers, IRQ storm, DMA garbage, ALSA open/close, then sane hardware): exit $rc"
+	grep -E "^coverage|ALSA periods|delivered|out of order|sequence not|timestamp not|STREAMOFF|ERROR b" $o | sed 's/^/    /'
+	for k in "torn/mixed, steady state" "duplicate frames" "frames out of order" "sequence not increasing" "timestamp not increasing" "left in driver after STREAMOFF" "completed after STREAMOFF"; do
+		v=$(grep "$k" $o | grep -o '[0-9]\+' | tail -1); [ "${v:-1}" = 0 ] || { echo "    !! $k = $v"; fail=1; }; done
+	# the fuzz must actually reach the data paths, not just bounce off the checks
+	for v in $(grep "^coverage" $o | grep -o '[0-9]\+' | head -3); do [ "$v" -gt 0 ] || { echo "    !! a data path was never reached"; fail=1; }; done
+	scan $o; [ $rc = 0 ] || fail=1
+done
 echo "== TSan (120 fps, 20 s)"
 (cd $S/sim && gcc -O1 -g -fsanitize=thread -pthread -w -I. -Ifake -I$SRC -include shim.h -o sim_tsan sim.c && TSAN_OPTIONS=report_signal_unsafe=0 timeout 400 setarch -R ./sim_tsan 120 20 > tsan.txt 2>&1) || true
 [ -x $S/sim/sim_tsan ] || { echo "!! TSan build FAILED"; fail=1; }

@@ -13,6 +13,7 @@
 #define SHIM_H
 #define _GNU_SOURCE
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -39,11 +40,14 @@ typedef u64 v4l2_std_id; typedef unsigned int __poll_t;
 #define LINUX_VERSION_CODE KERNEL_VERSION(7, 0, 0)
 #define KERN_ERR ""
 #define KERN_WARNING ""
+#define KERN_INFO ""
 #define printk printf
 #define pr_debug(...) do { } while (0)
 #define pr_info(...) do { } while (0)
 extern atomic_long sim_ratelimited_warnings;
 #define pr_warn_ratelimited(...) atomic_fetch_add(&sim_ratelimited_warnings, 1)
+#define printk_ratelimited(...) atomic_fetch_add(&sim_ratelimited_warnings, 1)
+#define cond_resched() sched_yield()
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
 #define READ_ONCE(x) (*(volatile __typeof__(x) *)&(x))
@@ -185,7 +189,11 @@ struct v4l2_device { int dummy; void (*release)(struct v4l2_device *); };
 struct video_device { int dummy; };
 struct pci_dev { unsigned short device, vendor; };
 struct uio_info { struct { void *internal_addr; unsigned long addr, size; int memtype; } mem[1]; };
-struct snd_card; struct snd_pcm_substream; struct task_struct;
+struct snd_card; struct task_struct;
+/* just enough ALSA for the driver's audio delivery path */
+struct snd_pcm_runtime { unsigned char *dma_area; unsigned long buffer_size, period_size; };
+struct snd_pcm_substream { struct snd_pcm_runtime *runtime; };
+void snd_pcm_period_elapsed(struct snd_pcm_substream *s);
 struct msix_entry { int dummy; };
 
 /* ---- irq ---- */

@@ -33,6 +33,13 @@ UndefinedBehaviorSanitizer and ThreadSanitizer, and python3.
   - `SIM_NO_DIRECT=1`: ring + worker path only
   - `SIM_LOSE_IRQ=N` / `SIM_DUP_IRQ=N`: lose one in N second-half interrupts /
     report one in N first halves twice
+  - `SIM_HOSTILE=1` (60/240 fps): alternates 1 s of broken hardware (status
+    and format registers return garbage, 0 or all-ones; an interrupt storm
+    with random status bits; garbage written into DMA memory; ALSA streams
+    opened, closed and resized at random) with 1 s of sane hardware. Checks
+    that nothing crashes or trips a sanitizer, that every buffer comes back on
+    STREAMOFF, and that the fuzz really reaches the video, audio and ALSA copy
+    paths. Frame content isn't checked in this mode.
 - **ThreadSanitizer** run of the simulator. The remaining reports are the
   driver's intentional lock-free flags (pending bits, counters, busy flags)
   and the simulated card's own DMA writes; none involve frames, buffers or

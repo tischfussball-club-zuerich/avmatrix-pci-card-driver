@@ -656,13 +656,8 @@ static int hws_vidioc_enum_framesizes(struct file *file, void *fh, struct v4l2_f
 static int hws_vidioc_enum_input(struct file *file, void *priv,struct v4l2_input *i)
 {
 	struct hws_video *videodev = video_drvdata(file);
-	int Index;
-	Index = i->index;
-	//printk( "%s(%d)-%d Index =%d \n", __func__,videodev->index,i->index,Index);
-	if(Index >0)
-	{
-		return   -EINVAL;
-	}
+	if (i->index != 0)
+		return -EINVAL;
 	i->type = V4L2_INPUT_TYPE_CAMERA;
 	strscpy(i->name, KBUILD_MODNAME, sizeof(i->name));
 	i->std = 0;	/* HDMI: no analog TV standard */
@@ -1186,7 +1181,7 @@ static int hws_queue_setup_multi(struct vb2_queue *q,
 
     if (*num_planes) {
         /* larger than the biggest frame twice over is only a way to eat memory */
-        if (sizes[0] < size || sizes[0] > 2 * MAX_VIDEO_SCLAER_SIZE)
+        if (sizes[0] < size || sizes[0] > PAGE_ALIGN(MAX_VIDEO_SCLAER_SIZE))
             return -EINVAL;
         return 0;
     }
@@ -2706,7 +2701,8 @@ static int hws_convert_frame(struct hws_pcie_dev *pdx, int nDecoder, BYTE *bBuf,
                     return -1;
                 }
                 FillYUU2(bBuf, pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf, in_width, in_height, interlace);
-                VideoScaler(pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf, pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf, in_width, in_height, nWidth, nHeight);
+                /* scale to the unrotated size, then rotate (as for YUYV) */
+                VideoScaler(pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf, pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf, in_width, in_height, nHeight, nWidth);
                 VideoRotate90deg(pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf, dst, nHeight, nWidth, nWidth, nHeight);
             }
         } else {
@@ -2733,7 +2729,8 @@ static int hws_convert_frame(struct hws_pcie_dev *pdx, int nDecoder, BYTE *bBuf,
                     return -1;
                 }
                 FillNV12ToYUY2(bBuf, pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf, in_width, in_height, interlace);
-                VideoScaler(pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf, pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf, in_width, in_height, nWidth, nHeight);
+                /* scale to the unrotated size, then rotate (as for YUYV) */
+                VideoScaler(pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf, pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf, in_width, in_height, nHeight, nWidth);
                 VideoRotate90deg(pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf, dst, nHeight, nWidth, nWidth, nHeight);
             }
         } else {
@@ -2806,6 +2803,7 @@ static int hws_complete_buffers(struct list_head *list, int ok, int out_size,
             memcpy(buf->mem, first->mem, out_size);
         else
             buf->mem_bad = true;
+        cond_resched();	/* callers can sleep; many consumers = many 4 MB copies */
     }
 
     list_for_each_entry_safe_reverse(buf, tmp, list, queue) {
@@ -3854,6 +3852,12 @@ static void hws_remove(struct pci_dev *pdev)
 	//----------------------------
 	if(dev == NULL || dev->map_bar0_addr == NULL) return;
 
+	/* surprise removal: don't touch registers of a card that is gone (some
+	 * arm64 root complexes raise an SError on accesses to a removed device) */
+	if (!pci_device_is_present(pdev) ||
+	    READ_REGISTER_ULONG(dev, CVBS_IN_BASE) == 0xFFFFFFFF)
+		WRITE_ONCE(dev->m_PciDeviceLost, 1);
+
 	hws_block_streams(dev);
 	for (i = 0; i < MAX_VID_CHANNELS; i++)
 		if (dev->audio[i].card)
@@ -4627,6 +4631,7 @@ static void hws_audio_dpc(struct hws_pcie_dev *pdx, int index)
 
 	while ((pending = READ_ONCE(pdx->m_audio_pending[index])) != 0)
 	{
+		cond_resched();	/* an interrupt storm must not monopolise the CPU */
 		smp_rmb();	/* pairs with smp_mb__before_atomic() in the IRQ handler */
 		if (pending == 3)
 			half = (s64)(atomic64_read(&pdx->m_audio_half_ts[index][1]) -
@@ -4681,6 +4686,7 @@ static void hws_video_dpc(struct hws_pcie_dev *pdx, int i)
 
 	while ((pending = READ_ONCE(pdx->m_half_pending[i])) != 0)
 	{
+		cond_resched();	/* an interrupt storm must not monopolise the CPU */
 		smp_rmb();	/* pairs with smp_mb__before_atomic() in the IRQ handler */
 		if (pending == 3)
 			half = (s64)(atomic64_read(&pdx->m_half_ts[i][1]) -
@@ -4721,8 +4727,11 @@ static irqreturn_t irqhandler(int irq, void  *info)
 	u32 IntState;
 	u32 tmp;
 	u32 cnt;
+	u32 before;
 	int i;
 	bool wake = false;
+	bool ours = false;
+	bool stuck = false;
 
 	dma_status =  READ_REGISTER_ULONG(pdx,(u32)(CVBS_IN_BASE));
 	if((dma_status == 0xffffffff) || ((dma_status&0x04) != 0x04))
@@ -4738,6 +4747,10 @@ static irqreturn_t irqhandler(int irq, void  *info)
 	{
 		/* bits to acknowledge in this pass only */
 		Int_Value = 0;
+		/* any source we acknowledge is ours (also bits 16/17): returning
+		 * IRQ_NONE for them would get the line disabled as "nobody cared" */
+		if (IntState & 0x00ffffff)
+			ours = true;
 		for (i = 0; i < MAX_VID_CHANNELS; i++)
 		{
 			if(IntState & (0x01 << i)) // video ch done
@@ -4779,10 +4792,48 @@ static irqreturn_t irqhandler(int irq, void  *info)
 				wake = true;
 			}
 		}
-		Int_Value = Int_Value&0x00ffffff;
+		/*
+		 * Acknowledge every source that is set, also ones we don't handle
+		 * (e.g. bits 16/17, enabled by INT_EN): an unacknowledged level
+		 * interrupt would re-fire forever.
+		 */
+		Int_Value = (Int_Value | IntState) & 0x00ffffff;
+		before = IntState;
 		WRITE_REGISTER_ULONG(pdx,(u32)(0x4000 + (PCIE_BARADDROFSIZE * 1)), Int_Value);
 		IntState= READ_REGISTER_ULONG(pdx,(u32)(CVBS_IN_BASE + 1 * PCIE_BARADDROFSIZE));
+		if (IntState == before)
+		{
+			/* the acknowledge had no effect: a stuck bit, don't spin on it */
+			stuck = true;
+			break;
+		}
 	}
+
+	/*
+	 * Storm guard: a status bit that never clears keeps a level-triggered
+	 * line asserted. After many stuck passes in a row switch the card's
+	 * interrupts off (no lock here: hard IRQ context, also on PREEMPT_RT);
+	 * the status thread switches them back on a second later.
+	 */
+	if (stuck || cnt >= 100)
+	{
+		if (++pdx->irq_stuck_passes >= 1000 && !READ_ONCE(pdx->irq_storm_off))
+		{
+			WRITE_REGISTER_ULONG(pdx, INT_EN_REG_BASE, 0);
+			pdx->irq_storm_off_ns = ktime_get_ns();
+			WRITE_ONCE(pdx->irq_storm_off, true);
+			pdx->irq_stuck_passes = 0;
+			printk_ratelimited(KERN_WARNING "HwsCapture: interrupt status stuck at %08x, card interrupts paused\n", IntState);
+		}
+	}
+	else
+	{
+		pdx->irq_stuck_passes = 0;
+	}
+
+	/* nothing the card could have raised: let the kernel's spurious-interrupt handling see it */
+	if (!ours)
+		return IRQ_NONE;
 	/* a wake while the thread runs makes it run again, so nothing is lost */
 	return wake ? IRQ_WAKE_THREAD : IRQ_HANDLED;
 }
@@ -5199,6 +5250,22 @@ int MainKsThreadHandle(void *arg)
 	{
 		try_to_freeze();
 
+		/* card interrupts paused by the storm guard: try again after a second */
+		if (READ_ONCE(pdx->irq_storm_off) && !READ_ONCE(pdx->removing) &&
+		    ktime_get_ns() - pdx->irq_storm_off_ns > NSEC_PER_SEC)
+		{
+			unsigned long flags;
+
+			mutex_lock(&pdx->pm_lock);
+			if (!pdx->suspended && !READ_ONCE(pdx->m_PciDeviceLost))
+			{
+				spin_lock_irqsave(&pdx->reg_lock, flags);
+				WRITE_REGISTER_ULONG(pdx, INT_EN_REG_BASE, 0x3ffff);
+				spin_unlock_irqrestore(&pdx->reg_lock, flags);
+			}
+			WRITE_ONCE(pdx->irq_storm_off, false);
+			mutex_unlock(&pdx->pm_lock);
+		}
 		need_check=0;
 		for(i=0; i<pdx->m_nMaxChl; i++)
 		{
@@ -5357,12 +5424,18 @@ static int irq_setup(struct hws_pcie_dev *lro, struct pci_dev *pdev)
 		irq_flag = lro->msi_enabled ? 0 : IRQF_SHARED;
 		//irq_flag = IRQF_SHARED;
 
-		rc = request_threaded_irq(pdev->irq, irqhandler, hws_irq_thread, irq_flag, pci_name(pdev), lro);
-		/* sharers of a line must agree on IRQF_ONESHOT; the hard handler acks the
-		 * card, so keeping the line masked until the thread is done is harmless */
-		if (rc == -EBUSY && (irq_flag & IRQF_SHARED))
+		/*
+		 * Legacy INTx: prefer IRQF_ONESHOT, so the line stays masked until the
+		 * IRQ thread has run (a misbehaving card can't keep the CPU in hard
+		 * IRQ context). Sharers of a line must agree on it, so fall back to
+		 * plain sharing if another device registered without it.
+		 */
+		rc = -EBUSY;
+		if (irq_flag & IRQF_SHARED)
 			rc = request_threaded_irq(pdev->irq, irqhandler, hws_irq_thread,
 						  irq_flag | IRQF_ONESHOT, pci_name(pdev), lro);
+		if (rc == -EBUSY)
+			rc = request_threaded_irq(pdev->irq, irqhandler, hws_irq_thread, irq_flag, pci_name(pdev), lro);
 		if (rc)
 		{
 			//printk("Couldn't use IRQ#%d, rc=%d\n", pdev->irq, rc);

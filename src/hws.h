@@ -438,6 +438,9 @@ struct hws_pcie_dev {
 	bool				removing;	/* hws_remove() started, hardware is going away */
 	bool				regions_requested;
 	int				m_lost_reads;	/* status thread: consecutive all-ones reads */
+	int				irq_stuck_passes;	/* hard IRQ: consecutive passes with a stuck status bit */
+	bool				irq_storm_off;	/* storm guard switched card interrupts off */
+	u64				irq_storm_off_ns;
 	int				m_recovered;	/* status thread: card came back, re-arm channels */
 	struct mutex			pm_lock;	/* suspend/resume vs. engine start/stop; nests inside engine_lock */
 	bool				suspended;	/* pm_lock */

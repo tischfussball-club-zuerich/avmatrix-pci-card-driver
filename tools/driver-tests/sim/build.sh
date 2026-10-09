@@ -10,7 +10,8 @@ python3 -I $H/extract.py $SRC/hws_video.c hws_frame_period_ns hws_copy_too_late 
   hws_buffer_queue_multi hws_return_buffers hws_start_streaming_multi hws_stop_streaming_multi \
   EnableVideoCapture CheckVideoCapture CheckCardStatus StartVideoCapture StopVideoCapture \
   SetVideoFormteSize ChangeVideoSize hws_get_mark hws_put_mark hws_direct_requeue_locked hws_direct_reclaim hws_fanout_work hws_direct_complete hws_direct_half MemCopyVideoToSteam MemCopyAudioToSteam SetAudioQuene \
-  hws_audio_dpc SetQuene hws_video_dpc irqhandler hws_irq_thread > $H/named.inc
+  hws_audio_dpc SetQuene hws_video_dpc irqhandler hws_irq_thread \
+  CheckAudioCapture StartAudioCapture StopAudioCapture EnableAudioCapture SetDMAAddress InitVideoSys Get_Video_Status CheckVideFmt _deliver_samples audio_data_process > $H/named.inc
 # forward declarations for everything extracted
 python3 -I - $H/conv.inc $H/named.inc > $H/protos.inc <<'PY'
 import re, sys

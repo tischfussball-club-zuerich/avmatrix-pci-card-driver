@@ -33,15 +33,50 @@ static void WRITE_REGISTER_ULONG(struct hws_pcie_dev *pdx, u32 off, u32 v)
 	else
 		atomic_store(&regs[off / 4], v);
 }
+static int fake_area_hit(const void *d);
+/* SIM_HOSTILE: status registers return garbage (random, 0, all-ones, plausible) */
+static int hostile;
+/* hostile phases: 1 s of garbage, then 1 s of sane hardware the driver must recover in */
+static atomic_int hostile_now;
+static _Thread_local unsigned hseed = 12345;
+static _Atomic u32 hval[0x6000 / 4];
+static atomic_bool hset[0x6000 / 4];
+/* a register keeps its (garbage) value and re-rolls now and then: stable
+ * windows the pipeline can run in, interrupted by bursts of nonsense */
+static u32 hostile_value(u32 off, u32 plausible)
+{
+	u32 i = off / 4;
+	if (!atomic_load(&hset[i]) || rand_r(&hseed) % 100 < 3) {
+		unsigned r = rand_r(&hseed) % 100;
+		u32 v = r < 1 ? 0xFFFFFFFF : r < 3 ? 0 : r < 35 ? (((u32)rand_r(&hseed) << 16) ^ (u32)rand_r(&hseed)) : plausible;
+		atomic_store(&hval[i], v);
+		atomic_store(&hset[i], true);
+	}
+	return atomic_load(&hval[i]);
+}
+static int hostile_status_reg(u32 off)
+{
+	u32 i = (off - CVBS_IN_BASE) / PCIE_BARADDROFSIZE;
+	if (off < CVBS_IN_BASE)
+		return 0;
+	return i == 0 || i == 5 || i == 8 || (i >= 88 && i <= 97) || (i >= 110 && i <= 113) ||
+	       (i >= 120 && i <= 123) || (i >= 130 && i <= 133) || (i >= 32 && i <= 35) || (i >= 40 && i <= 43);
+}
 static u32 READ_REGISTER_ULONG(struct hws_pcie_dev *pdx, u32 off)
 {
 	(void)pdx;
+	if (atomic_load(&hostile_now) && off != CVBS_IN_BASE + 1 * PCIE_BARADDROFSIZE && hostile_status_reg(off)) {
+		u32 i = (off - CVBS_IN_BASE) / PCIE_BARADDROFSIZE;
+		u32 plausible = i == 0 ? 0x05 : i == 5 ? 0x0303 : (i >= 90 && i <= 97 && !(i & 1)) ? (720u << 16 | 1280u) :
+				(i >= 110 && i <= 113) ? 60 : atomic_load(&regs[off / 4]);
+		return hostile_value(off, plausible);
+	}
 	if (off == CVBS_IN_BASE)
 		return 0x04 | 0x01;	/* "interrupt pending" + "running" */
 	return atomic_load(&regs[off / 4]);
 }
-static void InitVideoSys(struct hws_pcie_dev *pdx, int set)
-{ (void)pdx; (void)set; fprintf(stderr, "unexpected InitVideoSys\n"); abort(); }
+static atomic_long periods_elapsed;
+void snd_pcm_period_elapsed(struct snd_pcm_substream *sub) { (void)sub; atomic_fetch_add(&periods_elapsed, 1); }
 
 /* Diagnostic mode (SIM_DMA_LOCK=1): the card never overwrites DMA memory the
  * driver is copying out of, which removes the physical DMA race and isolates
@@ -71,9 +106,19 @@ static pthread_rwlock_t dma_lock[MAX_VID_CHANNELS];
 void hws_trace(int ch, char what, int half, long a, long b) { ev(ch, what, half, (int)a, (int)b); }
 static int dma_lock_mode;
 static struct hws_pcie_dev *pdx;
+static atomic_long cov_video_copy, cov_audio_copy, cov_audio_deliver;
 static void *sim_memcpy(void *d, const void *s, size_t n)
 {
 	int ch;
+	for (ch = 0; ch < MAX_VID_CHANNELS; ch++) {
+		const u8 *b = pdx->m_pbyVideoBuffer[ch];
+		if (b && (const u8 *)s >= b + MAX_MM_VIDEO_SIZE - MAX_AUDIO_CAP_SIZE && (const u8 *)s < b + MAX_MM_VIDEO_SIZE)
+			atomic_fetch_add(&cov_audio_copy, 1);
+		else if (b && (const u8 *)s >= b && (const u8 *)s < b + MAX_MM_VIDEO_SIZE && n > 64)
+			atomic_fetch_add(&cov_video_copy, 1);
+	}
+	if (fake_area_hit(d))
+		atomic_fetch_add(&cov_audio_deliver, 1);
 	for (ch = 0; ch < MAX_VID_CHANNELS; ch++) {
 		const u8 *b = pdx->m_pbyVideoBuffer[ch];
 		if (b && (const u8 *)s >= b && (const u8 *)s < b + MAX_MM_VIDEO_SIZE && n > 64) {
@@ -376,12 +421,133 @@ static void *hw_thread(void *a)
 }
 
 /* ---- status thread: like MainKsThreadHandle/CheckVideFmt ---- */
+/* ---- SIM_HOSTILE: interrupt storm, DMA garbage, fake ALSA stream ---- */
+static void *storm_thread(void *a)
+{
+	unsigned seed = 4242;
+	(void)a;
+	while (atomic_load(&run)) {
+		static pthread_mutex_t hard = PTHREAD_MUTEX_INITIALIZER;
+		if (!atomic_load(&hostile_now)) { sleep_ns(NSEC_PER_MSEC); continue; }
+		/* mostly valid video/audio bits, sometimes anything (incl. bits nobody acks) */
+		u32 bits = rand_r(&seed) % 10 ? ((u32)rand_r(&seed) & 0x0F0F) :
+			   (((u32)rand_r(&seed) ^ ((u32)rand_r(&seed) << 16)) & 0x00ffffff);
+		/* (bits 24-31 don't exist on the card: nobody could ever clear them) */
+		int i;
+
+		for (i = 0; i < MAX_VID_CHANNELS; i++) {
+			atomic_store(&regs[(CVBS_IN_BASE + (32 + i) * PCIE_BARADDROFSIZE) / 4], rand_r(&seed));
+			atomic_store(&regs[(CVBS_IN_BASE + (40 + i) * PCIE_BARADDROFSIZE) / 4], rand_r(&seed));
+		}
+		pthread_mutex_lock(&hard);
+		atomic_fetch_or(&regs[(CVBS_IN_BASE + 1 * PCIE_BARADDROFSIZE) / 4], bits);
+		if (irqhandler(0, pdx) == IRQ_WAKE_THREAD) {
+			pthread_mutex_lock(&irq_lock);
+			irq_runthread = true;
+			pthread_cond_signal(&irq_cond);
+			pthread_mutex_unlock(&irq_lock);
+		}
+		pthread_mutex_unlock(&hard);
+		sleep_ns((500 + rand_r(&seed) % 2500) * 1000ULL);
+	}
+	return NULL;
+}
+
+static void *garbage_thread(void *a)
+{
+	unsigned seed = 777;
+	(void)a;
+	while (atomic_load(&run)) {
+		int ch = rand_r(&seed) % NCH;
+		u8 *b = pdx->m_pbyVideoBuffer[ch];
+		if (!atomic_load(&hostile_now)) { sleep_ns(NSEC_PER_MSEC); continue; }
+		size_t off = (size_t)rand_r(&seed) % MAX_MM_VIDEO_SIZE;
+		size_t len = rand_r(&seed) % 65536;
+		if (off + len > MAX_MM_VIDEO_SIZE)
+			len = MAX_MM_VIDEO_SIZE - off;
+		if (rand_r(&seed) % 4 == 0) {	/* plant "not rewritten" marks */
+			u32 m = 0x55AAAA55;
+			off &= ~3UL;
+			if (off + 4 <= MAX_MM_VIDEO_SIZE)
+				memcpy(b + off, &m, 4);
+		} else {
+			memset(b + off, rand_r(&seed), len);
+		}
+		sleep_ns((100 + rand_r(&seed) % 900) * 1000ULL);
+	}
+	return NULL;
+}
+
+static struct snd_pcm_substream fake_sub[NCH];
+static struct snd_pcm_runtime fake_rt[NCH];
+static int fake_area_hit(const void *d)
+{
+	for (int c = 0; c < NCH; c++)
+		if (fake_rt[c].dma_area && (const u8 *)d >= fake_rt[c].dma_area &&
+		    (const u8 *)d < fake_rt[c].dma_area + fake_rt[c].buffer_size * 4)
+			return 1;
+	return 0;
+}
+static void *alsa_thread(void *a)
+{
+	unsigned seed = 31337;
+	(void)a;
+	while (atomic_load(&run)) {
+		int ch = rand_r(&seed) % NCH;
+		struct hws_audio *drv = &pdx->audio[ch];
+		unsigned long flags;
+		int r = rand_r(&seed) % 4;
+		bool start = r != 0 && rand_r(&seed) % 3 != 0;
+
+		/* the driver's trigger STOP / START, as ALSA calls them */
+		if (start)
+			StartAudioCapture(pdx, ch);
+		else
+			StopAudioCapture(pdx, ch);
+		spin_lock_irqsave(&drv->ring_lock, flags);
+		if (r == 0) {			/* close */
+			drv->running = false;
+			drv->substream = NULL;
+		} else {			/* (re)open + hw_params + prepare + start */
+			unsigned long frames = 2048 + rand_r(&seed) % (16384 - 2048 + 1);
+			unsigned long period = 1024 + rand_r(&seed) % (frames / 2 - 1024 + 1);
+			free(fake_rt[ch].dma_area);
+			fake_rt[ch].dma_area = malloc(frames * 4);
+			fake_rt[ch].buffer_size = frames;
+			fake_rt[ch].period_size = period;
+			fake_sub[ch].runtime = &fake_rt[ch];
+			drv->substream = &fake_sub[ch];
+			drv->channels = 2;
+			drv->ring_size_byframes = frames;
+			drv->period_size_byframes = period;
+			drv->ring_wpos_byframes = 0;
+			drv->period_used_byframes = 0;
+			drv->running = start;
+		}
+		spin_unlock_irqrestore(&drv->ring_lock, flags);
+		sleep_ns((5 + rand_r(&seed) % 50) * NSEC_PER_MSEC);
+	}
+	return NULL;
+}
+
 static void *status_thread(void *a)
 {
 	(void)a;
 	unsigned seed = 7;
 	int tick = 0;
 	while (atomic_load(&run)) {
+		if (hostile) {
+			/* the driver's own status poll, against garbage registers, 50x faster */
+			sleep_ns(20 * NSEC_PER_MSEC);
+			if (++tick % 50 == 0) {
+				if (atomic_load(&hostile_now))
+					for (u32 k = 0; k < 0x6000 / 4; k++)	/* fresh garbage next time */
+						atomic_store(&hset[k], false);
+				atomic_store(&hostile_now, !atomic_load(&hostile_now));
+			}
+			CheckVideFmt(pdx);
+			continue;
+		}
 		sleep_ns(NSEC_PER_SEC / 4);
 		tick++;
 		for (int ch = 0; ch < NCH; ch++) {
@@ -455,13 +621,24 @@ static void *consumer_thread(void *a)
 	c->bufs = calloc(c->nbufs, sizeof(*c->bufs));
 	for (i = 0; i < c->nbufs; i++) {
 		c->bufs[i].vb.vb2_buf.vb2_queue = q;
-		c->bufs[i].vb.vb2_buf.plane_size = out_size;
-		c->bufs[i].mem = malloc(out_size);
+		/* hostile consumers switch output sizes: buffers fit the largest */
+		size_t alloc = hostile ? 1920 * 1080 * 2 : out_size;
+		c->bufs[i].vb.vb2_buf.plane_size = alloc;
+		c->bufs[i].mem = malloc(alloc);
 	}
 
 	while (atomic_load(&run)) {
 		u32 last_seq = 0; u64 last_ts = 0; int last_v = -1, have_last = 0; long last_f = -1;
 
+		if (hostile) {
+			static const int outs[][2] = { {1920,1080},{1280,720},{720,480},{720,576},{800,600},{640,480},
+				{1024,768},{1280,768},{1280,800},{1280,1024},{1360,768},{1440,900},{1680,1050},{1080,1920} };
+			int o = rand_r(&seed) % 14;
+			spin_lock_irqsave(&pdx->videoslock[c->ch], flags);
+			vd->current_out_width = outs[o][0];
+			vd->curren_out_height = outs[o][1];
+			spin_unlock_irqrestore(&pdx->videoslock[c->ch], flags);
+		}
 		/* STREAMON */
 		q->stopped = false;
 		for (i = 0; i < c->nbufs; i++)
@@ -506,7 +683,9 @@ static void *consumer_thread(void *a)
 					atomic_fetch_add(&seq_err, 1);
 				if (have_last && vb->timestamp <= last_ts)
 					atomic_fetch_add(&ts_err, 1);
-				if (is_nosig(p)) {
+				if (hostile) {
+					/* garbage in, garbage out: only safety and ordering are checked */
+				} else if (is_nosig(p)) {
 					atomic_fetch_add(&nosig_frames, 1);
 					last_v = -1;
 				} else {
@@ -602,6 +781,9 @@ int main(int argc, char **argv)
 	if (argc > 1) fps = atoi(argv[1]);
 	if (argc > 2) seconds = atoi(argv[2]);
 	dma_lock_mode = getenv("SIM_DMA_LOCK") != NULL;
+	hostile = getenv("SIM_HOSTILE") != NULL;
+	atomic_store(&hostile_now, hostile);
+	if (hostile) printf("HOSTILE hardware: garbage registers, interrupt storm, DMA garbage, fake ALSA\n");
 	if (getenv("SIM_LOSE_IRQ")) lose_irq = atoi(getenv("SIM_LOSE_IRQ"));
 	if (getenv("SIM_DUP_IRQ")) dup_irq = atoi(getenv("SIM_DUP_IRQ"));
 	for (ch = 0; ch < MAX_VID_CHANNELS; ch++)
@@ -617,6 +799,8 @@ int main(int argc, char **argv)
 	pdx->m_nMaxChl = 4;
 	pdx->m_nCurreMaxVideoChl = NCH;
 	pdx->wq = &dummy_wq;
+	pdx->auwq = &dummy_wq;
+	pdx->m_dwAudioPTKSize = MAX_DMA_AUDIO_PK_SIZE;
 	spin_lock_init(&pdx->reg_lock);
 	mutex_init(&pdx->pm_lock);
 	if (getenv("SIM_NO_DIRECT")) direct_io = 0;
@@ -650,8 +834,20 @@ int main(int argc, char **argv)
 		}
 		SetVideoFormteSize(pdx, ch, 1280, 720);
 		atomic_store(&regs[(CBVS_IN_BUF_BASE2 + ch * PCIE_BARADDROFSIZE) / 4], pdx->m_format[ch].HLAF_SIZE / 16);
+		pdx->audio[ch].dev = pdx;
+		pdx->audio[ch].index = ch;
+		spin_lock_init(&pdx->audio[ch].ring_lock);
+		INIT_WORK(&pdx->audio[ch].audiowork, audio_data_process);
 		if (ch < NCH) {
 			pdx->m_pbyVideoBuffer[ch] = calloc(1, MAX_MM_VIDEO_SIZE);
+			pdx->m_pbyAudioBuffer[ch] = pdx->m_pbyVideoBuffer[ch] + MAX_MM_VIDEO_SIZE - MAX_AUDIO_CAP_SIZE;
+			for (j = 0; j < MAX_AUDIO_QUEUE; j++)
+				pdx->m_AudioInfo[ch].m_pAudioBufData[j] = calloc(1, MAX_DMA_AUDIO_PK_SIZE);
+			if (hostile) {
+				pdx->m_AudioInfo[ch].dwisRuning = 1;
+				pdx->m_bACapStarted[ch] = 1;
+				pdx->m_bAudioRun[ch] = 1;
+			}
 			pdx->m_VideoInfo[ch].m_pVideoScalerBuf = malloc(MAX_VIDEO_HW_W * MAX_VIDEO_HW_H * 2);
 			pdx->m_VideoInfo[ch].m_pVideoYUV2Buf = malloc(MAX_VIDEO_HW_W * MAX_VIDEO_HW_H * 2);
 			pdx->m_VideoInfo[ch].m_pRotateVideoBuf = malloc(MAX_VIDEO_HW_W * MAX_VIDEO_HW_H * 2);
@@ -667,6 +863,12 @@ int main(int argc, char **argv)
 	for (ch = 0; ch < NCH; ch++)
 		pthread_create(&hw[ch], NULL, hw_thread, (void *)(intptr_t)ch);
 	pthread_create(&st, NULL, status_thread, NULL);
+	pthread_t hst[3];
+	if (hostile) {
+		pthread_create(&hst[0], NULL, storm_thread, NULL);
+		pthread_create(&hst[1], NULL, garbage_thread, NULL);
+		pthread_create(&hst[2], NULL, alsa_thread, NULL);
+	}
 	for (i = 0; i < ncons; i++)
 		pthread_create(&ct[i], NULL, consumer_thread, &cons[i]);
 
@@ -679,6 +881,13 @@ int main(int argc, char **argv)
 	pthread_mutex_lock(&irq_lock); irq_runthread = true; pthread_cond_signal(&irq_cond); pthread_mutex_unlock(&irq_lock);
 	pthread_join(irq, NULL);
 	pthread_join(st, NULL);
+	if (hostile) {
+		for (i = 0; i < 3; i++)
+			pthread_join(hst[i], NULL);
+		printf("hostile: ALSA periods elapsed %ld\n", (long)periods_elapsed);
+	}
+	printf("coverage: video half copies %ld, audio packet copies %ld, ALSA ring writes %ld, rate-limited warnings %ld\n",
+	       (long)cov_video_copy, (long)cov_audio_copy, (long)cov_audio_deliver, (long)sim_ratelimited_warnings);
 
 	printf("fps=%d seconds=%d channels=%d consumers=%d\n", fps, seconds, NCH, ncons);
 	printf("frames from hw           %ld  (lost second-half IRQs %ld, duplicate first-half IRQs %ld)\n", frames_hw, lost_irqs, dup_irqs);
