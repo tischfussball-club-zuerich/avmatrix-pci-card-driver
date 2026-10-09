@@ -231,6 +231,12 @@ sudo depmod -a
    setup `in` and `out` match the input frame rate and `dma_overrun`,
    `overwrite` and `skip` stay at 0. `direct` counts frames that took the
    fast path.
+   **Another HwsCapture driver installed?** `tools/test-on-card.sh` builds
+   this driver from the checkout, loads it in place of the installed one (in
+   memory only), runs the check below, and loads the original driver again,
+   also after an error or Ctrl-C. Nothing is installed; a log file is written
+   to the current directory. `--keep` leaves the new driver loaded for manual
+   testing until `sudo rmmod HwsCapture` or a reboot.
 3. Run `tools/card-check.sh` with a source connected. Per channel it runs
    `v4l2-compliance`, a 10 s capture that counts lost and late frames, and a
    short audio capture, and it lists problem messages from the kernel log. It
@@ -399,6 +405,7 @@ compile tests; none of it has been confirmed on a card yet.
   README.
 - `tools/stutter-monitor.py`: frame pacing and system monitor (above).
 - `tools/card-check.sh`: checks on the real card (above).
+- `tools/test-on-card.sh`: tries this driver next to an installed one (above).
 - `doc/`: the vendor's original user guide.
 
 Licensed under the GPL (see `MODULE_LICENSE` in the source).
