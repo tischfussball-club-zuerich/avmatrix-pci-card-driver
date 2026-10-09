@@ -329,8 +329,11 @@ compile tests; none of it has been confirmed on a card yet.
 - **Big copies ran in softirq,** delaying network, timer and disk work. Each
   channel now has its own copy thread (lowest real-time priority), so with
   4 channels the copies (up to ~1 GB/s at 4×1080p60) run on 4 CPUs instead
-  of queuing behind each other on one. Conversion and delivery also run on
-  one real-time thread per channel, so a busy encoder can't delay frames.
+  of queuing behind each other on one. Conversion and delivery, including
+  the copies for additional applications on the same channel, also run on
+  one real-time thread per channel, so a busy encoder can't delay frames; the
+  copy threads have priority over conversion, since a half-frame must be
+  copied before the card rewrites it.
 - **Audio** is delivered straight from the interrupt thread, without an
   extra wakeup per packet, and no longer waits behind video copies.
 - **Interlaced input** (1080i, 576i, 480i) shown at the input size is now

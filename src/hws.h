@@ -26,6 +26,7 @@
 #include <linux/timer.h>
 #include <linux/jiffies.h>
 #include <linux/sched.h>
+#include <uapi/linux/sched/types.h>	/* struct sched_attr */
 #include <linux/timer.h>
 #include <linux/kthread.h>
 #include <linux/cdev.h>
@@ -365,7 +366,7 @@ struct hws_video{
 	u64				nosig_last_ns;	/* last "no signal" frame */
 	struct delayed_work		nosig_work;	/* paces "no signal" frames */
 	/* direct-path fan-out to further consumers, off the IRQ thread */
-	struct work_struct		fanout_work;
+	struct kthread_work		fanout_work;	/* on conv_worker[index] */
 	struct kthread_work		copy_work;	/* half-frame copies, on copy_worker[index] */
 	spinlock_t			fanout_lock;
 	struct list_head		fanout_q;	/* frames to fan out, in order */
@@ -446,6 +447,7 @@ struct hws_pcie_dev {
 	u64				irq_stuck_t0;	/* hard IRQ: start of the current storm window */
 	bool				need_bringup;	/* pm_lock: card was gone at resume, re-init when back */
 	int				m_recovered;	/* status thread: card came back, re-arm channels */
+	struct mutex			irq_lock;	/* irq_line vs. its teardown (ALSA sync) */
 	struct mutex			pm_lock;	/* suspend/resume vs. engine start/stop; nests inside engine_lock */
 	bool				suspended;	/* pm_lock */
 	int				nr_v4l2_registered;	/* channels with a registered v4l2_device */

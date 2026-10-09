@@ -34,7 +34,8 @@ static void hws_audio_unregister(struct hws_pcie_dev *dev);
 static void hws_dev_release(struct kref *kref);
 static void hws_snd_card_free(struct snd_card *card);
 static void hws_direct_reclaim(struct hws_pcie_dev *pdx, int ch, struct hws_vfh_ctx *ctx);
-static void hws_fanout_work(struct work_struct *work);
+static void hws_fanout_work(struct kthread_work *work);
+static void hws_fanout_drain(struct hws_video *v);
 static void hws_hw_bringup(struct hws_pcie_dev *pdx);
 
 static int direct_io = 1;
@@ -1313,7 +1314,7 @@ static void hws_stop_streaming_multi(struct vb2_queue *q)
     /* the IRQ thread may hold this fh's buffers half-filled for the direct path */
     hws_direct_reclaim(pdx, videodev->index, ctx);
     /* ...or have handed complete frames with them to the fan-out worker */
-    flush_work(&videodev->fanout_work);
+    kthread_flush_work(&videodev->fanout_work);
 
     /*
      * The worker may be filling a buffer it already took from this fh. Wait for
@@ -2997,7 +2998,7 @@ void video_data_process(struct kthread_work *p_work)
          * so seeing that frame here means the fan-out is already visible.
          */
         if (READ_ONCE(videodev->fanout_inflight))
-            flush_work(&videodev->fanout_work);
+            hws_fanout_drain(videodev);	/* same thread as the queued fan-out: no wait */
 
         hws_tstat_max(&ts->wq_lat_max, lock_ns - frame_ts);
         if (timing_debug >= 2 && lock_ns - frame_ts > hws_frame_period_ns(pdx, nDecoder))
@@ -3225,10 +3226,13 @@ int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 /* deliveries run in the IRQ thread: wait for one in progress */
 static void hws_audio_sync(struct hws_audio *drv)
 {
-	int irq = READ_ONCE(drv->dev->irq_line);
+	struct hws_pcie_dev *pdx = drv->dev;
 
-	if (irq != -1)
-		synchronize_irq(irq);
+	/* irq_lock: remove can't free (and reuse) the IRQ in between */
+	mutex_lock(&pdx->irq_lock);
+	if (pdx->irq_line != -1)
+		synchronize_irq(pdx->irq_line);
+	mutex_unlock(&pdx->irq_lock);
 }
 
 int hws_pcie_audio_close(struct snd_pcm_substream *substream)
@@ -3284,6 +3288,9 @@ int hws_pcie_audio_trigger(struct snd_pcm_substream *substream, int cmd)
 	unsigned long flags;
 	switch(cmd){
 		case SNDRV_PCM_TRIGGER_START:
+			/* shut down / being removed: the card stays off */
+			if (READ_ONCE(dev->removing))
+				return -ENODEV;
 			//HWS_PCIE_READ(HWS_DMA_BASE(chip->index), HWS_DMA_STATUS);
 			//start dma
 			//HWS_PCIE_WRITE(HWS_INT_BASE, HWS_DMA_MASK(chip->index), 0x00000001);
@@ -3528,6 +3535,22 @@ static void EnableAudioCapture(struct hws_pcie_dev *pdx,int index,int en)
 	//printk("EnableAudioCapture =%X",status);
 }
 
+/*
+ * Card interrupts on, unless the storm guard paused them (the status thread
+ * re-enables those). The guard may trip right between the check and the
+ * write - it can't take reg_lock in hard IRQ context - so look again after
+ * the write and undo it then.
+ */
+static void hws_enable_card_irqs(struct hws_pcie_dev *pdx)
+{
+	if (READ_ONCE(pdx->irq_storm_off))
+		return;
+	WRITE_REGISTER_ULONG(pdx, INT_EN_REG_BASE, 0x3ffff);
+	smp_mb();
+	if (READ_ONCE(pdx->irq_storm_off))
+		WRITE_REGISTER_ULONG(pdx, INT_EN_REG_BASE, 0);
+}
+
 static int SetVideoFormteSize(struct hws_pcie_dev *pdx,int ch,int w,int h)
 {
 	int hf_size;
@@ -3758,7 +3781,6 @@ static void hws_dev_release(struct kref *kref)
 	 * The works are initialized before wq is created, so wq tells us they are. */
 	for (i = 0; pdx->wq && i < MAX_VID_CHANNELS; i++) {
 		cancel_delayed_work_sync(&pdx->video[i].nosig_work);
-		cancel_work_sync(&pdx->video[i].fanout_work);
 	}
 	if (pdx->wq)
 		destroy_workqueue(pdx->wq);
@@ -3827,14 +3849,16 @@ static void hws_quiesce(struct hws_pcie_dev *dev)
 	hws_hw_stop(dev);
 	/* a card that ignored the stop must not DMA into memory we are about to free */
 	pci_clear_master(dev->pdev);
+	mutex_lock(&dev->irq_lock);
 	irq_teardown(dev);	/* also waits for the IRQ thread */
-	dev->irq_line = -1;
+	WRITE_ONCE(dev->irq_line, -1);
+	mutex_unlock(&dev->irq_lock);
 	for (i = 0; i < MAX_VID_CHANNELS; i++)
 		if (dev->copy_worker[i])	/* nothing queues them any more */
 			kthread_flush_work(&dev->video[i].copy_work);
 	for (i = 0; i < MAX_VID_CHANNELS; i++) {
 		hws_direct_reclaim(dev, i, NULL);
-		flush_work(&dev->video[i].fanout_work);	/* hands its buffers back */
+		kthread_flush_work(&dev->video[i].fanout_work);	/* hands its buffers back */
 	}
 	for (i = 0; i < MAX_VID_CHANNELS; i++) {
 		/*
@@ -4169,9 +4193,13 @@ static void hws_direct_reclaim(struct hws_pcie_dev *pdx, int ch, struct hws_vfh_
  * later frames of the channel follow the same way, so each consumer still
  * sees frames in order.
  */
-static void hws_fanout_work(struct work_struct *work)
+/*
+ * Extra consumers' copies of direct-path frames. Runs on the channel's
+ * conversion thread (RT), queued or called inline by the conversion work
+ * itself, so frames keep their order without waiting on another thread.
+ */
+static void hws_fanout_drain(struct hws_video *v)
 {
-	struct hws_video *v = container_of(work, struct hws_video, fanout_work);
 	struct hws_timing_stats *ts = &v->dev->tstats[v->index];
 	struct hws_fanout *f;
 	unsigned long flags;
@@ -4197,6 +4225,11 @@ static void hws_fanout_work(struct work_struct *work)
 		v->fanout_inflight--;
 		spin_unlock_irqrestore(&v->fanout_lock, flags);
 	}
+}
+
+static void hws_fanout_work(struct kthread_work *work)
+{
+	hws_fanout_drain(container_of(work, struct hws_video, fanout_work));
 }
 
 /* complete a direct-path frame (direct_lock held): inline if it is the only
@@ -4225,7 +4258,7 @@ static void hws_direct_complete(struct hws_pcie_dev *pdx, int ch, struct list_he
 	spin_unlock_irqrestore(&v->fanout_lock, flags);
 
 	if (f) {
-		queue_work(pdx->wq, &v->fanout_work);
+		kthread_queue_work(pdx->conv_worker[ch], &v->fanout_work);
 		return;
 	}
 	if (queued_ahead) {
@@ -4444,6 +4477,21 @@ static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder,int mVideoB
 	if (cnt_self == pdx->m_half_done_cnt[nDecoder][mVideoBufIndex])
 		return -1;
 	pdx->m_half_done_cnt[nDecoder][mVideoBufIndex] = cnt_self;
+
+	/*
+	 * A new first half: buffers a direct-path frame took for a second half
+	 * that never came (dropped pairing, lost IRQ, mode change) go back to
+	 * their apps now, before any check below can return early. Otherwise
+	 * an app whose only free buffer sits there would never get another
+	 * frame: "nobody has a buffer" would hold forever.
+	 */
+	if (mVideoBufIndex == 1 && READ_ONCE(pdx->direct_frame[nDecoder]))
+	{
+		mutex_lock(&pdx->direct_lock[nDecoder]);
+		hws_direct_requeue_locked(pdx, nDecoder, NULL);
+		pdx->direct_frame[nDecoder] = false;
+		mutex_unlock(&pdx->direct_lock[nDecoder]);
+	}
 
 	/* no signal: the worker shows the "no signal" picture; nothing to copy */
 	if (READ_ONCE(pdx->m_curr_No_Video[nDecoder]))
@@ -4866,7 +4914,6 @@ static irqreturn_t irqhandler(int irq, void  *info)
 	u32 before;
 	int i;
 	bool wake = false;	/* audio: run the IRQ thread */
-	bool handled = false;	/* video: queued to the channel's copy thread */
 	bool ours = false;
 	bool stuck = false;
 
@@ -4923,7 +4970,6 @@ static irqreturn_t irqhandler(int irq, void  *info)
 					smp_mb__before_atomic();	/* ts/counts visible before the bit */
 					set_bit(tmp, &pdx->m_half_pending[i]);
 					kthread_queue_work(pdx->copy_worker[i], &pdx->video[i].copy_work);
-					handled = true;
 				}
 			}
 			if(IntState & (0x100 << i)) // audio ch done
@@ -4965,13 +5011,14 @@ static irqreturn_t irqhandler(int irq, void  *info)
 	{
 		pdx->irq_stuck_passes = 0;
 	}
-	else if (!wake && !handled)
+	else
 	{
 		/*
-		 * Only interrupts that brought nothing count: with MSI a bit that
-		 * never clears shows up on every normal video interrupt too, which
-		 * is harmless and must not switch capture off. And only many of
-		 * them close together (1000 within 100 ms) are a storm.
+		 * A storm is many stuck interrupts close together (1000 within
+		 * 100 ms, i.e. >= 10k/s). Normal traffic with a bit that never
+		 * clears (MSI) stays far below that, ~500/s at 4 channels; a level
+		 * line that re-fires on a stuck bit - also a video bit, which
+		 * looks "handled" every time - reaches it within milliseconds.
 		 */
 		u64 now = ktime_get_ns();
 
@@ -5146,7 +5193,7 @@ static void SetDMAAddress(struct hws_pcie_dev *pdx)
 		}
 		#endif
 	}
-	WRITE_REGISTER_ULONG(pdx,INT_EN_REG_BASE, 0x3ffff); //enable PCI Interruput
+	hws_enable_card_irqs(pdx); //enable PCI Interruput
 	//WRITE_REGISTER_ULONG(PCIEBR_EN_REG_BASE, 0xFFFFFFFF);
 
 }
@@ -5712,7 +5759,7 @@ static void InitVideoSys(struct hws_pcie_dev *pdx,int set)
 		}
 	}
 
-	WRITE_REGISTER_ULONG(pdx,INT_EN_REG_BASE, 0x3ffff);
+	hws_enable_card_irqs(pdx);
 	//start Run
 	//---------------------------------------------
 	WRITE_REGISTER_ULONG(pdx,CVBS_IN_BASE, 0x80000000);
@@ -5856,12 +5903,25 @@ static int ReadChipId(struct hws_pcie_dev *pdx)
 
 }
 
-static struct kthread_worker *hws_create_worker(const char *fmt, int ch)
+/*
+ * FIFO 2 for the copy threads, FIFO 1 for conversion: a half-frame copy has a
+ * deadline (the card rewrites that half), a conversion only latency, so a
+ * copy must not wait for a conversion run on the same CPU. Both stay far
+ * below the IRQ threads (FIFO 50) and ahead of normal tasks.
+ */
+static struct kthread_worker *hws_create_worker(const char *fmt, int ch, int prio)
 {
 	struct kthread_worker *w = kthread_create_worker(0, fmt, ch);
 
 	if (!IS_ERR(w)) {
-		sched_set_fifo_low(w->task);
+		struct sched_attr attr = {
+			.size		= sizeof(attr),
+			.sched_policy	= SCHED_FIFO,
+			.sched_priority	= prio,
+		};
+
+		if (sched_setattr_nocheck(w->task, &attr))
+			sched_set_fifo_low(w->task);
 		wake_up_process(w->task);
 	}
 	return w;
@@ -5879,6 +5939,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	kref_init(&gdev->kref);
 	spin_lock_init(&gdev->reg_lock);
 	mutex_init(&gdev->pm_lock);
+	mutex_init(&gdev->irq_lock);
 
 	gdev->dwDeviceID = gdev->pdev->device;
 	gdev->dwVendorID = gdev->pdev->vendor;
@@ -5997,7 +6058,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		INIT_DELAYED_WORK(&gdev->video[i].nosig_work,hws_nosig_work);
 		mutex_init(&gdev->direct_lock[i]);
 		INIT_LIST_HEAD(&gdev->direct_bufs[i]);
-		INIT_WORK(&gdev->video[i].fanout_work, hws_fanout_work);
+		kthread_init_work(&gdev->video[i].fanout_work, hws_fanout_work);
 		kthread_init_work(&gdev->video[i].copy_work, hws_copy_work);
 		spin_lock_init(&gdev->video[i].fanout_lock);
 		INIT_LIST_HEAD(&gdev->video[i].fanout_q);
@@ -6020,14 +6081,14 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	gdev->wq = alloc_workqueue("hws", WQ_HIGHPRI | WQ_UNBOUND, 0);
 	if (!gdev->wq) {
 		err = -ENOMEM;
-		goto err_unmap;
+		goto err_mem;	/* bus mastering is on: clear it (no pool yet: free is a no-op) */
 	}
 	for (i = 0; i < MAX_VID_CHANNELS; i++) {
-		/* lowest RT priority: ahead of normal tasks (an encoder can't delay
+		/* low RT priorities: ahead of normal tasks (an encoder can't delay
 		 * frames), behind every IRQ thread. Not started by
 		 * kthread_create_worker() since 6.14, hence wake_up_process(). */
-		gdev->copy_worker[i] = hws_create_worker("hws-copy%d", i);
-		gdev->conv_worker[i] = hws_create_worker("hws-conv%d", i);
+		gdev->copy_worker[i] = hws_create_worker("hws-copy%d", i, 2);
+		gdev->conv_worker[i] = hws_create_worker("hws-conv%d", i, 1);
 		if (IS_ERR(gdev->copy_worker[i]) || IS_ERR(gdev->conv_worker[i])) {
 			err = IS_ERR(gdev->copy_worker[i]) ? PTR_ERR(gdev->copy_worker[i]) :
 							     PTR_ERR(gdev->conv_worker[i]);
@@ -6035,13 +6096,13 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 				gdev->copy_worker[i] = NULL;
 			if (IS_ERR(gdev->conv_worker[i]))
 				gdev->conv_worker[i] = NULL;
-			goto err_unmap;	/* hws_dev_release() destroys the ones made */
+			goto err_mem;	/* hws_dev_release() destroys the ones made */
 		}
 	}
 
 	err = DmaMemAllocPool(gdev);
 	if (err)
-		goto err_unmap;
+		goto err_mem;	/* frees what was allocated, clears bus mastering */
 
 	err = irq_setup(gdev, pdev);
 	if (err) {
@@ -6147,7 +6208,7 @@ static int __maybe_unused hws_suspend(struct device *dev)
 		kthread_flush_work(&pdx->video[i].copy_work);	/* and the copies it queued */
 	for (i = 0; i < MAX_VID_CHANNELS; i++) {
 		hws_direct_reclaim(pdx, i, NULL);
-		flush_work(&pdx->video[i].fanout_work);
+		kthread_flush_work(&pdx->video[i].fanout_work);
 		cancel_delayed_work_sync(&pdx->video[i].nosig_work);
 		kthread_flush_work(&pdx->video[i].videowork);
 		cancel_delayed_work_sync(&pdx->video[i].nosig_work);

@@ -58,6 +58,7 @@ extern atomic_long sim_ratelimited_warnings;
 #define smp_rmb() atomic_thread_fence(memory_order_acquire)
 #define smp_wmb() atomic_thread_fence(memory_order_release)
 #define wmb() atomic_thread_fence(memory_order_release)
+#define smp_mb() atomic_thread_fence(memory_order_seq_cst)
 #define smp_store_release(p, v) do { atomic_thread_fence(memory_order_release); WRITE_ONCE(*(p), (v)); } while (0)
 #define smp_load_acquire(p) ({ __typeof__(*(p)) ___v = READ_ONCE(*(p)); atomic_thread_fence(memory_order_acquire); ___v; })
 #define max_t(t, a, b) ((t)(a) > (t)(b) ? (t)(a) : (t)(b))
@@ -158,13 +159,26 @@ struct workqueue_struct { int dummy; };
 void INIT_WORK(struct work_struct *w, void (*f)(struct work_struct *));
 void INIT_DELAYED_WORK(struct delayed_work *d, void (*f)(struct work_struct *));
 bool queue_work(struct workqueue_struct *wq, struct work_struct *w);
-/* kthread_worker: each work item has its own thread here, like one worker per channel */
-#define kthread_work work_struct
-struct kthread_worker { struct task_struct *task; };
-#define kthread_init_work(w, f) INIT_WORK((w), (f))
-#define kthread_queue_work(wk, w) queue_work(NULL, (w))
-#define kthread_flush_work(w) flush_work(w)
-#define kthread_cancel_work_sync(w) cancel_work_sync(w)
+/* kthread_worker: one thread runs its works in queue order, like the kernel's */
+struct kthread_worker;
+struct kthread_work {
+	void (*func)(struct kthread_work *);
+	struct kthread_work *next;
+	struct kthread_worker *worker;
+	bool pending, running;
+};
+struct kthread_worker {
+	pthread_mutex_t lock;
+	pthread_cond_t cond;
+	struct kthread_work *head, *tail;
+	struct task_struct *task;
+	pthread_t thr;
+};
+void kthread_init_work(struct kthread_work *w, void (*f)(struct kthread_work *));
+bool kthread_queue_work(struct kthread_worker *wk, struct kthread_work *w);
+void kthread_flush_work(struct kthread_work *w);
+bool kthread_cancel_work_sync(struct kthread_work *w);
+struct kthread_worker *sim_kthread_worker(void);
 #define memcpy_flushcache(d, s, n) memcpy((d), (s), (n))
 #define queue_work_on(cpu, wq, w) queue_work((wq), (w))
 #define raw_smp_processor_id() 0

@@ -5,7 +5,7 @@
  *  hw thread      - simulated card: writes stamped half-frames into the DMA
  *                   buffer and raises the interrupt (runs the real irqhandler)
  *  irq thread     - runs the real hws_irq_thread when woken
- *  work threads   - one per work item (videowork, nosig_work), shim.c-style
+ *  work threads   - per channel: a copy and a conversion kthread_worker; one per wq work item
  *  status thread  - like MainKsThreadHandle: signal loss, resolution changes
  *  consumers      - per channel, several apps with different buffer counts and
  *                   processing speeds that randomly stop/restart streaming
@@ -141,6 +141,89 @@ static void hws_hw_bringup(struct hws_pcie_dev *p) { (void)p; }
 #undef memcpy
 
 /* ------------------------------------------------------------ shim impl */
+static void *kworker_thread(void *arg)
+{
+	struct kthread_worker *wk = arg;
+	pthread_mutex_lock(&wk->lock);
+	for (;;) {
+		struct kthread_work *w;
+		while (!wk->head)
+			pthread_cond_wait(&wk->cond, &wk->lock);
+		w = wk->head;
+		wk->head = w->next;
+		if (!wk->head)
+			wk->tail = NULL;
+		w->pending = false;
+		w->running = true;
+		pthread_mutex_unlock(&wk->lock);
+		w->func(w);
+		pthread_mutex_lock(&wk->lock);
+		w->running = false;
+		pthread_cond_broadcast(&wk->cond);
+	}
+	return NULL;
+}
+struct kthread_worker *sim_kthread_worker(void)
+{
+	struct kthread_worker *wk = calloc(1, sizeof(*wk));
+	pthread_mutex_init(&wk->lock, NULL);
+	pthread_cond_init(&wk->cond, NULL);
+	pthread_create(&wk->thr, NULL, kworker_thread, wk);
+	return wk;
+}
+void kthread_init_work(struct kthread_work *w, void (*f)(struct kthread_work *))
+{
+	memset(w, 0, sizeof(*w));
+	w->func = f;
+}
+bool kthread_queue_work(struct kthread_worker *wk, struct kthread_work *w)
+{
+	pthread_mutex_lock(&wk->lock);
+	if (w->pending) {
+		pthread_mutex_unlock(&wk->lock);
+		return false;
+	}
+	w->worker = wk;
+	w->pending = true;
+	w->next = NULL;
+	if (wk->tail)
+		wk->tail->next = w;
+	else
+		wk->head = w;
+	wk->tail = w;
+	pthread_cond_broadcast(&wk->cond);
+	pthread_mutex_unlock(&wk->lock);
+	return true;
+}
+void kthread_flush_work(struct kthread_work *w)
+{
+	struct kthread_worker *wk = w->worker;
+	if (!wk)
+		return;
+	pthread_mutex_lock(&wk->lock);
+	while (w->pending || w->running)
+		pthread_cond_wait(&wk->cond, &wk->lock);
+	pthread_mutex_unlock(&wk->lock);
+}
+bool kthread_cancel_work_sync(struct kthread_work *w)
+{
+	struct kthread_worker *wk = w->worker;
+	bool was;
+	if (!wk)
+		return false;
+	pthread_mutex_lock(&wk->lock);
+	was = w->pending;
+	if (w->pending) {
+		struct kthread_work **pp = &wk->head, *prev = NULL;
+		while (*pp && *pp != w) { prev = *pp; pp = &(*pp)->next; }
+		if (*pp) { *pp = w->next; if (wk->tail == w) wk->tail = prev; }
+		w->pending = false;
+	}
+	while (w->running)
+		pthread_cond_wait(&wk->cond, &wk->lock);
+	pthread_mutex_unlock(&wk->lock);
+	return was;
+}
 static void *work_thread(void *arg)
 {
 	struct work_struct *w = arg;
@@ -578,11 +661,46 @@ static void *status_thread(void *a)
 					ChangeVideoSize(pdx, ch, w, h, il);
 				WRITE_ONCE(pdx->m_curr_No_Video[ch], !present);
 				if (!present && pdx->m_bVCapStarted[ch] == TRUE)
-					queue_work(pdx->wq, &pdx->video[ch].videowork);
+					kthread_queue_work(pdx->conv_worker[ch], &pdx->video[ch].videowork);
 			}
 		}
 	}
 	return NULL;
+}
+
+/* driver state of a channel, for a stall report */
+static void stall_dump(int ch)
+{
+	struct hws_video *v = &pdx->video[ch];
+	ACAP_VIDEO_INFO *vi = &pdx->m_VideoInfo[ch];
+	struct hws_vfh_ctx *ctx;
+	struct list_head *pos;
+	int nd = 0, i;
+
+	list_for_each(pos, &pdx->direct_bufs[ch]) nd++;
+	fprintf(stderr, "  ch%d: direct_frame=%d direct_bufs=%d fanout_inflight=%d halfdone=%d pending=%lx cnt=%u/%u done_cnt=%u/%u gen=%u half1_gen=%u fmt_cnt0=%u half1_cnt=%u fmt=%ux%u%s out=%dx%d\n",
+		ch, pdx->direct_frame[ch], nd, v->fanout_inflight, pdx->m_nVideoHalfDone[ch], pdx->m_half_pending[ch],
+		pdx->m_half_cnt[ch][1], pdx->m_half_cnt[ch][0], pdx->m_half_done_cnt[ch][1], pdx->m_half_done_cnt[ch][0],
+		pdx->m_fmt_gen[ch], pdx->m_half1_gen[ch], pdx->m_fmt_cnt0[ch], pdx->m_half1_cnt[ch],
+		pdx->m_pVCAPStatus[ch][0].dwWidth, pdx->m_pVCAPStatus[ch][0].dwHeight,
+		pdx->m_pVCAPStatus[ch][0].dwinterlace ? "i" : "p", v->current_out_width, v->curren_out_height);
+	fprintf(stderr, "  ring:");
+	for (i = 0; i < MAX_VIDEO_QUEUE; i++)
+		fprintf(stderr, " %d", vi->pStatusInfo[i].byLock);
+	fprintf(stderr, " | copy_work pend=%d run=%d videowork pend=%d run=%d fanout pend=%d run=%d\n",
+		v->copy_work.pending, v->copy_work.running, v->videowork.pending, v->videowork.running,
+		v->fanout_work.pending, v->fanout_work.running);
+	list_for_each_entry(ctx, &v->consumers, node) {
+		int nq = 0;
+		list_for_each(pos, &ctx->buf_queue) nq++;
+		fprintf(stderr, "  consumer streaming=%d queued=%d\n", ctx->streaming, nq);
+	}
+	{
+		struct hws_timing_stats *ts = &pdx->tstats[ch];
+		fprintf(stderr, "  stats: direct %d dma_overrun %d stale_half %d no_app_buf %d empty %d skip %d\n",
+			atomic_read(&ts->direct), atomic_read(&ts->dma_overrun), atomic_read(&ts->stale_half),
+			atomic_read(&ts->no_app_buf), atomic_read(&ts->worker_empty), atomic_read(&ts->ring_skip));
+	}
 }
 
 /* ---- consumers ---- */
@@ -619,7 +737,13 @@ static void *consumer_thread(void *a)
 	c->ctx.video = vd;
 	q->drv_priv = &c->ctx;
 	pthread_mutex_init(&q->lock, NULL);
-	pthread_cond_init(&q->cond, NULL);
+	{
+		/* monotonic: a wall-clock step (NTP, VM time sync) must not look like a stall */
+		pthread_condattr_t ca;
+		pthread_condattr_init(&ca);
+		pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+		pthread_cond_init(&q->cond, &ca);
+	}
 	INIT_LIST_HEAD(&q->done);
 	spin_lock_irqsave(&vd->consumers_lock, flags);
 	list_add_tail(&c->ctx.node, &vd->consumers);
@@ -657,7 +781,7 @@ static void *consumer_thread(void *a)
 			struct timespec dl;
 
 			pthread_mutex_lock(&q->lock);
-			clock_gettime(CLOCK_REALTIME, &dl);
+			clock_gettime(CLOCK_MONOTONIC, &dl);
 			dl.tv_sec += 2;
 			while (list_empty(&q->done) && atomic_load(&run))
 				if (pthread_cond_timedwait(&q->cond, &q->lock, &dl)) {
@@ -668,6 +792,7 @@ static void *consumer_thread(void *a)
 						c->ch, c->nbufs, c->stop_every, k, src_present[c->ch], pdx->m_curr_No_Video[c->ch],
 						pdx->m_bVCapStarted[c->ch], vd->engine_users, c->ctx.streaming, q->owned_by_driver,
 						(ktime_get_ns() - last_src_change[c->ch]) / 1e9);
+					stall_dump(c->ch);
 					break;
 				}
 			if (list_empty(&q->done)) { pthread_mutex_unlock(&q->lock); continue; }
@@ -818,11 +943,14 @@ int main(int argc, char **argv)
 		mutex_init(&pdx->video[ch].engine_lock);
 		spin_lock_init(&pdx->video[ch].consumers_lock);
 		INIT_LIST_HEAD(&pdx->video[ch].consumers);
-		INIT_WORK(&pdx->video[ch].videowork, video_data_process);
+		/* per channel: copies on one thread, conversion + fan-out on another */
+		pdx->copy_worker[ch] = sim_kthread_worker();
+		pdx->conv_worker[ch] = sim_kthread_worker();
+		kthread_init_work(&pdx->video[ch].videowork, video_data_process);
 		INIT_DELAYED_WORK(&pdx->video[ch].nosig_work, hws_nosig_work);
 		mutex_init(&pdx->direct_lock[ch]);
 		INIT_LIST_HEAD(&pdx->direct_bufs[ch]);
-		INIT_WORK(&pdx->video[ch].fanout_work, hws_fanout_work);
+		kthread_init_work(&pdx->video[ch].fanout_work, hws_fanout_work);
 		kthread_init_work(&pdx->video[ch].copy_work, hws_copy_work);
 		spin_lock_init(&pdx->video[ch].fanout_lock);
 		INIT_LIST_HEAD(&pdx->video[ch].fanout_q);
