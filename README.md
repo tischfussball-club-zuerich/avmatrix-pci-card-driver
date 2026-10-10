@@ -237,7 +237,9 @@ back afterwards.
 **`tools/test-on-card.sh`: try this driver without installing it.** It builds
 the driver from the checkout, loads it in place of the installed one (in
 memory only), runs `card-check.sh`, and loads the original driver again, also
-after an error or Ctrl-C. If only your own PipeWire/WirePlumber hold the card,
+after an error, Ctrl-C or a dropped SSH session (captures still running are
+ended first, and sudo is kept logged in for long runs, so the restore never
+waits for a password). If only your own PipeWire/WirePlumber hold the card,
 it stops them for the test and starts them again afterwards. A log file is
 written to the current directory. `--keep` leaves the new driver loaded for
 manual testing until `sudo rmmod HwsCapture` or a reboot; a reboot always
@@ -249,9 +251,13 @@ DUR=60 tools/test-on-card.sh
 
 **Old vs. new:** `tools/test-on-card.sh --compare` first runs the same check on
 the installed driver, then on this one, and ends with a table of both results
-side by side (frames received, lost, duplicated and late per capture, the
+side by side (frames missing, lost, duplicated and late per capture, the
 longest gap, the frame rate reported to applications, audio, CPU use, kernel
-errors), with totals and each difference marked "better" or "worse".
+errors, and with this driver whether every frame the card delivered is
+accounted for), with totals and each difference marked "better" or "worse".
+Missing frames are compared rather than frames received, so the two drivers'
+rates (60 vs. 59.94) don't count as a difference. The scripts set the C
+locale, so their numbers are right whatever the desktop language.
 `v4l2-compliance` is left out for the installed driver, because older versions
 of this driver crash the kernel in the control ioctls it tests;
 `OLD_COMPLIANCE=1` runs it there too. If no driver was loaded before, the
@@ -482,7 +488,11 @@ have also been verified on a VC42 (see [Status](#status)).
 - **A dead card** (all registers read as ones) was accepted at probe and never
   detected, while a single bad read marked it lost forever. It's now detected
   after repeated failures and recovers automatically, also when it was gone
-  at resume and comes back later.
+  at resume and comes back later. A card that lost power or its PCIe link
+  comes back with empty configuration; the driver keeps its own copy of a
+  working card's configuration and restores it (including MSI) before
+  bringing the card up again. Until the card is back on the bus, its
+  registers aren't touched (some systems fault on reads of a missing device).
 
 ### Smooth capture and performance
 
@@ -525,7 +535,10 @@ have also been verified on a VC42 (see [Status](#status)).
 
 - **No I/O error without a signal:** the card sends no audio then, so the
   ALSA stream stalled. The driver now delivers silence at the exact 48 kHz
-  pace until audio returns.
+  pace until audio returns, starting as soon as the signal is lost. It never
+  delivers more at once than the application's buffer holds (a small buffer
+  would overrun, the stream stop and restart, and overrun again), and never
+  silence after audio from the card has resumed.
 - **No xruns:** periods match the card's 1024-frame packets, the BATCH flag is
   set, and no stale packet plays at start.
 - Audio is delivered directly from the interrupt thread, without an extra

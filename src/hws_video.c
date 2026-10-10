@@ -1299,8 +1299,7 @@ static void SetNoVideoMem(uint8_t * pDest, int  w,int h)
  * Append one captured packet to the ALSA ring. Everything that touches the
  * runtime happens under ring_lock and only while the stream runs, so a
  * concurrent STOP/close can't free dma_area underneath us.
- */
-/*
+ *
  * fill_after 0: a packet from the card (its time is noted in the same locked
  * step). Otherwise silence, written only if no real packet came since
  * last_real_ns was fill_after - checked under the lock, so a real packet can't
