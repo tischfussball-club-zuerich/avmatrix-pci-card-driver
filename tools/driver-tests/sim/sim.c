@@ -701,8 +701,10 @@ static void *status_thread(void *a)
 		sleep_ns(NSEC_PER_SEC / 4);
 		tick++;
 		for (int ch = 0; ch < NCH; ch++) {
-			/* source events: loss of signal or a mode change every few seconds */
-			if (tick % 12 == 3 + ch * 4) {
+			/* source events: loss of signal or a mode change every few seconds;
+			 * on ch0 in 10 s bursts with 10 s calm in between (the driver needs
+			 * a stable source for a few seconds to measure its exact rate) */
+			if (tick % 12 == 3 + ch * 4 && (ch != 0 || (tick / 40) % 2 == 0)) {
 				int r = rand_r(&seed) % 3;
 				if (r == 0) {
 					atomic_store(&src_present[ch], !atomic_load(&src_present[ch]));
@@ -1205,6 +1207,20 @@ int main(int argc, char **argv)
 		printf("ch%d driver stats: direct %d dma_overrun %d overwrite %d skip %d stale_half %d no_app_buf %d empty %d coalesced %d\n", ch,
 		       atomic_read(&ts->direct), atomic_read(&ts->dma_overrun), atomic_read(&ts->ring_overwrite), atomic_read(&ts->ring_skip), atomic_read(&ts->stale_half),
 		       atomic_read(&ts->no_app_buf), atomic_read(&ts->worker_empty), atomic_read(&ts->wq_coalesced));
+	}
+	/* every frame the card completed is in frames_in or exactly one drop counter */
+	for (ch = 0; ch < NCH; ch++) {
+		struct hws_timing_stats *ts = &pdx->tstats[ch];
+		atomic_t *c[HWS_ST_N];
+		long t[HWS_ST_N], card = pdx->m_half_cnt[ch][0];
+
+		hws_tstat_counters(ts, c);
+		for (i = 0; i < HWS_ST_N; i++)
+			t[i] = (long)ts->tot[i] + (unsigned)atomic_read(c[i]);
+		printf("ch%d frame accounting: card %ld in %ld overrun %ld stale %ld unpaired %ld aborted %ld copy_missed %ld unaccounted %ld\n",
+		       ch, card, t[HWS_ST_IN], t[HWS_ST_OVERRUN], t[HWS_ST_STALE], t[HWS_ST_UNPAIRED], t[HWS_ST_ABORTED],
+		       t[HWS_ST_MISSED], card - t[HWS_ST_IN] - t[HWS_ST_OVERRUN] - t[HWS_ST_STALE] - t[HWS_ST_UNPAIRED] -
+		       t[HWS_ST_ABORTED] - t[HWS_ST_MISSED]);
 	}
 	/* the measured rate (G_PARM) */
 	long rate_err = atomic_load(&rate_bad);

@@ -6,10 +6,10 @@ mkdir -p $H/fake
 for f in $(grep -o '#include <[^>]*>' $SRC/hws.h $SRC/hws_reg.h | sed 's/.*<\(.*\)>/\1/' | sort -u); do mkdir -p $H/fake/$(dirname $f); : > $H/fake/$f; done
 python3 -I $H/../conv/extract.py $SRC/hws_video.c > $H/conv.inc
 python3 -I $H/extract.py $SRC/hws_video.c hws_frame_period_ns hws_copy_too_late hws_tstat_max hws_tstat_frame_in hws_tstat_counters hws_tstat_fold \
-  hws_take_buffers hws_min_queued hws_complete_buffers hws_nosig_work video_data_process \
+  hws_take_buffers hws_max_queued hws_complete_buffers hws_nosig_work video_data_process \
   hws_buffer_queue_multi hws_return_buffers hws_start_streaming_multi hws_stop_streaming_multi \
   EnableVideoCapture CheckVideoCapture CheckCardStatus StartVideoCapture StopVideoCapture \
-  SetVideoFormteSize ChangeVideoSize hws_get_mark hws_put_mark hws_direct_requeue_locked hws_direct_reclaim hws_fanout_drain hws_fanout_work hws_direct_complete hws_dcopy hws_copy_doubled hws_take_late_buffers hws_inline_fanout hws_list_count hws_direct_half MemCopyVideoToSteam MemCopyAudioToSteam SetAudioQuene \
+  SetVideoFormteSize ChangeVideoSize hws_get_mark hws_put_mark hws_direct_requeue_locked hws_direct_reclaim hws_fanout_drain hws_fanout_work hws_direct_complete hws_dcopy hws_copy_doubled hws_take_late_buffers hws_inline_fanout hws_list_count hws_frame_drop hws_direct_half hws_copy_half MemCopyVideoToSteam MemCopyAudioToSteam SetAudioQuene \
   hws_audio_dpc SetQuene hws_video_dpc irqhandler hws_irq_thread hws_copy_work \
   hws_enable_card_irqs CheckAudioCapture StartAudioCapture StopAudioCapture EnableAudioCapture SetDMAAddress InitVideoSys hws_measure_rate hws_reset_rate Get_Video_Status CheckVideFmt _deliver_samples audio_data_process hws_audio_silence_work > $H/named.inc
 # forward declarations for everything extracted

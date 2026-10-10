@@ -99,6 +99,9 @@ static void hws_tstat_frame_in(struct hws_pcie_dev *pdx, int ch, u64 irq_ns)
 	struct hws_timing_stats *ts = &pdx->tstats[ch];
 	u64 interval;
 
+	pdx->frame_open[ch] = false;	/* counted: see hws_frame_drop() */
+	pdx->half1_drop[ch] = NULL;
+
 	atomic_inc(&ts->frames_in);
 	hws_tstat_max(&ts->copy_lat_max, ktime_get_ns() - irq_ns);
 
@@ -110,8 +113,7 @@ static void hws_tstat_frame_in(struct hws_pcie_dev *pdx, int ch, u64 irq_ns)
 		 * card skipped would bias it */
 		if (interval > period / 2 && interval < period * 7 / 5)
 		{
-			atomic64_add(interval, &ts->rate_sum_ns);
-			atomic_inc(&ts->rate_n);
+			atomic64_add(BIT_ULL(RATE_N_SHIFT) + interval, &ts->rate_acc);
 		}
 		if (interval < ts->interval_min)
 			ts->interval_min = interval;
@@ -137,6 +139,8 @@ static void hws_tstat_counters(struct hws_timing_stats *ts, atomic_t **c)
 	c[HWS_ST_EMPTY] = &ts->worker_empty;
 	c[HWS_ST_SKIP] = &ts->ring_skip;
 	c[HWS_ST_UNPAIRED] = &ts->unpaired;
+	c[HWS_ST_ABORTED] = &ts->aborted;
+	c[HWS_ST_MISSED] = &ts->copy_missed;
 }
 
 /* end a report window: its counts (win, may be NULL) go into the totals */
@@ -173,6 +177,7 @@ static void hws_tstat_report(struct hws_pcie_dev *pdx)
 		 */
 		bool eventful = atomic_read(&ts->stale_half) || atomic_read(&ts->dma_overrun) ||
 				atomic_read(&ts->unpaired) || atomic_read(&ts->ring_overwrite) ||
+				atomic_read(&ts->aborted) || atomic_read(&ts->copy_missed) ||
 				atomic_read(&ts->ring_skip) || atomic_read(&ts->no_app_buf) ||
 				ts->interval_max * 2 > 3 * hws_frame_period_ns(pdx, ch);
 		u32 w[HWS_ST_N];
@@ -189,13 +194,13 @@ static void hws_tstat_report(struct hws_pcie_dev *pdx)
 		ts->last_half0_cnt = c0;
 
 		if (pdx->m_bVCapStarted[ch] && elapsed_ms > 0)
-			pr_info("HwsCapture ch%d: in %llu fps (hw %u) out %llu fps | frames card %u in %u | irq_busy %u stale_half %u dma_overrun %u unpaired %u direct %u overwrite %u skip %u wq_coalesced %u no_app_buf %u empty %u | interval %llu-%llu us, copy_lat %llu us, wq_lat %llu us, lock_hold %llu us, backlog %d\n",
+			pr_info("HwsCapture ch%d: in %llu fps (hw %u) out %llu fps | frames card %u in %u | irq_busy %u stale_half %u dma_overrun %u unpaired %u aborted %u copy_missed %u direct %u overwrite %u skip %u wq_coalesced %u no_app_buf %u empty %u | interval %llu-%llu us, copy_lat %llu us, wq_lat %llu us, lock_hold %llu us, backlog %d\n",
 				ch, div64_u64((u64)w[HWS_ST_IN] * 1000, elapsed_ms),
 				pdx->m_pVCAPStatus[ch][0].dwFrameRate,
 				div64_u64((u64)w[HWS_ST_OUT] * 1000, elapsed_ms),
 				card, w[HWS_ST_IN],
 				w[HWS_ST_IRQ_BUSY], w[HWS_ST_STALE],
-				w[HWS_ST_OVERRUN], w[HWS_ST_UNPAIRED], w[HWS_ST_DIRECT],
+				w[HWS_ST_OVERRUN], w[HWS_ST_UNPAIRED], w[HWS_ST_ABORTED], w[HWS_ST_MISSED], w[HWS_ST_DIRECT],
 				w[HWS_ST_OVERWRITE], w[HWS_ST_SKIP],
 				w[HWS_ST_COALESCED],
 				w[HWS_ST_NO_BUF], w[HWS_ST_EMPTY],
@@ -399,11 +404,38 @@ static const framegrabber_pixfmt_t *framegrabber_g_out_pixelfmt(struct hws_video
 {
 	return &support_pixfmts[dev->current_out_pixfmt];
 }
+static void hws_follow_input(struct hws_video *videodev, int w, int h);
+
+/*
+ * An input change while buffers were allocated couldn't move the default
+ * format then; once they are freed (an app handling SOURCE_CHANGE: STREAMOFF,
+ * REQBUFS(0), G_FMT) it can. hws_follow_input() rechecks both conditions.
+ */
+static void hws_follow_current(struct hws_video *videodev)
+{
+	struct hws_pcie_dev *pdx = videodev->dev;
+	int ch = videodev->index, w, h;
+	unsigned long flags;
+
+	if (READ_ONCE(videodev->fmt_by_app) || READ_ONCE(pdx->m_curr_No_Video[ch]))
+		return;
+	spin_lock_irqsave(&pdx->videoslock[ch], flags);
+	w = pdx->m_pVCAPStatus[ch][0].dwWidth;
+	h = pdx->m_pVCAPStatus[ch][0].dwHeight;
+	if (pdx->m_pVCAPStatus[ch][0].dwinterlace)
+		h *= 2;
+	spin_unlock_irqrestore(&pdx->videoslock[ch], flags);
+	if (w > 0 && h > 0 && (w != videodev->current_out_width || h != videodev->curren_out_height))
+		hws_follow_input(videodev, w, h);
+}
+
 static int hws_vidioc_g_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *fmt)
 {
 	struct hws_video *videodev = video_drvdata(file);
 	const framegrabber_pixfmt_t *pixfmt;
 	v4l2_model_timing_t *p_SupportmodeTiming;
+
+	hws_follow_current(videodev);
 	pixfmt=framegrabber_g_out_pixelfmt(videodev);
 	if(pixfmt)
 	{
@@ -2519,18 +2551,19 @@ static void hws_take_late_buffers(struct hws_video *videodev, struct list_head *
 }
 
 /*
- * How many frames the consumers can take right now: the smallest number of
- * queued buffers over the streaming consumers that have any. A consumer with
- * none queued (paused, or holding all its buffers) is ignored, so it can't
- * cost the others frames. Returns 0 if no consumer has a buffer queued and
- * INT_MAX if nobody streams.
+ * How many waiting frames some consumer can still take: the largest number
+ * of queued buffers over the streaming consumers. Frames beyond that reach
+ * nobody; the rest go out in order, and a consumer with fewer buffers misses
+ * some of them without costing the others any (the smallest count would drop
+ * frames an app with enough buffers could have shown). Returns INT_MAX if
+ * nobody streams.
  */
-static int hws_min_queued(struct hws_video *videodev)
+static int hws_max_queued(struct hws_video *videodev)
 {
     struct hws_vfh_ctx *ctx;
     struct list_head *pos;
     unsigned long flags;
-    int min = INT_MAX;
+    int max = 0;
     bool streaming = false;
 
     spin_lock_irqsave(&videodev->consumers_lock, flags);
@@ -2545,13 +2578,11 @@ static int hws_min_queued(struct hws_video *videodev)
                 break;
         spin_unlock(&ctx->qlock);
         streaming = true;
-        if (n > 0 && n < min)
-            min = n;
+        if (n > max)
+            max = n;
     }
     spin_unlock_irqrestore(&videodev->consumers_lock, flags);
-    if (streaming && min == INT_MAX)
-        return 0;
-    return min;
+    return streaming ? max : INT_MAX;
 }
 
 /*
@@ -2775,7 +2806,7 @@ static void video_data_process(struct kthread_work *p_work)
         BYTE *bBuf;
 
         /* outside videoslock: consumers_lock is never nested inside it */
-        avail = hws_min_queued(videodev);
+        avail = hws_max_queued(videodev);
 
         spin_lock_irqsave(&pdx->videoslock[nDecoder], devflags);
         lock_ns = ktime_get_ns();
@@ -2842,7 +2873,8 @@ static void video_data_process(struct kthread_work *p_work)
          * More frames waiting than the consumers have buffers for: they can't
          * all be shown, so drop the oldest ones now instead of delivering stale
          * frames and dropping the fresh ones. Keeps latency at a minimum while
-         * an app with enough buffers still gets every frame.
+         * an app with enough buffers still gets every frame, also next to a
+         * slower one.
          */
         while (backlog > 1 && backlog > avail) {
             int oldest = -1;
@@ -3003,9 +3035,10 @@ static ssize_t stats_show(struct device *dev, struct device_attribute *attr, cha
 		"apps_open %d\napps_streaming %d\n"
 		"card_frames %u\nframes_in %llu\nframes_out %llu\ndirect %llu\n"
 		"dma_overrun %llu\nstale_half %llu\nunpaired %llu\nring_overwrite %llu\nring_skip %llu\n"
+		"aborted %llu\ncopy_missed %llu\n"
 		"no_app_buf %llu\nirq_busy %llu\nwq_coalesced %llu\nworker_empty %llu\n"
 		"audio_running %d\naudio_card_packets %u\naudio_silence_packets %u\n"
-		"card_lost %d\nirq_paused %d\n",
+		"card_lost %d\nirq_paused %d\ncapture_starts %u\n",
 		ch, pdx->m_bVCapStarted[ch] ? 1 : 0, READ_ONCE(pdx->m_curr_No_Video[ch]) ? 0 : 1,
 		pdx->m_pVCAPStatus[ch][0].dwWidth, pdx->m_pVCAPStatus[ch][0].dwHeight,
 		pdx->m_pVCAPStatus[ch][0].dwinterlace ? "i" : "p",
@@ -3014,9 +3047,11 @@ static ssize_t stats_show(struct device *dev, struct device_attribute *attr, cha
 		open, streaming,
 		READ_ONCE(pdx->m_half_cnt[ch][0]), t[HWS_ST_IN], t[HWS_ST_OUT], t[HWS_ST_DIRECT],
 		t[HWS_ST_OVERRUN], t[HWS_ST_STALE], t[HWS_ST_UNPAIRED], t[HWS_ST_OVERWRITE], t[HWS_ST_SKIP],
+		t[HWS_ST_ABORTED], t[HWS_ST_MISSED],
 		t[HWS_ST_NO_BUF], t[HWS_ST_IRQ_BUSY], t[HWS_ST_COALESCED], t[HWS_ST_EMPTY],
 		READ_ONCE(a->running) ? 1 : 0, atomic_read(&a->pkts_card), atomic_read(&a->pkts_silence),
-		READ_ONCE(pdx->m_PciDeviceLost) ? 1 : 0, READ_ONCE(pdx->irq_storm_off) ? 1 : 0);
+		READ_ONCE(pdx->m_PciDeviceLost) ? 1 : 0, READ_ONCE(pdx->irq_storm_off) ? 1 : 0,
+		READ_ONCE(pdx->capture_starts[ch]));
 }
 static DEVICE_ATTR_RO(stats);
 
@@ -3151,6 +3186,7 @@ static void hws_audio_silence_work(struct work_struct *work)
 	u64 gap_ns = READ_ONCE(pdx->m_curr_No_Video[drv->index]) ? 3 * pkt_ns : 250 * NSEC_PER_MSEC;
 	unsigned long flags;
 	bool running, filling;
+	s64 delay_ns;
 	int n;
 
 	spin_lock_irqsave(&drv->ring_lock, flags);
@@ -3175,9 +3211,16 @@ static void hws_audio_silence_work(struct work_struct *work)
 			drv->silence_next_ns += pkt_ns;
 		}
 	}
-	/* filling: every packet; real audio flowing: just look again in a while */
-	queue_delayed_work(pdx->wq, &drv->silence_work,
-			   max_t(unsigned long, 1, nsecs_to_jiffies(filling ? pkt_ns : 2 * pkt_ns)));
+	/*
+	 * Filling: every packet. Real audio flowing: look again when the gap
+	 * could first be long enough, at most 125 ms on (a lost signal shortens
+	 * the gap that counts), instead of waking every other packet.
+	 */
+	if (filling)
+		delay_ns = pkt_ns;
+	else
+		delay_ns = clamp_t(s64, (s64)(last + gap_ns - now), 2 * pkt_ns, 125 * NSEC_PER_MSEC);
+	queue_delayed_work(pdx->wq, &drv->silence_work, max_t(unsigned long, 1, nsecs_to_jiffies(delay_ns)));
 }
 
 /* deliveries run in the IRQ thread and the silence work: wait for one in progress */
@@ -3970,6 +4013,17 @@ static int StartVideoCapture(struct hws_pcie_dev *pdx,int index)
 	pdx->tstats[index].last_frame_ns = 0;
 	pdx->tstats[index].interval_min = U64_MAX;
 	pdx->tstats[index].window_start_ns = ktime_get_ns();
+	{
+		/* frames the card completed while capture was off (in flight at the
+		 * stop, bringup): given up; the copy thread starts counting from here */
+		u32 c0 = READ_ONCE(pdx->m_half_cnt[index][0]);
+
+		atomic_add(c0 - pdx->m_half_done_cnt[index][0], &pdx->tstats[index].aborted);
+		WRITE_ONCE(pdx->capture_starts[index], pdx->capture_starts[index] + 1);
+		pdx->m_half_done_cnt[index][0] = c0;
+		pdx->frame_open[index] = false;
+		pdx->half1_drop[index] = NULL;
+	}
 	/* counted from the same moment, or the first report shows inflated rates */
 	hws_tstat_fold(&pdx->tstats[index], NULL);
 	pdx->tstats[index].last_half0_cnt = READ_ONCE(pdx->m_half_cnt[index][0]);
@@ -4209,6 +4263,28 @@ static void hws_copy_doubled(BYTE *dst, const BYTE *src, int off, int len, int p
 }
 
 /*
+ * Every frame the card completes (its second-half interrupt, card_frames in
+ * the stats file) ends in exactly one counter: frames_in or one reason for
+ * dropping it, so the stats add up and a frame that vanishes stands out. A
+ * first half that fails is charged once its frame's second half arrives.
+ * Copy thread only.
+ */
+static void hws_frame_drop(struct hws_pcie_dev *pdx, int ch, int half, atomic_t *why)
+{
+	if (half == 1)
+	{
+		pdx->half1_drop[ch] = why;
+		return;
+	}
+	pdx->half1_drop[ch] = NULL;
+	if (pdx->frame_open[ch])
+	{
+		pdx->frame_open[ch] = false;
+		atomic_inc(why);
+	}
+}
+
+/*
  * Handle one half on the direct path. Returns -1 if the ring path must take
  * it, otherwise 1 (half consumed; a completed frame is already delivered).
  */
@@ -4270,7 +4346,7 @@ static int hws_direct_half(struct hws_pcie_dev *pdx, int ch, int half, BYTE *src
 		smp_rmb();
 		if (READ_ONCE(pdx->m_half_cnt[ch][0]) != peer_at_irq || hws_copy_too_late(pdx, ch, t_irq))
 		{
-			atomic_inc(&pdx->tstats[ch].dma_overrun);
+			hws_frame_drop(pdx, ch, 1, &pdx->tstats[ch].dma_overrun);
 			pdx->m_nVideoHalfDone[ch] = 0;
 			hws_direct_requeue_locked(pdx, ch, NULL);
 		}
@@ -4310,7 +4386,7 @@ static int hws_direct_half(struct hws_pcie_dev *pdx, int ch, int half, BYTE *src
 	smp_rmb();
 	if (READ_ONCE(pdx->m_half_cnt[ch][1]) != peer_at_irq || hws_copy_too_late(pdx, ch, t_irq))
 	{
-		atomic_inc(&pdx->tstats[ch].dma_overrun);
+		hws_frame_drop(pdx, ch, 0, &pdx->tstats[ch].dma_overrun);
 		hws_direct_requeue_locked(pdx, ch, NULL);
 		rt_mutex_unlock(&pdx->direct_lock[ch]);
 		return 1;
@@ -4337,7 +4413,19 @@ use_ring:
  * ring. Runs in the IRQ thread. Returns 0 when a complete frame was
  * committed to the ring, non-zero otherwise.
  */
-static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder,int mVideoBufIndex)
+static int hws_copy_half(struct hws_pcie_dev *pdx, int nDecoder, int mVideoBufIndex);
+
+static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx, int nDecoder, int mVideoBufIndex)
+{
+	int ret = hws_copy_half(pdx, nDecoder, mVideoBufIndex);
+
+	/* a frame neither delivered nor dropped for a counted reason */
+	if (mVideoBufIndex == 0 && pdx->frame_open[nDecoder])
+		hws_frame_drop(pdx, nDecoder, 0, &pdx->tstats[nDecoder].aborted);
+	return ret;
+}
+
+static int hws_copy_half(struct hws_pcie_dev *pdx, int nDecoder, int mVideoBufIndex)
 {
 	ACAP_VIDEO_INFO *vi = &pdx->m_VideoInfo[nDecoder];
 	int nIndex = -1;
@@ -4390,6 +4478,20 @@ static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder,int mVideoB
 	 */
 	if (cnt_self == pdx->m_half_done_cnt[nDecoder][mVideoBufIndex])
 		return -1;
+	if (mVideoBufIndex == 0)
+	{
+		/* second halves skipped since the last one: interrupts that merged
+		 * while this thread was busy (a big jump: the channel was stopped) */
+		u32 gap = cnt_self - pdx->m_half_done_cnt[nDecoder][0] - 1;
+
+		if (gap && gap < 0x10000)
+			atomic_add(gap, &pdx->tstats[nDecoder].copy_missed);
+		pdx->frame_open[nDecoder] = true;
+	}
+	else
+	{
+		pdx->half1_drop[nDecoder] = NULL;	/* a new frame: an older reason doesn't apply */
+	}
 	pdx->m_half_done_cnt[nDecoder][mVideoBufIndex] = cnt_self;
 
 	/*
@@ -4464,7 +4566,7 @@ static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder,int mVideoB
 		 * or our mark landed in new data while the card was rewriting this
 		 * half. The two can't be told apart, so drop the frame in progress.
 		 */
-		atomic_inc(&pdx->tstats[nDecoder].stale_half);
+		hws_frame_drop(pdx, nDecoder, mVideoBufIndex, &pdx->tstats[nDecoder].stale_half);
 		pdx->m_nVideoHalfDone[nDecoder] =0;
 		return -1;
 	}
@@ -4483,7 +4585,9 @@ static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder,int mVideoB
 			   t_irq - pdx->m_half1_ts[nDecoder] >
 			   max_t(u64, 2 * hws_frame_period_ns(pdx, nDecoder), 50 * NSEC_PER_MSEC))
 			{
-				atomic_inc(&pdx->tstats[nDecoder].unpaired);
+				atomic_t *why = pdx->half1_drop[nDecoder];
+
+				hws_frame_drop(pdx, nDecoder, 0, why ? why : &pdx->tstats[nDecoder].unpaired);
 				pdx->m_nVideoHalfDone[nDecoder] =0;
 				hws_put_mark(pMask);
 				return -1;
@@ -4508,6 +4612,7 @@ static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder,int mVideoB
 		{
 
 			pdx->m_nVideoHalfDone[nDecoder] = 1;
+			pdx->half1_drop[nDecoder] = NULL;
 			pdx->m_half1_gen[nDecoder] = gen;
 			pdx->m_half1_ts[nDecoder] = t_irq;
 			/* one check per format change: a counter compared for months
@@ -4582,7 +4687,7 @@ static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder,int mVideoB
 			if (READ_ONCE(pdx->m_half_cnt[nDecoder][!mVideoBufIndex]) != peer_at_irq ||
 			    hws_copy_too_late(pdx, nDecoder, t_irq))
 			{
-				atomic_inc(&pdx->tstats[nDecoder].dma_overrun);
+				hws_frame_drop(pdx, nDecoder, mVideoBufIndex, &pdx->tstats[nDecoder].dma_overrun);
 				pdx->m_nVideoHalfDone[nDecoder] = 0;
 				hws_put_mark(pMask);
 				return 1;
@@ -5144,7 +5249,9 @@ static void hws_follow_input(struct hws_video *videodev, int w, int h)
 /*
  * Every few seconds of capture: the input's exact rate from the frame
  * intervals, snapped to a standard rate (59.94 and 60 differ by 0.1%; the
- * mean over a few hundred frames is good to ~0.01%).
+ * mean over a few hundred frames is good to ~0.01%). Taken only when two
+ * windows in a row agree: interrupts held off for milliseconds at a window's
+ * edge shift one mean by about that 0.1%.
  */
 static void hws_measure_rate(struct hws_pcie_dev *pdx, int ch)
 {
@@ -5155,32 +5262,51 @@ static void hws_measure_rate(struct hws_pcie_dev *pdx, int ch)
 	};
 	struct hws_timing_stats *ts = &pdx->tstats[ch];
 	struct hws_video *v = &pdx->video[ch];
-	u64 sum, mhz;
-	int n, i;
+	u64 acc, sum, mhz, tpf;
+	u32 n;
+	int i;
 
-	if (atomic_read(&ts->rate_n) < 200)
+	if ((atomic64_read(&ts->rate_acc) >> RATE_N_SHIFT) < 200)
 		return;
-	n = atomic_xchg(&ts->rate_n, 0);
-	sum = atomic64_xchg(&ts->rate_sum_ns, 0);
-	if (n <= 0 || !sum)
+	acc = atomic64_xchg(&ts->rate_acc, 0);
+	n = acc >> RATE_N_SHIFT;
+	sum = acc & (BIT_ULL(RATE_N_SHIFT) - 1);
+	if (!n || !sum)
 		return;
 	mhz = div64_u64((u64)n * 1000000000000ULL, sum);
 	for (i = 0; i < ARRAY_SIZE(std); i++)
 		if (mhz * 2500 > (u64)std[i].mhz * 2499 && mhz * 2500 < (u64)std[i].mhz * 2501)
 		{
 			/* within 0.04% */
-			atomic64_set(&v->tpf, (u64)std[i].num << 32 | std[i].den);
+			tpf = (u64)std[i].num << 32 | std[i].den;
+
+			if (ts->rate_cand == tpf)
+				atomic64_set(&v->tpf, tpf);
+			ts->rate_cand = tpf;
 			return;
 		}
-	atomic64_set(&v->tpf, 0);	/* nothing standard: the card's own figure */
+	ts->rate_cand = 0;
+	/*
+	 * Nothing standard. Close to what was measured before: a burst of jitter
+	 * spoiled this window, keep it. Far off: the source changed its rate
+	 * (75, 120 Hz) - back to the card's own figure (0).
+	 */
+	tpf = atomic64_read(&v->tpf);
+	if (tpf && (u32)tpf)
+	{
+		u64 old_mhz = div64_u64((u64)(u32)tpf * 1000ULL, tpf >> 32);	/* den/num Hz */
+
+		if (mhz * 200 < old_mhz * 199 || mhz * 200 > old_mhz * 201)
+			atomic64_set(&v->tpf, 0);
+	}
 }
 
 /* new mode or signal: the old measurement doesn't apply */
 static void hws_reset_rate(struct hws_pcie_dev *pdx, int ch)
 {
 	atomic64_set(&pdx->video[ch].tpf, 0);
-	atomic_set(&pdx->tstats[ch].rate_n, 0);
-	atomic64_set(&pdx->tstats[ch].rate_sum_ns, 0);
+	atomic64_set(&pdx->tstats[ch].rate_acc, 0);
+	pdx->tstats[ch].rate_cand = 0;
 }
 
 static int Get_Video_Status(struct hws_pcie_dev *pdx,unsigned int  ch)
@@ -5472,14 +5598,28 @@ static int MainKsThreadHandle(void *arg)
 		}
 		tick++;
 		/* also when a card that was gone at resume is back (config-space check
-		 * only until then): CheckVideFmt notices it and re-inits it */
+		 * only until then): CheckVideFmt notices it and re-inits it. Idle: once
+		 * a second, so the default format matches the input before an app opens
+		 * the device (a few register reads) */
 		if(need_check==1 ||
-		   (READ_ONCE(pdx->need_bringup) && pci_device_is_present(pdx->pdev)))
+		   (READ_ONCE(pdx->need_bringup) && pci_device_is_present(pdx->pdev)) ||
+		   (tick % 4 == 0 && !READ_ONCE(pdx->need_bringup) &&
+		    pci_device_is_present(pdx->pdev)))
 		{
 			CheckVideFmt(pdx);
 			if(timing_debug && tick % 4 == 0)
 				hws_tstat_report(pdx);	/* per-second summary */
 		}
+		/* without reports nothing else empties the 32-bit window counters:
+		 * move them into the 64-bit totals before any can wrap */
+		if (!timing_debug && tick % 240 == 0)
+			for (i = 0; i < pdx->m_nCurreMaxVideoChl; i++)
+			{
+				hws_tstat_fold(&pdx->tstats[i], NULL);
+				/* a report after timing_debug is switched on starts here */
+				pdx->tstats[i].window_start_ns = ktime_get_ns();
+				pdx->tstats[i].last_half0_cnt = READ_ONCE(pdx->m_half_cnt[i][0]);
+			}
 		/* 4 Hz: a mode change is noticed within 250 ms (cheap: a few register
 		 * reads per channel). Returns early when kthread_stop() wakes us */
 		schedule_timeout_interruptible(HZ / 4);

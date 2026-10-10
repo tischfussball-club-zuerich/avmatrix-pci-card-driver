@@ -80,7 +80,10 @@ driver made for that card, e.g.
   frame is copied straight from the card into your buffer; other sizes are
   scaled by the driver (bilinear, keeping the aspect ratio: e.g. 1080p to
   640×480 crops the sides instead of squeezing the picture). Until an
-  application sets a format, the default is the input's size.
+  application sets a format, the default is the input's size (checked once a
+  second also while nothing streams, so it is right when an application
+  opens the device, and updated for an application that re-reads the format
+  after a source change).
 - **Audio:** 48 kHz, stereo, 16-bit, one ALSA card per channel.
 
 ## Supported kernels and distributions
@@ -328,17 +331,32 @@ sudo tools/stutter-monitor.py --quiet --log run.jsonl   # only seconds with a pr
   delivered, the driver's drop counters, applications without a free buffer
   (`NO-APP-BUF`: the application is too slow), a card delivering fewer frames
   than the input rate (`CARD-SLOW`: source, cable or card), signal and format
-  changes, audio filled with silence while there is a picture.
+  changes on channels in use, audio gaps the driver filled with silence
+  (`AUDIO-SILENCE`), a source that sends no audio at all (`AUDIO-NONE`, once).
 - **System:** the card's interrupt rate and CPU, saturated or throttled CPUs,
   CPU/memory/IO pressure stalls, application threads at 100%, relevant kernel
   messages.
 - **Ctrl+C** prints a summary: how often each problem occurred and which system
-  events came with the frame problems.
+  events came with the frame problems. So does closing the terminal or ssh
+  session (`SIGHUP`) and `SIGTERM`; with `--log` the summary is also the last
+  line of the log. A second Ctrl+C quits at once. To keep it running after
+  the terminal closes: `sudo nohup tools/stutter-monitor.py --quiet --log
+  run.jsonl &`.
+
+It is built to run for hours without false alarms: the second a stream starts,
+the signal changes or the format changes (and the one after) isn't judged,
+also when an application stops and restarts capture between two samples,
+frames are only reported lost when they stay missing (the driver counts a
+frame a moment after the card finishes it), a driver reload or a new channel
+starts a fresh baseline, and a reading that fails is reported once as
+`MONITOR-ERROR` instead of ending the run. Samples are taken on a fixed
+schedule, so an hour has exactly 3600 of them.
 
 It costs nothing measurable: once per second it reads a few counters from the
 driver and some `/proc` files; the frames themselves aren't touched. (Only the
 optional `--device /dev/videoN` adds a frame probe that reads every frame as an
-extra application: one more copy per frame inside the driver.)
+extra application: one more copy per frame inside the driver. While it holds
+the device open the driver can't be unloaded.)
 
 The driver's counters are also readable directly, one file per channel:
 
@@ -347,9 +365,12 @@ cat /sys/class/video4linux/video0/stats
 ```
 
 `card_frames` / `frames_in` / `frames_out` are totals since the driver loaded
-(compare two readings); `dma_overrun`, `stale_half`, `unpaired`,
-`ring_overwrite` and `ring_skip` count frames the driver dropped, `no_app_buf`
-frames no application had a buffer for; `audio_card_packets` /
+(compare two readings). Every frame the card completes is counted exactly once:
+taken in (`frames_in`) or dropped on the way in (`dma_overrun`, `stale_half`,
+`unpaired`, `aborted`, `copy_missed`), so `card_frames` minus those is 0 apart
+from a frame in flight; anything else is a driver bug. `ring_overwrite` and
+`ring_skip` count frames dropped later, `no_app_buf` frames no application had
+a buffer for, `capture_starts` how often capture was started; `audio_card_packets` /
 `audio_silence_packets` count audio from the card and silence the driver filled
 in. Unlike `timing_debug`, this needs no module parameter and writes nothing to
 the kernel log.
@@ -524,6 +545,11 @@ have also been verified on a VC42 (see [Status](#status)).
   showing a wrong-sized picture.
 - **Monitoring:** a `stats` file per channel in sysfs with the driver's frame,
   drop and audio counters, read by `tools/stutter-monitor.py` while streaming.
+  The frame counters add up exactly (a dropped frame counts once, under one
+  reason), so a frame that vanishes stands out.
+- **Several applications on one channel:** frames are only dropped when no
+  application has a buffer for them; before, one application with few buffers
+  made the others lose frames too.
 - **Format replies** are complete (colorimetry fields), the input reports
   "no signal", there is no fake analog TV standard, and `bus_info` is unique
   (`PCI:<address>`) so tools can tell two cards apart.

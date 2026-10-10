@@ -26,7 +26,7 @@ for mode in race logic nodirect irqfaults; do for f in 60 240 480; do
 	if [ $mode = irqfaults ]; then export SIM_LOSE_IRQ=40 SIM_DUP_IRQ=40; fi
 	ASAN_OPTIONS=detect_leaks=0 timeout 300 $S/sim/sim $f 45 > $o 2>&1; rc=$?
 	echo "== sim $f fps, mode=$mode (race=card DMA race present, logic=race removed + 59.94 fps, nodirect=ring path only, irqfaults=lost+duplicate IRQs): exit $rc"
-	grep -E "^frames|delivered|restarts|steady|duplicate|out of order|mod 100|sequence not|timestamp not|STREAMOFF|ERROR b|stalls|latency|driver stats" $o | sed 's/^/    /'
+	grep -E "^frames|delivered|restarts|steady|duplicate|out of order|mod 100|sequence not|timestamp not|STREAMOFF|ERROR b|stalls|latency|driver stats|accounting" $o | sed 's/^/    /'
 	for k in "torn/mixed, steady state" "duplicate frames" "frames out of order" "sequence not increasing" "timestamp not increasing" "left in driver after STREAMOFF" "completed after STREAMOFF" "2 s stalls"; do
 		v=$(grep "$k" $o | grep -o '[0-9]\+' | tail -1); [ "${v:-1}" = 0 ] || { echo "    !! $k = $v"; fail=1; }; done
 	# an app that keeps showing its frame until the next one arrives (2 buffers,
@@ -39,6 +39,9 @@ for mode in race logic nodirect irqfaults; do for f in 60 240 480; do
 	# the exact frame rate reported by G_PARM (1001/60000 vs 1/60)
 	ok=$(grep -o "frame rate measurements: right [0-9]*" $o | grep -o "[0-9]*$"); echo "    exact frame rate measured right ${ok:-?} times"
 	[ $f != 60 ] || [ "${ok:-0}" -gt 0 ] || { echo "    !! the frame rate was never measured"; fail=1; }
+	# card frames = frames taken in + counted drops; at most the last frame or two still in flight
+	for u in $(grep -o "unaccounted -*[0-9]*" $o | grep -o -- "-*[0-9]*$"); do
+		[ "$u" -ge 0 ] && [ "$u" -le 2 ] || { echo "    !! $u frames neither taken in nor counted as dropped"; fail=1; }; done
 	# a capture with no audio from the card must keep moving with silence at 48 kHz
 	a=$(grep -o "expected [0-9]*: [0-9]*%" $o | grep -o "[0-9]*%" | tr -d %); echo "    audio without card audio ran at ${a:-?}% of 48 kHz"
 	[ "${a:-0}" -ge 95 ] && [ "${a:-0}" -le 105 ] || { echo "    !! silent audio stream at ${a:-?}% of its rate"; fail=1; }

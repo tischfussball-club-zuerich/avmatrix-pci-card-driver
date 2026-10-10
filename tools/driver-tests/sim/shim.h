@@ -68,6 +68,8 @@ extern atomic_long sim_ratelimited_warnings;
 #define div_s64(a, b) ((s64)(a) / (b))
 #define num_online_cpus() 16
 #define min_t(t, a, b) ((t)(a) < (t)(b) ? (t)(a) : (t)(b))
+#define BIT_ULL(n) (1ULL << (n))
+#define clamp_t(t, v, lo, hi) min_t(t, max_t(t, v, lo), hi)
 #define queue_delayed_work(wq, d, j) mod_delayed_work((wq), (d), (j))
 #define cpu_relax() sched_yield()
 #define smp_mb__before_atomic() atomic_thread_fence(memory_order_seq_cst)
@@ -90,6 +92,7 @@ static inline void clear_bit(int nr, unsigned long *a)
 { __atomic_fetch_and(a, ~(1UL << nr), __ATOMIC_SEQ_CST); }
 typedef struct { atomic_int v; } atomic_t;
 #define atomic_inc(a) atomic_fetch_add(&(a)->v, 1)
+#define atomic_add(n, a) atomic_fetch_add(&(a)->v, (n))
 #define atomic_read(a) atomic_load(&(a)->v)
 #define atomic_set(a, x) atomic_store(&(a)->v, (x))
 #define atomic_xchg(a, x) atomic_exchange(&(a)->v, (x))

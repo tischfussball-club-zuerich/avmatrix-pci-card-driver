@@ -117,6 +117,22 @@ done
 [ ${#nodes[@]} -gt 0 ] || { say "no HwsCapture video devices found"; exit 2; }
 say "== ${#nodes[@]} video channel(s): ${nodes[*]}"
 cards=$(arecord -l 2>/dev/null | sed -n 's/^card [0-9]*: \(HAudio[0-9]*\) .*/\1/p')
+# the driver's counters per channel (this driver; the stock one has no stats file)
+stats_snap() {
+	local d f
+	for d in "${nodes[@]}"; do
+		f=/sys/class/video4linux/$(basename "$d")/stats
+		[ -r "$f" ] && printf '%s %s\n' "$d" "$(awk '{ printf "%s=%s ", $1, $2 }' "$f")"
+	done
+}
+stats_start=$(stats_snap)
+# the check assumes the card counts no frames while nobody captures: look for a second
+idle_moving=
+if [ -n "$stats_start" ]; then
+	sleep 1
+	[ "$(stats_snap | sed 's/ capture_starts=.*//; s/.*card_frames=\([0-9]*\).*/\1/')" = \
+	  "$(printf '%s\n' "$stats_start" | sed 's/ capture_starts=.*//; s/.*card_frames=\([0-9]*\).*/\1/')" ] || idle_moving=1
+fi
 
 # ---------------------------------------------------------------- 1. per channel
 sig_nodes=()
@@ -422,6 +438,37 @@ if [ "$EXTRA" = 1 ] && [ -n "$cards" ]; then
 	done
 fi
 
+# ---------------------------------------------------------------- frame accounting
+# Every frame the card completed must be taken in or counted as dropped, once.
+if [ -n "$stats_start" ] && [ -n "$idle_moving" ]; then
+	say ""
+	say "== driver frame accounting: skipped, the card counts frames while nothing captures"
+	res "accounting idle_moving=1"
+elif [ -n "$stats_start" ]; then
+	say ""
+	say "== driver frame accounting over the whole run (card frames = taken in + dropped)"
+	while read -r d line; do
+		[ -n "$d" ] || continue
+		before=$(printf '%s\n' "$stats_start" | awk -v d="$d" '$1 == d { $1 = ""; print }')
+		[ -n "$before" ] || continue
+		out=$(awk -v a="$before" -v b="$line" 'BEGIN {
+			n = split(a, x, " "); for (i = 1; i <= n; i++) { split(x[i], kv, "="); p[kv[1]] = kv[2] }
+			n = split(b, x, " "); for (i = 1; i <= n; i++) { split(x[i], kv, "="); c[kv[1]] = kv[2] }
+			if (!("aborted" in c)) { print "old"; exit }
+			card = c["card_frames"] - p["card_frames"]; if (card < 0) card += 4294967296
+			split("dma_overrun stale_half unpaired aborted copy_missed", k, " ")
+			drops = 0; txt = ""
+			for (i = 1; i <= 5; i++) { v = c[k[i]] - p[k[i]]; drops += v; if (v) txt = txt " " k[i] " " v }
+			inn = c["frames_in"] - p["frames_in"]
+			printf "%d %d %d %d%s", card, inn, drops, card - inn - drops, txt }')
+		[ "$out" = old ] && continue
+		read -r card inn drops un rest <<< "$out"
+		say "   $d: card $card, taken in $inn, dropped $drops${rest:+ (${rest# })}, unaccounted $un"
+		res "accounting.${KEY[$d]} card=$card in=$inn dropped=$drops unaccounted=$un"
+		if [ "$un" -gt 2 ] || [ "$un" -lt -2 ]; then bad "$d: $un frames neither taken in nor counted as dropped - a driver bug, please report"; fi
+	done <<< "$(stats_snap)"
+fi
+
 # ---------------------------------------------------------------- 4. kernel log
 say ""
 if [ $dmesg_ok = 0 ]; then
@@ -450,5 +497,5 @@ fi
 say ""
 say "RESULT: $([ $fail = 0 ] && echo OK || echo 'PROBLEMS FOUND (see !! above)')"
 res "result ok=$([ $fail = 0 ] && echo 1 || echo 0)"
-say "For frame pacing over time: tools/stutter-monitor.py --device ${nodes[0]}"
+say "While streaming: sudo tools/stutter-monitor.py --quiet (driver + system, no extra load)"
 exit $fail

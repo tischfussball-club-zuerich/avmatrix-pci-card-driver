@@ -410,10 +410,12 @@ struct hws_audio{
  * irq/irq-thread/worker are not serialized against the reset; good enough
  * for diagnostics.
  */
+#define RATE_N_SHIFT	44	/* rate_acc: 2^44 ns = 4.9 h of intervals, up to 2^20 of them */
+
 /* counters of hws_timing_stats, in hws_tstat_counters() order */
 enum { HWS_ST_IN, HWS_ST_OUT, HWS_ST_IRQ_BUSY, HWS_ST_STALE, HWS_ST_OVERRUN, HWS_ST_DIRECT,
        HWS_ST_OVERWRITE, HWS_ST_COALESCED, HWS_ST_NO_BUF, HWS_ST_EMPTY, HWS_ST_SKIP,
-       HWS_ST_UNPAIRED, HWS_ST_N };
+       HWS_ST_UNPAIRED, HWS_ST_ABORTED, HWS_ST_MISSED, HWS_ST_N };
 
 struct hws_timing_stats {
 	atomic_t	frames_in;	/* complete frames committed to the ring */
@@ -428,6 +430,10 @@ struct hws_timing_stats {
 	atomic_t	worker_empty;	/* worker ran but found no ready slot */
 	atomic_t	ring_skip;	/* ready frames skipped: more backlog than app buffers */
 	atomic_t	unpaired;	/* second half without a usable first half (pairing rejected it) */
+	atomic_t	aborted;	/* frame given up for another reason (no signal, format change,
+					 * every app stopped mid-frame, not capturing) */
+	atomic_t	copy_missed;	/* second halves the copy thread never got to (their interrupts
+					 * merged while it was busy); each one is a frame */
 	u64		last_frame_ns;
 	u64		interval_min;
 	u64		interval_max;
@@ -437,8 +443,10 @@ struct hws_timing_stats {
 	int		backlog_max;		/* ready slots waiting when worker ran */
 	u64		window_start_ns;
 	u32		last_half0_cnt;	/* second-half interrupts seen at the last report */
-	atomic64_t	rate_sum_ns;	/* regular frame intervals, for the exact input rate */
-	atomic_t	rate_n;
+	/* regular frame intervals, for the exact input rate: count << RATE_N_SHIFT
+	 * plus their sum in ns, one atomic so the two always match */
+	atomic64_t	rate_acc;
+	u64		rate_cand;	/* status thread: the last window's standard rate */
 	/* totals since the driver loaded (the counters above are per report
 	 * window); fold_lock moves window counts into them atomically for readers */
 	spinlock_t	fold_lock;
@@ -496,6 +504,11 @@ struct hws_pcie_dev {
 	struct kthread_worker		*conv_worker[MAX_VID_CHANNELS];
 	u32				m_half_seq[MAX_VID_CHANNELS][2];	/* hard IRQ: odd while ts/cnt/peer change */
 	u32				m_half_done_cnt[MAX_VID_CHANNELS][2];	/* copy thread: last completion handled */
+	/* copy thread: the frame of the second half being handled isn't counted yet,
+	 * and why its first half failed (charged when the second half arrives) */
+	bool				frame_open[MAX_VID_CHANNELS];
+	u32				capture_starts[MAX_VID_CHANNELS];	/* for the stats file: a restart between two readings */
+	atomic_t			*half1_drop[MAX_VID_CHANNELS];
 	u64				m_half1_ts[MAX_VID_CHANNELS];	/* IRQ time of that first half */
 	u32				m_fmt_cnt0[MAX_VID_CHANNELS];
 	bool				m_fmt_armed[MAX_VID_CHANNELS];	/* videoslock: m_fmt_cnt0 still to be checked */

@@ -114,6 +114,9 @@ compare_results() {
 					row("audio " what ": samples per second", get("old", k, "rate"), get("new", k, "rate"))
 					row("   loudest sample", get("old", k, "peak"), get("new", k, "peak")) }
 				else if (ch == "audio") { better = "high"; row("audio " what " ok (1 = yes)", get("old", k, "ok"), get("new", k, "ok")) }
+				else if (ch == "accounting") { better = "low"
+					row("driver " what ": frames dropped on the way in", get("old", k, "dropped"), get("new", k, "dropped"))
+					row("   frames unaccounted (must be 0)", get("old", k, "unaccounted"), get("new", k, "unaccounted")) }
 				else if (ch == "cpu") { better = "low"; row("whole system CPU busy, % (all at once)", get("old", k, "busy"), get("new", k, "busy")) }
 				else if (ch == "kernel") { better = "low"; row("kernel errors (Oops, BUG, WARNING)", get("old", k, "problems"), get("new", k, "problems")) }
 				else if (ch == "result") { better = "high"; row("card-check result OK (1 = yes)", get("old", k, "ok"), get("new", k, "ok")) }
