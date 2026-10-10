@@ -3188,7 +3188,7 @@ static void hws_audio_silence_work(struct work_struct *work)
 	bool running, filling;
 	u32 ring_frames;
 	s64 delay_ns;
-	int n, burst;
+	int n, burst, ring_pkts, lag_pkts;
 
 	spin_lock_irqsave(&drv->ring_lock, flags);
 	running = drv->running;
@@ -3201,8 +3201,11 @@ static void hws_audio_silence_work(struct work_struct *work)
 	 * holds, less two for margin. More, and ALSA sees a full buffer (an xrun),
 	 * stops the stream, the app restarts it - and the same burst comes again.
 	 */
-	burst = max_t(int, 1, (int)(ring_frames / (bytes / 4)) - 2);
-	burst = min(burst, 4);
+	ring_pkts = ring_frames / (bytes / 4);
+	burst = clamp_t(int, ring_pkts - 2, 1, 4);
+	/* a backlog may reach one packet past a burst (the next jiffy brings it),
+	 * but never the whole buffer */
+	lag_pkts = max_t(int, 1, min_t(int, burst + 1, ring_pkts - 1));
 	filling = (s64)(now - last) > (s64)gap_ns;
 	if (filling)
 	{
@@ -3210,7 +3213,7 @@ static void hws_audio_silence_work(struct work_struct *work)
 		 * drop the backlog instead of catching up */
 		if ((s64)(drv->silence_next_ns - (last + pkt_ns)) < 0)
 			drv->silence_next_ns = last + pkt_ns;
-		if ((s64)(now - drv->silence_next_ns) >= (s64)((burst + 2) * pkt_ns))	/* signed: "next" is usually ahead */
+		if ((s64)(now - drv->silence_next_ns) >= (s64)(lag_pkts * pkt_ns))	/* signed: "next" is usually ahead */
 			drv->silence_next_ns = now - (burst - 1) * pkt_ns;
 		for (n = 0; n < burst && (s64)(now - drv->silence_next_ns) >= 0; n++)
 		{
@@ -5581,6 +5584,8 @@ static bool hws_card_reachable(struct hws_pcie_dev *pdx)
 		if (!pdx->suspended && !READ_ONCE(pdx->removing) && pdx->pci_state &&
 		    pci_load_saved_state(pdx->pdev, pdx->pci_state) == 0)
 		{
+			/* the core marked it D3cold when it was unreadable: power state first */
+			pci_set_power_state(pdx->pdev, PCI_D0);
 			pci_restore_state(pdx->pdev);
 			pdx->need_bringup = true;
 		}
