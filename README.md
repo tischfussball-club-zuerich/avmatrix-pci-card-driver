@@ -246,8 +246,10 @@ DUR=60 tools/test-on-card.sh
 
 **`tools/card-check.sh`: check the loaded driver.** Connect a source to the
 inputs you want checked. Per channel it runs `v4l2-compliance`, a capture at
-the input size and one scaled to another size, counting lost and late frames.
-Then it captures all channels with a signal plus audio on every card at the
+the input size and one scaled to another size, counting lost and late frames,
+and shows the frame rate the driver reports to applications next to the rate
+worked out from the frame timestamps (they should agree, e.g. 59.940 for a
+59.94 source). Then it captures all channels with a signal plus audio on every card at the
 same time, reports the CPU use, compares the frames the card produced with the
 frames the driver took in, and lists the driver's drop counters and problem
 messages from the kernel log. `DUR=60` makes the captures longer;
