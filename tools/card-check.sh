@@ -25,13 +25,16 @@ set -u
 DUR=${DUR:-10}
 SCALE_DUR=${SCALE_DUR:-$(( DUR < 10 ? DUR : 10 ))}
 SKIP_COMPLIANCE=${SKIP_COMPLIANCE:-0}
+export LC_ALL=C	# awk/printf with a decimal point, whatever the desktop's language
 EXTRA=${EXTRA:-1}
 CHAOS=${CHAOS:-30}	# kill-test rounds
 ADUR=${ADUR:-20}	# audio clock measurement, seconds
 TMP=$(mktemp -d /tmp/hws-check.XXXXXX)
 LOAD_PIDS=()
 stop_load() { [ ${#LOAD_PIDS[@]} -eq 0 ] || { kill "${LOAD_PIDS[@]}"; wait "${LOAD_PIDS[@]}"; } 2>/dev/null; LOAD_PIDS=(); }
-trap 'stop_load; rm -rf "$TMP"' EXIT
+# background captures ignore Ctrl-C (non-interactive shell): end them too, or they
+# keep the device busy and the driver can't be unloaded afterwards
+trap 'stop_load; kill $(jobs -p) 2>/dev/null; rm -rf "$TMP"' EXIT
 # kernel messages after a point in time. Timestamps, not line counts: once the
 # kernel's log buffer is full, old lines drop out as new ones arrive.
 dmesg_now() { dmesg 2>/dev/null | tail -1 | sed -n 's/^\[ *\([0-9.]*\)\].*/\1/p'; }
@@ -111,7 +114,8 @@ lsmod | grep -q '^HwsCapture' || { say "HwsCapture module not loaded"; exit 2; }
 say "== module: $(modinfo -F version HwsCapture 2>/dev/null) params: direct_io=$(cat /sys/module/HwsCapture/parameters/direct_io 2>/dev/null) nt_copy=$(cat /sys/module/HwsCapture/parameters/nt_copy 2>/dev/null) timing_debug=$(cat /sys/module/HwsCapture/parameters/timing_debug 2>/dev/null)"
 
 nodes=()
-for d in /dev/video*; do
+# by number: video10 after video9, so ch1, ch2... follow the card's channels
+for d in $(printf '%s\n' /dev/video* | sort -V); do
 	v4l2-ctl -d "$d" --info 2>/dev/null | grep -q 'Driver name *: *HwsCapture' && nodes+=("$d")
 done
 [ ${#nodes[@]} -gt 0 ] || { say "no HwsCapture video devices found"; exit 2; }
@@ -394,7 +398,8 @@ if [ "$EXTRA" = 1 ] && [ ${#sig_nodes[@]} -gt 0 ]; then
 				hung=$((hung + 1))
 				bad "a killed application (pid $p) is still there after 5 s: $(cat /proc/$p/wchan 2>/dev/null) $(awk '{ print "state " $3 }' /proc/$p/stat 2>/dev/null)"
 			fi
-			wait "$p"
+			# a stuck one would block wait forever: leave it to the report above
+			alive "$p" && disown "$p" || wait "$p"
 		done
 	done 2>/dev/null
 	say "   $kills applications killed, $hung stuck"

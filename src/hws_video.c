@@ -3186,23 +3186,33 @@ static void hws_audio_silence_work(struct work_struct *work)
 	u64 gap_ns = READ_ONCE(pdx->m_curr_No_Video[drv->index]) ? 3 * pkt_ns : 250 * NSEC_PER_MSEC;
 	unsigned long flags;
 	bool running, filling;
+	u32 ring_frames;
 	s64 delay_ns;
-	int n;
+	int n, burst;
 
 	spin_lock_irqsave(&drv->ring_lock, flags);
 	running = drv->running;
+	ring_frames = drv->ring_size_byframes;
 	spin_unlock_irqrestore(&drv->ring_lock, flags);
 	if (!running || !pkt_ns)
 		return;
+	/*
+	 * Packets at once without the app reading in between: what its buffer
+	 * holds, less two for margin. More, and ALSA sees a full buffer (an xrun),
+	 * stops the stream, the app restarts it - and the same burst comes again.
+	 */
+	burst = max_t(int, 1, (int)(ring_frames / (bytes / 4)) - 2);
+	burst = min(burst, 4);
 	filling = (s64)(now - last) > (s64)gap_ns;
 	if (filling)
 	{
-		/* continue where the card stopped; after a long gap don't burst */
+		/* continue where the card stopped; further behind than one burst:
+		 * drop the backlog instead of catching up */
 		if ((s64)(drv->silence_next_ns - (last + pkt_ns)) < 0)
 			drv->silence_next_ns = last + pkt_ns;
-		if ((s64)(now - drv->silence_next_ns) > (s64)(8 * pkt_ns))	/* signed: "next" is usually ahead */
-			drv->silence_next_ns = now - 4 * pkt_ns;
-		for (n = 0; n < 8 && (s64)(now - drv->silence_next_ns) >= 0; n++)
+		if ((s64)(now - drv->silence_next_ns) >= (s64)(burst * pkt_ns))	/* signed: "next" is usually ahead */
+			drv->silence_next_ns = now - (burst - 1) * pkt_ns;
+		for (n = 0; n < burst && (s64)(now - drv->silence_next_ns) >= 0; n++)
 		{
 			if (atomic64_read(&drv->last_real_ns) != last)
 				break;	/* the card is sending again */
@@ -5480,6 +5490,10 @@ static void CheckVideFmt (struct hws_pcie_dev *pdx)
 		{
 			hws_reset_rate(pdx, i);
 			hws_notify_source_change(&pdx->video[i]);	/* signal lost or back */
+			/* lost: the silence fill starts now, not after its long re-arm
+			 * (it would then have to catch up in a burst) */
+			if (now && READ_ONCE(pdx->audio[i].running))
+				mod_delayed_work(pdx->wq, &pdx->audio[i].silence_work, 0);
 		}
 		else if (!now)
 			hws_measure_rate(pdx, i);
@@ -5544,6 +5558,34 @@ static void CheckVideFmt (struct hws_pcie_dev *pdx)
 
 }
 
+/*
+ * A card marked lost: touch its registers again only once it is back on the
+ * bus (some root complexes fault on reads of a gone device). Back after a
+ * reset, its config space is empty (no memory decode, no MSI): restore it and
+ * bring the card up again.
+ */
+static bool hws_card_reachable(struct hws_pcie_dev *pdx)
+{
+	u16 cmd;
+
+	if (!READ_ONCE(pdx->m_PciDeviceLost))
+		return true;
+	if (!pci_device_is_present(pdx->pdev))
+		return false;
+	if (pci_read_config_word(pdx->pdev, PCI_COMMAND, &cmd) == 0 && !(cmd & PCI_COMMAND_MEMORY))
+	{
+		mutex_lock(&pdx->pm_lock);
+		if (!pdx->suspended && !READ_ONCE(pdx->removing))
+		{
+			pci_restore_state(pdx->pdev);
+			pci_save_state(pdx->pdev);	/* a restore uses the saved copy up */
+			pdx->need_bringup = true;
+		}
+		mutex_unlock(&pdx->pm_lock);
+	}
+	return true;
+}
+
 static int MainKsThreadHandle(void *arg)
 {
 	int need_check=0;
@@ -5601,10 +5643,10 @@ static int MainKsThreadHandle(void *arg)
 		 * only until then): CheckVideFmt notices it and re-inits it. Idle: once
 		 * a second, so the default format matches the input before an app opens
 		 * the device (a few register reads) */
-		if(need_check==1 ||
+		if((need_check==1 && hws_card_reachable(pdx)) ||
 		   (READ_ONCE(pdx->need_bringup) && pci_device_is_present(pdx->pdev)) ||
 		   (tick % 4 == 0 && !READ_ONCE(pdx->need_bringup) &&
-		    pci_device_is_present(pdx->pdev)))
+		    pci_device_is_present(pdx->pdev) && hws_card_reachable(pdx)))
 		{
 			CheckVideFmt(pdx);
 			if(timing_debug && tick % 4 == 0)
@@ -6129,6 +6171,8 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		dev_err(&pdev->dev, "cannot get IRQ %d: %d\n", pdev->irq, err);
 		goto err_mem;
 	}
+	/* restored if the card comes back after a reset (link down, power loss) */
+	pci_save_state(pdev);
 	InitVideoSys(gdev,0);
 	StartKSThread(gdev);
 
@@ -6265,6 +6309,7 @@ static int __maybe_unused hws_resume(struct device *dev)
 		return 0;
 	}
 	hws_hw_bringup(pdx);
+	pci_save_state(pdx->pdev);	/* the PM core's restore used up the copy saved at probe */
 	for (i = 0; i < pdx->m_nCurreMaxVideoChl; i++)
 		if (pdx->video[i].engine_users > 0)
 			StartVideoCapture(pdx, i);

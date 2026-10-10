@@ -28,6 +28,7 @@ bad() { printf '  !! %s\n' "$*"; fail=1; }
 for t in v4l2-ctl arecord; do command -v $t >/dev/null || { say "missing $t"; exit 2; }; done
 lsmod | grep -q '^HwsCapture' || { say "HwsCapture module not loaded"; exit 2; }
 
+export LC_ALL=C	# awk/printf with a decimal point, whatever the desktop's language
 TMPD=$(mktemp -d /tmp/hws-leak.XXXXXX); trap 'rm -rf "$TMPD"' EXIT
 KMEMLEAK=/sys/kernel/debug/kmemleak
 [ -e $KMEMLEAK ] || mount -t debugfs none /sys/kernel/debug 2>/dev/null
@@ -85,10 +86,10 @@ stream_round() {	# <cycle number>: one open/stream/close per channel, varied
 	for d in $NODES; do
 		io="--stream-mmap=4"; [ $((i % 2)) = 1 ] && io="--stream-user=4"
 		size="${FMT[$d]}"; [ $((i % 3)) = 2 ] && size="width=1280,height=720,pixelformat=YUYV"
-		v4l2-ctl -d "$d" --set-fmt-video="$size" $io --stream-count=3 --stream-to=/dev/null >/dev/null 2>&1
+		timeout 20 v4l2-ctl -d "$d" --set-fmt-video="$size" $io --stream-count=3 --stream-to=/dev/null >/dev/null 2>&1
 	done
 }
-audio_round() { local c; for c in $CARDS; do arecord -q -D "hw:CARD=$c" -f S16_LE -r 48000 -c 2 -s 4800 /dev/null >/dev/null 2>&1; done; }
+audio_round() { local c; for c in $CARDS; do timeout 10 arecord -q -D "hw:CARD=$c" -f S16_LE -r 48000 -c 2 -s 4800 /dev/null >/dev/null 2>&1; done; }
 restore_fmt() { local d; for d in $NODES; do v4l2-ctl -d "$d" --set-fmt-video="${FMT[$d]}" >/dev/null 2>&1; done; }
 
 say "== leak check: $(echo $NODES | wc -w) video channel(s), $(echo $CARDS | wc -w) audio card(s); kmemleak: $([ $have_kmemleak = 1 ] && echo yes || echo 'not in this kernel (CONFIG_DEBUG_KMEMLEAK)')"
@@ -124,7 +125,7 @@ if [ -n "${HWS_KO:-}" ] && [ -f "$HWS_KO" ]; then
 	for i in $(seq 1 "$RELOADS"); do
 		insmod "$HWS_KO" timing_debug=0 || { bad "reload $i: insmod failed"; break; }
 		udevadm settle 2>/dev/null; sleep 1
-		for d in $(nodes); do v4l2-ctl -d "$d" --stream-mmap=4 --stream-count=3 --stream-to=/dev/null >/dev/null 2>&1; done
+		for d in $(nodes); do timeout 20 v4l2-ctl -d "$d" --stream-mmap=4 --stream-count=3 --stream-to=/dev/null >/dev/null 2>&1; done
 		unload || { bad "reload $i: can't unload"; break; }
 	done
 	sleep 1; read -r tot _ _ _ _ _ _ slab < <(snap)

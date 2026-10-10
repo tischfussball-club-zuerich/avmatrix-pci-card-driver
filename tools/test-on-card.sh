@@ -23,6 +23,7 @@
 #
 # A reboot always brings back the installed driver.
 set -u
+export LC_ALL=C	# awk/printf with a decimal point, whatever the desktop's language
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 KEEP=0; LEAK=0; COMPARE=0
 for a in "$@"; do
@@ -37,7 +38,10 @@ done
 BUILD=""
 SWAPPED=0
 LOG=$PWD/test-on-card-$(date +%Y%m%d-%H%M%S).log
-exec > >(tee "$LOG") 2>&1
+# tee ignores Ctrl-C/hangup: it must outlive this script's cleanup, or the cleanup's
+# own output kills the script (SIGPIPE) before the original driver is back
+exec > >(trap '' INT TERM HUP; exec tee "$LOG") 2>&1
+trap '' PIPE
 
 say() { printf '%s\n' "$*"; }
 die() { say "ERROR: $*"; exit 1; }
@@ -60,18 +64,27 @@ compare_results() {
 		FILENAME == ARGV[1] { kv($0, "new"); next }
 		{ kv($0, "old") }
 		function get(w, k, f) { return ((w, k, f) in v) ? v[w, k, f] : "-" }
+		# "-" (or "-/-") = not measured; a negative number is a measurement
+		function na(x) { return x == "" || x == "-" || x ~ /^-\// }
+		function missing(w, k,   f, t) {
+			f = get(w, k, "frames"); t = get(w, k, "want")
+			if (f == "-" || t == "-") return "-"
+			return t - f > 0 ? t - f : 0	# a capture can get a frame more than the time allows
+		}
 		function row(label, o, n,   mark) {
 			mark = ""
-			if (o != n && substr(o, 1, 1) != "-" && substr(n, 1, 1) != "-" && better != "") {
+			if (o != n && !na(o) && !na(n) && better != "") {
 				if ((better == "low" && n + 0 < o + 0) || (better == "high" && n + 0 > o + 0)) mark = "  better"
 				else if ((better == "low" && n + 0 > o + 0) || (better == "high" && n + 0 < o + 0)) mark = "  worse"
 			}
 			printf "%-46s %16s %16s%s\n", label, o, n, mark
 		}
 		function cap(k, label,   w) {
-			better = "high"; row(label ": frames received",
+			# the wanted count follows each driver frame rate (60 vs 59.94): judge what is missing
+			better = ""; row(label ": frames received",
 				get("old", k, "frames") "/" get("old", k, "want"), get("new", k, "frames") "/" get("new", k, "want"))
 			better = "low"
+			row("   frames missing", missing("old", k), missing("new", k))
 			row("   lost (sequence gaps)", get("old", k, "lost"), get("new", k, "lost"))
 			row("   duplicate / out of order", get("old", k, "dup"), get("new", k, "dup"))
 			row("   late (>1.5 frame periods)", get("old", k, "late"), get("new", k, "late"))
@@ -83,7 +96,7 @@ compare_results() {
 				if (get(which, k, "lost") != "-") {
 					tl[which] += get(which, k, "lost") + get(which, k, "dup")
 					tlate[which] += get(which, k, "late")
-					tmiss[which] += get(which, k, "want") - get(which, k, "frames")
+					tmiss[which] += missing(which, k)
 				}
 			}
 		}
@@ -194,7 +207,12 @@ restore() {
 		return
 	fi
 	say "== restoring the original driver"
-	sudo rmmod HwsCapture 2>/dev/null
+	# a capture that is still closing can hold the device for a moment
+	for i in 1 2 3 4 5; do
+		[ -d /sys/module/HwsCapture ] || break
+		sudo rmmod HwsCapture 2>/dev/null && break
+		sleep 1
+	done
 	if [ $ORIG_LOADED = 1 ]; then
 		sudo modprobe HwsCapture 2>/dev/null || { [ -n "$ORIG_FILE" ] && sudo insmod "$ORIG_FILE"; }
 		now=$(cat /sys/module/HwsCapture/srcversion 2>/dev/null)
@@ -206,8 +224,11 @@ restore() {
 	SWAPPED=0
 }
 # from here on, whatever happens, the original state comes back
-trap 'restore; restart_pipewire; [ -n "$BUILD" ] && rm -rf "$BUILD"; say "log: $LOG"' EXIT
-trap 'say "interrupted"; exit 130' INT TERM
+trap '[ -n "${SUDO_KEEP:-}" ] && kill $SUDO_KEEP 2>/dev/null; restore; restart_pipewire; [ -n "$BUILD" ] && rm -rf "$BUILD"; say "log: $LOG"' EXIT
+trap 'say "interrupted"; exit 130' INT TERM HUP
+# a long run outlasts sudo's login: keep it fresh, so the restore never waits for a password
+( while sleep 60; do sudo -n -v 2>/dev/null || exit; done ) &
+SUDO_KEEP=$!
 users=$(card_users)
 if [ -n "$users" ] && ! echo "$users" | awk -v me="$(id -u)" '$3 !~ /^(pipewire|pipewire-pulse|wireplumber)$/ || $4 != me { bad = 1 } END { exit bad }'; then
 	:	# someone else than our own PipeWire: report below
@@ -239,16 +260,18 @@ if [ $COMPARE = 1 ]; then
 	OLD_DESC="installed driver $(modinfo -F version HwsCapture 2>/dev/null) (srcversion $(cat /sys/module/HwsCapture/srcversion 2>/dev/null))"
 	say "################################################################ 1/2: $OLD_DESC"
 	sudo env DUR="${DUR:-10}" ${SCALE_DUR:+SCALE_DUR=$SCALE_DUR} SKIP_COMPLIANCE="$([ "${OLD_COMPLIANCE:-0}" = 1 ] && echo 0 || echo 1)" \
+		${EXTRA:+EXTRA=$EXTRA} ${CHAOS:+CHAOS=$CHAOS} ${ADUR:+ADUR=$ADUR} \
 		RESULTS="$OLD_RES" "$HERE/tools/card-check.sh"
 	say ""
 	say "################################################################ 2/2: this checkout (srcversion $NEW_SRC)"
 fi
 
 # ---------------------------------------------------------------- swap, with guaranteed restore
+# swapped before the unload: Ctrl-C while rmmod runs must still bring the original back
+SWAPPED=1
 if [ -d /sys/module/HwsCapture ]; then
 	sudo rmmod HwsCapture || die "can't unload the current driver (still in use?)"
 fi
-SWAPPED=1
 # timestamps, not line counts: a full kernel log buffer drops old lines as new ones come
 DMESG_START=$(sudo dmesg | tail -1 | sed -n 's/^\[ *\([0-9.]*\)\].*/\1/p')
 kmsg_since() { sudo dmesg | awk -v t="${DMESG_START:-0}" 'match($0, /^\[ *[0-9.]+\]/) { v = substr($0, RSTART + 1, RLENGTH - 2); gsub(/ /, "", v); if (v + 0 > t + 0) print }'; }
@@ -269,6 +292,7 @@ if [ $LEAK = 1 ]; then
 	sudo env HWS_KO="$BUILD/HwsCapture.ko" ${CYCLES:+CYCLES=$CYCLES} ${ACYCLES:+ACYCLES=$ACYCLES} ${RELOADS:+RELOADS=$RELOADS} "$HERE/tools/leak-check.sh"
 else
 	sudo env DUR="${DUR:-10}" ${SCALE_DUR:+SCALE_DUR=$SCALE_DUR} SKIP_COMPLIANCE="${SKIP_COMPLIANCE:-0}" \
+		${EXTRA:+EXTRA=$EXTRA} ${CHAOS:+CHAOS=$CHAOS} ${ADUR:+ADUR=$ADUR} \
 		$([ $COMPARE = 1 ] && echo "RESULTS=$NEW_RES") "$HERE/tools/card-check.sh"
 fi
 rc=$?
