@@ -1071,6 +1071,7 @@ int main(int argc, char **argv)
 		pdx->audio[ch].dev = pdx;
 		pdx->audio[ch].index = ch;
 		spin_lock_init(&pdx->audio[ch].ring_lock);
+		spin_lock_init(&pdx->tstats[ch].fold_lock);
 		INIT_WORK(&pdx->audio[ch].audiowork, audio_data_process);
 		INIT_DELAYED_WORK(&pdx->audio[ch].silence_work, hws_audio_silence_work);
 		if (ch < NCH) {

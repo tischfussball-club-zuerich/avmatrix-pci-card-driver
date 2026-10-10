@@ -263,10 +263,32 @@ inputs you want checked. Per channel it runs `v4l2-compliance`, a capture at
 the input size and one scaled to another size, counting lost and late frames,
 and shows the frame rate the driver reports to applications next to the rate
 worked out from the frame timestamps (they should agree, e.g. 59.940 for a
-59.94 source). Then it captures all channels with a signal plus audio on every card at the
-same time, reports the CPU use, compares the frames the card produced with the
-frames the driver took in, and lists the driver's drop counters and problem
-messages from the kernel log. `DUR=60` makes the captures longer;
+59.94 source). Then it captures all channels with a signal plus audio on every
+card at the same time, reports the CPU use, compares the frames the card
+produced with the frames the driver took in, and lists the driver's drop
+counters and problem messages from the kernel log.
+
+It also checks behaviour beyond plain capturing (about 2 minutes; `EXTRA=0`
+leaves it out):
+
+- **the scaled picture shows the input:** brightness and colour of an 8 × 6
+  grid of the scaled frame are compared with the input frame (a squeezed,
+  shifted or colour-swapped picture fails; show something with contrast, a
+  black screen can't be checked)
+- **picture controls work:** the average brightness of the picture at the
+  brightness control's minimum and maximum must differ
+- **user-pointer buffers** (application memory instead of the driver's)
+- **two applications on one channel** at the same time, each must get every frame
+- **every CPU busy** (half computing, half memory traffic) while all channels
+  capture: no frame may be lost
+- **applications killed at random moments** (`CHAOS=30` rounds, while starting,
+  streaming, two at once, with audio): no application may get stuck in the
+  driver, no kernel error, the channel must work afterwards, and another
+  channel streaming meanwhile must not lose a frame
+- **the audio sample clock** of every card, also without a signal (`ADUR=20`
+  seconds): it must run at 48 kHz (±1%)
+
+`DUR=60` makes the captures longer;
 `SKIP_COMPLIANCE=1` leaves out `v4l2-compliance`, e.g. to compare with another
 driver; `RESULTS=<file>` also writes the numbers to a file. Every capture has a
 time limit, so a driver that stops delivering frames can't hang the check.
@@ -287,11 +309,50 @@ where they started, and if the kernel has `kmemleak`, that kmemleak finds
 nothing from the driver. It takes about 10 minutes; `CYCLES`, `ACYCLES` and
 `RELOADS` change the counts.
 
-For frame pacing over a longer time, run
-`sudo tools/stutter-monitor.py --device /dev/video0` while capturing; it
-reports dropped, duplicated and late frames together with likely system causes
-(interrupt rate, saturated or throttled CPUs, CPU/memory/IO pressure, busy
-application threads, kernel errors).
+## Monitoring while streaming
+
+`tools/stutter-monitor.py` watches the driver and the system while your
+application streams, one line per second, and says where a problem came from:
+
+```sh
+sudo tools/stutter-monitor.py                       # every second
+sudo tools/stutter-monitor.py --quiet --log run.jsonl   # only seconds with a problem
+```
+
+```
+14:02:11  video0 1920x1080p->1920x1080 card 60 in 60 out 60/s apps 1 | cpu max 23%(cpu5) | irq cpu5:240/s
+14:02:12  video0 1920x1080p->1920x1080 card 60 in 60 out 52/s apps 1 | ...  !! NO-APP-BUF video0 x8; CPU-PRESSURE 14%
+```
+
+- **Driver:** frames the card produced, frames the driver took in and
+  delivered, the driver's drop counters, applications without a free buffer
+  (`NO-APP-BUF`: the application is too slow), a card delivering fewer frames
+  than the input rate (`CARD-SLOW`: source, cable or card), signal and format
+  changes, audio filled with silence while there is a picture.
+- **System:** the card's interrupt rate and CPU, saturated or throttled CPUs,
+  CPU/memory/IO pressure stalls, application threads at 100%, relevant kernel
+  messages.
+- **Ctrl+C** prints a summary: how often each problem occurred and which system
+  events came with the frame problems.
+
+It costs nothing measurable: once per second it reads a few counters from the
+driver and some `/proc` files; the frames themselves aren't touched. (Only the
+optional `--device /dev/videoN` adds a frame probe that reads every frame as an
+extra application: one more copy per frame inside the driver.)
+
+The driver's counters are also readable directly, one file per channel:
+
+```sh
+cat /sys/class/video4linux/video0/stats
+```
+
+`card_frames` / `frames_in` / `frames_out` are totals since the driver loaded
+(compare two readings); `dma_overrun`, `stale_half`, `unpaired`,
+`ring_overwrite` and `ring_skip` count frames the driver dropped, `no_app_buf`
+frames no application had a buffer for; `audio_card_packets` /
+`audio_silence_packets` count audio from the card and silence the driver filled
+in. Unlike `timing_debug`, this needs no module parameter and writes nothing to
+the kernel log.
 
 ## Updating
 
@@ -343,7 +404,7 @@ sudo depmod -a
 | `Key was rejected by service` | Secure Boot: enroll the DKMS key (see [Secure Boot](#secure-boot)). |
 | No `/dev/video*` device | `lspci -nn` must list the card with an ID from the table above (the VC12-4K needs a different driver); check `sudo dmesg \| grep -i hwscapture`. |
 | Picture shows "no signal" | No or unsupported input signal. Check the source and cable; inputs above 1920×1080 are not supported. |
-| Stutter or dropped frames | Load with `timing_debug=1` and run `tools/card-check.sh` (see [Testing on your card](#testing-on-your-card)); `direct_io=0` rules out the fast path. |
+| Stutter or dropped frames | Run `sudo tools/stutter-monitor.py` while streaming (see [Monitoring while streaming](#monitoring-while-streaming)): it tells card, driver, application and system causes apart. `tools/card-check.sh` tests the card on its own (see [Testing on your card](#testing-on-your-card)); `direct_io=0` rules out the fast path. |
 | Module does not unload (`in use`) | Close all applications using the video or audio devices, including PipeWire (`systemctl --user stop pipewire.socket pipewire-pulse.socket pipewire wireplumber`), or reboot. |
 
 ## Improvements over the official driver
@@ -461,6 +522,8 @@ have also been verified on a VC42 (see [Status](#status)).
   `V4L2_EVENT_SOURCE_CHANGE` are told when the input resolution changes or
   the signal is lost or comes back, so they can follow the input instead of
   showing a wrong-sized picture.
+- **Monitoring:** a `stats` file per channel in sysfs with the driver's frame,
+  drop and audio counters, read by `tools/stutter-monitor.py` while streaming.
 - **Format replies** are complete (colorimetry fields), the input reports
   "no signal", there is no fake analog TV standard, and `bus_info` is unique
   (`PCI:<address>`) so tools can tell two cards apart.
@@ -506,7 +569,8 @@ have also been verified on a VC42 (see [Status](#status)).
   or `FAIL`); see its README.
 - `tools/card-check.sh`, `tools/leak-check.sh`, `tools/test-on-card.sh`:
   checks on the real card.
-- `tools/stutter-monitor.py`: frame pacing and system monitor.
+- `tools/stutter-monitor.py`: monitor while streaming (see
+  [Monitoring while streaming](#monitoring-while-streaming)).
 - `doc/`: the vendor's original user guide.
 
 Licensed under the GPL (GPL-2.0-or-later, see the SPDX tags in the source).

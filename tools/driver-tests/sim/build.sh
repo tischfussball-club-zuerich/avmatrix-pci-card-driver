@@ -5,7 +5,7 @@ H=$(cd "$(dirname "$0")" && pwd); SRC=$1
 mkdir -p $H/fake
 for f in $(grep -o '#include <[^>]*>' $SRC/hws.h $SRC/hws_reg.h | sed 's/.*<\(.*\)>/\1/' | sort -u); do mkdir -p $H/fake/$(dirname $f); : > $H/fake/$f; done
 python3 -I $H/../conv/extract.py $SRC/hws_video.c > $H/conv.inc
-python3 -I $H/extract.py $SRC/hws_video.c hws_frame_period_ns hws_copy_too_late hws_tstat_max hws_tstat_frame_in \
+python3 -I $H/extract.py $SRC/hws_video.c hws_frame_period_ns hws_copy_too_late hws_tstat_max hws_tstat_frame_in hws_tstat_counters hws_tstat_fold \
   hws_take_buffers hws_min_queued hws_complete_buffers hws_nosig_work video_data_process \
   hws_buffer_queue_multi hws_return_buffers hws_start_streaming_multi hws_stop_streaming_multi \
   EnableVideoCapture CheckVideoCapture CheckCardStatus StartVideoCapture StopVideoCapture \

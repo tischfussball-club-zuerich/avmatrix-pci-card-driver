@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """
 stutter-monitor: watch the whole capture pipeline for causes of stutter.
-Works with the stock HwsCapture driver - no driver changes or debug logs needed.
 
 Samples once per interval and flags anything that can make video stutter:
+  - driver:  what the driver itself sees on every channel, from
+             /sys/class/video4linux/videoN/stats (this driver; the stock one
+             has no such file): frames the card produced vs. frames the
+             driver took in and delivered, its drop counters, applications
+             without a free buffer, signal and format changes, audio from the
+             card vs. silence filled in. Costs nothing on the frame path: a
+             few counters read once per interval. This is the part to leave
+             running while streaming.
   - frames:  with --device, reads frames from the V4L2 device as an extra
              consumer and checks frame intervals, gaps, duplicate bursts and
              delivery latency (the driver supports several readers per device)
@@ -20,9 +27,10 @@ system is already at its limit.
 Ctrl+C prints a summary that correlates frame problems with system events.
 
 Examples:
+  sudo ./stutter-monitor.py                  # driver + system, no extra load
+  sudo ./stutter-monitor.py --quiet --log run.jsonl   # only seconds with problems
   sudo ./stutter-monitor.py --device /dev/video0
   sudo ./stutter-monitor.py --device /dev/video0 --fps 50 --quiet --log run.jsonl
-  ./stutter-monitor.py                       # system only, no frame probe
 """
 
 import argparse
@@ -49,7 +57,59 @@ CLK_TCK = os.sysconf("SC_CLK_TCK")
 KMSG_INTEREST = re.compile(r"HwsCapture|AER|pcieport|interrupt took|hung_task|soft lockup|rcu.*stall", re.I)
 
 # Flags that mean "the frames themselves were bad" - correlated against the rest
-FRAME_FLAGS = ("FRAME-GAP", "DUP-FRAMES", "LOW-FPS", "JITTER", "DELIVERY-LATE", "IRQ-RATE", "PROBE-ERROR")
+FRAME_FLAGS = ("FRAME-GAP", "DUP-FRAMES", "LOW-FPS", "JITTER", "DELIVERY-LATE", "IRQ-RATE", "PROBE-ERROR",
+               "DRV-LOST", "DRV-DROP", "CARD-SLOW", "NO-APP-BUF")
+
+# counters in the driver's stats file (totals since it loaded; the monitor shows differences)
+DRV_COUNTERS = ("card_frames", "frames_in", "frames_out", "direct", "dma_overrun", "stale_half", "unpaired",
+                "ring_overwrite", "ring_skip", "no_app_buf", "audio_card_packets", "audio_silence_packets")
+DRV_DROPS = ("dma_overrun", "stale_half", "unpaired", "ring_overwrite", "ring_skip")
+
+
+def read_driver_stats():
+    """{"video0": {key: value}} for every channel of this driver that has a stats file."""
+    out = {}
+    for path in sorted(glob.glob("/sys/class/video4linux/video*/stats")):
+        txt = read_file(path)
+        if not txt:
+            continue
+        d = {}
+        for line in txt.splitlines():
+            k, _, v = line.partition(" ")
+            d[k] = v.strip()
+        if "card_frames" in d:
+            out[os.path.basename(os.path.dirname(path))] = d
+    return out
+
+
+def driver_deltas(prev, cur, dt):
+    """Per channel: the state now plus what happened since the last sample."""
+    res = {}
+    for name, d in cur.items():
+        p = prev.get(name)
+        e = {"streaming": d.get("streaming") == "1", "signal": d.get("signal") == "1",
+             "input": d.get("input", "?"), "output": d.get("output", "?"),
+             "apps": int(d.get("apps_streaming", 0) or 0), "card_lost": d.get("card_lost") == "1",
+             "irq_paused": d.get("irq_paused") == "1", "audio_running": d.get("audio_running") == "1"}
+        fi = d.get("frame_interval", "0/0").split("/")
+        try:
+            num, den = int(fi[0]), int(fi[1])
+            e["fps"] = den / num if num and den else float(d.get("input_fps", 0) or 0)
+        except ValueError:
+            e["fps"] = 0.0
+        def num(x, k):
+            try:
+                return int(x.get(k, 0))
+            except ValueError:
+                return 0
+        # a counter that went down: the driver was reloaded, start over
+        if p and all(num(d, k) >= num(p, k) for k in DRV_COUNTERS):
+            for k in DRV_COUNTERS:
+                e[k] = num(d, k) - num(p, k)
+            e["changed"] = [k for k in ("signal", "input") if p.get(k) != d.get(k)]
+            e["was_streaming"] = p.get("streaming") == "1"
+        res[name] = e
+    return res
 
 
 def read_file(path, default=None):
@@ -356,6 +416,34 @@ def evaluate(s, irq_cpus, irq_median):
     """Turn one sample into a list of flag strings."""
     flags = []
 
+    for name, e in sorted(s["driver"].items()):
+        if "changed" not in e:
+            continue  # first sample
+        if "signal" in e["changed"]:
+            flags.append(f"SIGNAL {name} {'back' if e['signal'] else 'lost'}")
+        elif "input" in e["changed"] and e["signal"]:
+            flags.append(f"FORMAT {name} input now {e['input']}")
+        if e["card_lost"]:
+            flags.append(f"CARD-LOST {name}")
+        if e["irq_paused"]:
+            flags.append(f"IRQ-PAUSED {name} (interrupt storm)")
+        if not (e["streaming"] and e["was_streaming"]):
+            continue  # the second a stream starts or stops counts only partly
+        # frames the card completed that the driver neither took in nor counted
+        # as a drop (+-1 is just where the sample fell)
+        lost = e["card_frames"] - e["frames_in"] - e["dma_overrun"] - e["stale_half"] - e["unpaired"]
+        if lost > 1:
+            flags.append(f"DRV-LOST {name} card {e['card_frames']} in {e['frames_in']}, {lost} unexplained")
+        drops = [f"{k} {e[k]}" for k in DRV_DROPS if e.get(k)]
+        if drops:
+            flags.append(f"DRV-DROP {name} " + " ".join(drops))
+        if e["signal"] and e["fps"] and e["card_frames"] < 0.9 * e["fps"] * s["dt"]:
+            flags.append(f"CARD-SLOW {name} {e['card_frames'] / s['dt']:.1f}fps<{e['fps']:.2f}")
+        if e["no_app_buf"]:
+            flags.append(f"NO-APP-BUF {name} x{e['no_app_buf']}")
+        if e["audio_running"] and e["signal"] and e["audio_silence_packets"]:
+            flags.append(f"AUDIO-SILENCE {name} {e['audio_silence_packets']} packets filled")
+
     for dev, f in sorted(s["frames"].items()):
         name = os.path.basename(dev)
         if "error" in f:
@@ -410,6 +498,12 @@ def evaluate(s, irq_cpus, irq_median):
 def fmt_line(s, flags, color):
     ts = time.strftime("%H:%M:%S", time.localtime(s["time"]))
     parts = []
+    for name, e in sorted(s["driver"].items()):
+        if e["streaming"] and "card_frames" in e and "changed" in e:
+            dt = s["dt"] or 1
+            parts.append(f"{name} {e['input'] if e['signal'] else 'no signal'}->{e['output']} "
+                         f"card {e['card_frames'] / dt:.0f} in {e['frames_in'] / dt:.0f} "
+                         f"out {e['frames_out'] / dt:.0f}/s apps {e['apps']}")
     for dev, f in sorted(s["frames"].items()):
         if "error" not in f:
             parts.append(f"{os.path.basename(dev)} {f['fps']:.1f}fps iv{f['iv_min_ms']:.0f}-{f['iv_max_ms']:.0f}ms "
@@ -457,8 +551,10 @@ def main():
     if kmsg.error:
         print(f"warning: cannot read /dev/kmsg ({kmsg.error}); kernel errors not tracked (run as root)",
               file=sys.stderr)
-    if not args.device:
-        print("note: no --device given - frame timing is not measured, only the system", file=sys.stderr)
+    prev_drv = read_driver_stats()
+    if not prev_drv:
+        print(f"note: no driver stats files (/sys/class/video4linux/video*/stats) - "
+              f"needs this repository's {DRIVER} driver", file=sys.stderr)
 
     probes = {}
     stats = {}
@@ -470,7 +566,8 @@ def main():
     app_names = [n for n in args.app.split(",") if n]
     log = open(args.log, "a") if args.log else None
 
-    print(f"card: {', '.join(pci) or '-'}   probing: {', '.join(args.device) or '-'}   "
+    print(f"card: {', '.join(pci) or '-'}   driver stats: {', '.join(prev_drv) or '-'}   "
+          f"probing: {', '.join(args.device) or '-'}   "
           f"watching apps: {', '.join(app_names)}   Ctrl+C for summary\n")
 
     prev_cpu = read_cpu_times()
@@ -538,8 +635,12 @@ def main():
                         hot_threads.append((f"{comm}/{tname}", pct))
         prev_threads = threads_now
 
+        drv = read_driver_stats()
+        driver = driver_deltas(prev_drv, drv, dt)
+        prev_drv = drv
+
         sample = {
-            "time": time.time(), "frames": frames, "cpu_busy": cpu_busy, "irq_rate": irq_rate,
+            "time": time.time(), "dt": dt, "driver": driver, "frames": frames, "cpu_busy": cpu_busy, "irq_rate": irq_rate,
             "psi_pct": psi_pct, "freq_ratio": freq_ratio, "throttle_delta": throttle_delta,
             "hot_threads": hot_threads, "kmsg": kmsg.read(),
         }
@@ -604,6 +705,19 @@ def print_summary(history):
         "THERMAL-THROTTLE": "CPU throttled by temperature",
         "APP-THREAD-SAT": "an app thread is pinned at 100% of a core - that thread is the bottleneck",
         "KERNEL": "relevant kernel messages - check dmesg",
+        "DRV-LOST": "the card completed frames the driver didn't take in - a driver problem, please report",
+        "DRV-DROP": "the driver dropped frames (DMA overrun / stale / unpaired halves, ring overwritten or "
+                    "skipped) - usually the copy thread ran too late: look at CPU and IRQ flags in the same seconds",
+        "CARD-SLOW": "the card itself delivered fewer frames than the input rate - source, cable or card "
+                     "(not the driver)",
+        "NO-APP-BUF": "a frame arrived while the application had no free buffer - the application is too slow "
+                      "or queues too few buffers",
+        "SIGNAL": "the input signal was lost or came back",
+        "FORMAT": "the input resolution changed",
+        "AUDIO-SILENCE": "the driver filled in silence while there was a picture - the source sends no audio, "
+                         "or the card's audio stalled",
+        "CARD-LOST": "the card stopped responding on the PCIe bus",
+        "IRQ-PAUSED": "the driver paused the card's interrupts after an interrupt storm (it retries every second)",
     }
     for k, _ in counts.most_common():
         if k in hints:

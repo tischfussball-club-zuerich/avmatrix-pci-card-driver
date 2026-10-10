@@ -98,6 +98,21 @@ compare_results() {
 				else if (what == "scaled") cap(k, ch ": capture scaled")
 				else if (what == "picture") { better = ""; row(ch ": scaled picture, distinct byte values", get("old", k, "values"), get("new", k, "values")) }
 				else if (what == "together") cap(k, ch ": all channels + audio at once")
+				else if (what == "scalecheck") { better = "high"
+					row(ch ": scaled vs. input, brightness match", get("old", k, "luma"), get("new", k, "luma"))
+					row("   colour match U", get("old", k, "u"), get("new", k, "u"))
+					row("   colour match V", get("old", k, "v"), get("new", k, "v")) }
+				else if (what == "controls") { better = "high"; row(ch ": brightness control, min->max change", get("old", k, "diff"), get("new", k, "diff")) }
+				else if (what == "userptr") cap(k, ch ": user-pointer buffers")
+				else if (what == "app1") cap(k, ch ": two apps at once, app 1")
+				else if (what == "app2") cap(k, ch ": two apps at once, app 2")
+				else if (what == "loaded") cap(k, ch ": every CPU busy")
+				else if (what == "after") cap(k, ch ": after the kill test")
+				else if (what == "observer") cap(k, ch ": while apps elsewhere were killed")
+				else if (ch == "chaos") { better = "low"; row("kill test: apps stuck after kill -9", get("old", k, "hung"), get("new", k, "hung")) }
+				else if (ch == "aclock") { better = ""
+					row("audio " what ": samples per second", get("old", k, "rate"), get("new", k, "rate"))
+					row("   loudest sample", get("old", k, "peak"), get("new", k, "peak")) }
 				else if (ch == "audio") { better = "high"; row("audio " what " ok (1 = yes)", get("old", k, "ok"), get("new", k, "ok")) }
 				else if (ch == "cpu") { better = "low"; row("whole system CPU busy, % (all at once)", get("old", k, "busy"), get("new", k, "busy")) }
 				else if (ch == "kernel") { better = "low"; row("kernel errors (Oops, BUG, WARNING)", get("old", k, "problems"), get("new", k, "problems")) }

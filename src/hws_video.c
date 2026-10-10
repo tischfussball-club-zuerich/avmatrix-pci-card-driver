@@ -123,6 +123,41 @@ static void hws_tstat_frame_in(struct hws_pcie_dev *pdx, int ch, u64 irq_ns)
 	ts->last_frame_ns = irq_ns;
 }
 
+static void hws_tstat_counters(struct hws_timing_stats *ts, atomic_t **c)
+{
+	c[HWS_ST_IN] = &ts->frames_in;
+	c[HWS_ST_OUT] = &ts->frames_out;
+	c[HWS_ST_IRQ_BUSY] = &ts->irq_busy_skip;
+	c[HWS_ST_STALE] = &ts->stale_half;
+	c[HWS_ST_OVERRUN] = &ts->dma_overrun;
+	c[HWS_ST_DIRECT] = &ts->direct;
+	c[HWS_ST_OVERWRITE] = &ts->ring_overwrite;
+	c[HWS_ST_COALESCED] = &ts->wq_coalesced;
+	c[HWS_ST_NO_BUF] = &ts->no_app_buf;
+	c[HWS_ST_EMPTY] = &ts->worker_empty;
+	c[HWS_ST_SKIP] = &ts->ring_skip;
+	c[HWS_ST_UNPAIRED] = &ts->unpaired;
+}
+
+/* end a report window: its counts (win, may be NULL) go into the totals */
+static void hws_tstat_fold(struct hws_timing_stats *ts, u32 *win)
+{
+	atomic_t *c[HWS_ST_N];
+	unsigned long flags;
+	int i;
+
+	hws_tstat_counters(ts, c);
+	spin_lock_irqsave(&ts->fold_lock, flags);
+	for (i = 0; i < HWS_ST_N; i++) {
+		u32 v = atomic_xchg(c[i], 0);
+
+		ts->tot[i] += v;
+		if (win)
+			win[i] = v;
+	}
+	spin_unlock_irqrestore(&ts->fold_lock, flags);
+}
+
 static void hws_tstat_report(struct hws_pcie_dev *pdx)
 {
 	u64 now = ktime_get_ns();
@@ -140,13 +175,12 @@ static void hws_tstat_report(struct hws_pcie_dev *pdx)
 				atomic_read(&ts->unpaired) || atomic_read(&ts->ring_overwrite) ||
 				atomic_read(&ts->ring_skip) || atomic_read(&ts->no_app_buf) ||
 				ts->interval_max * 2 > 3 * hws_frame_period_ns(pdx, ch);
-		unsigned int in, out;
+		u32 w[HWS_ST_N];
 		u32 c0, card;
 
 		if (pdx->m_bVCapStarted[ch] && !eventful && timing_debug < 2 && elapsed_ms < 10000)
 			continue;
-		in = atomic_xchg(&ts->frames_in, 0);
-		out = atomic_xchg(&ts->frames_out, 0);
+		hws_tstat_fold(ts, w);
 		/* frames the card completed (one second-half interrupt each) vs.
 		 * frames the driver committed: more interrupts = frames lost in the driver */
 		c0 = READ_ONCE(pdx->m_half_cnt[ch][0]);
@@ -155,16 +189,16 @@ static void hws_tstat_report(struct hws_pcie_dev *pdx)
 		ts->last_half0_cnt = c0;
 
 		if (pdx->m_bVCapStarted[ch] && elapsed_ms > 0)
-			pr_info("HwsCapture ch%d: in %llu fps (hw %u) out %llu fps | frames card %u in %u | irq_busy %d stale_half %d dma_overrun %d unpaired %d direct %d overwrite %d skip %d wq_coalesced %d no_app_buf %d empty %d | interval %llu-%llu us, copy_lat %llu us, wq_lat %llu us, lock_hold %llu us, backlog %d\n",
-				ch, div64_u64((u64)in * 1000, elapsed_ms),
+			pr_info("HwsCapture ch%d: in %llu fps (hw %u) out %llu fps | frames card %u in %u | irq_busy %u stale_half %u dma_overrun %u unpaired %u direct %u overwrite %u skip %u wq_coalesced %u no_app_buf %u empty %u | interval %llu-%llu us, copy_lat %llu us, wq_lat %llu us, lock_hold %llu us, backlog %d\n",
+				ch, div64_u64((u64)w[HWS_ST_IN] * 1000, elapsed_ms),
 				pdx->m_pVCAPStatus[ch][0].dwFrameRate,
-				div64_u64((u64)out * 1000, elapsed_ms),
-				card, in,
-				atomic_read(&ts->irq_busy_skip), atomic_read(&ts->stale_half),
-				atomic_read(&ts->dma_overrun), atomic_read(&ts->unpaired), atomic_read(&ts->direct),
-				atomic_read(&ts->ring_overwrite), atomic_read(&ts->ring_skip),
-				atomic_read(&ts->wq_coalesced),
-				atomic_read(&ts->no_app_buf), atomic_read(&ts->worker_empty),
+				div64_u64((u64)w[HWS_ST_OUT] * 1000, elapsed_ms),
+				card, w[HWS_ST_IN],
+				w[HWS_ST_IRQ_BUSY], w[HWS_ST_STALE],
+				w[HWS_ST_OVERRUN], w[HWS_ST_UNPAIRED], w[HWS_ST_DIRECT],
+				w[HWS_ST_OVERWRITE], w[HWS_ST_SKIP],
+				w[HWS_ST_COALESCED],
+				w[HWS_ST_NO_BUF], w[HWS_ST_EMPTY],
 				ts->interval_min == U64_MAX ? 0 : div_u64(ts->interval_min, NSEC_PER_USEC),
 				div_u64(ts->interval_max, NSEC_PER_USEC),
 				div_u64(ts->copy_lat_max, NSEC_PER_USEC),
@@ -172,16 +206,6 @@ static void hws_tstat_report(struct hws_pcie_dev *pdx)
 				div_u64(ts->lock_hold_max, NSEC_PER_USEC),
 				ts->backlog_max);
 
-		atomic_set(&ts->irq_busy_skip, 0);
-		atomic_set(&ts->stale_half, 0);
-		atomic_set(&ts->dma_overrun, 0);
-		atomic_set(&ts->unpaired, 0);
-		atomic_set(&ts->direct, 0);
-		atomic_set(&ts->ring_overwrite, 0);
-		atomic_set(&ts->ring_skip, 0);
-		atomic_set(&ts->wq_coalesced, 0);
-		atomic_set(&ts->no_app_buf, 0);
-		atomic_set(&ts->worker_empty, 0);
 		ts->interval_min = U64_MAX;
 		ts->interval_max = 0;
 		ts->copy_lat_max = 0;
@@ -1324,6 +1348,7 @@ static void audio_data_process(struct work_struct *p_work)
 		{
 			atomic64_set(&drv->last_real_ns, ktime_get_ns());
 			_deliver_samples(drv, bBuf, aud_len);
+			atomic_inc(&drv->pkts_card);
 		}
 
 		spin_lock_irqsave(&pdx->audiolock[dwAudioCh], flags);
@@ -2941,6 +2966,60 @@ static void hws_adapters_init(struct hws_pcie_dev *dev)
 		hws_get_video_param(dev,i);
 	}
 }
+/*
+ * /sys/class/video4linux/videoN/stats: what the driver sees on this channel,
+ * for monitoring while streaming (tools/stutter-monitor.py). Counts are totals
+ * since the driver loaded; reading costs a few counter reads, nothing on the
+ * frame path.
+ */
+static ssize_t stats_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct hws_video *v = video_get_drvdata(to_video_device(dev));
+	struct hws_pcie_dev *pdx = v->dev;
+	int ch = v->index;
+	struct hws_timing_stats *ts = &pdx->tstats[ch];
+	struct hws_audio *a = &pdx->audio[ch];
+	atomic_t *c[HWS_ST_N];
+	u64 t[HWS_ST_N], tpf = atomic64_read(&v->tpf);
+	struct hws_vfh_ctx *ctx;
+	int open = 0, streaming = 0, i;
+	unsigned long flags;
+
+	hws_tstat_counters(ts, c);
+	spin_lock_irqsave(&ts->fold_lock, flags);
+	for (i = 0; i < HWS_ST_N; i++)
+		t[i] = ts->tot[i] + (u32)atomic_read(c[i]);
+	spin_unlock_irqrestore(&ts->fold_lock, flags);
+	spin_lock_irqsave(&v->consumers_lock, flags);
+	list_for_each_entry(ctx, &v->consumers, node) {
+		open++;
+		streaming += ctx->streaming;
+	}
+	spin_unlock_irqrestore(&v->consumers_lock, flags);
+
+	return scnprintf(buf, PAGE_SIZE,
+		"channel %d\nstreaming %d\nsignal %d\n"
+		"input %ux%u%s\ninput_fps %u\nframe_interval %u/%u\noutput %dx%d\n"
+		"apps_open %d\napps_streaming %d\n"
+		"card_frames %u\nframes_in %llu\nframes_out %llu\ndirect %llu\n"
+		"dma_overrun %llu\nstale_half %llu\nunpaired %llu\nring_overwrite %llu\nring_skip %llu\n"
+		"no_app_buf %llu\nirq_busy %llu\nwq_coalesced %llu\nworker_empty %llu\n"
+		"audio_running %d\naudio_card_packets %u\naudio_silence_packets %u\n"
+		"card_lost %d\nirq_paused %d\n",
+		ch, pdx->m_bVCapStarted[ch] ? 1 : 0, READ_ONCE(pdx->m_curr_No_Video[ch]) ? 0 : 1,
+		pdx->m_pVCAPStatus[ch][0].dwWidth, pdx->m_pVCAPStatus[ch][0].dwHeight,
+		pdx->m_pVCAPStatus[ch][0].dwinterlace ? "i" : "p",
+		pdx->m_pVCAPStatus[ch][0].dwFrameRate, (u32)(tpf >> 32), (u32)tpf,
+		v->current_out_width, v->curren_out_height,
+		open, streaming,
+		READ_ONCE(pdx->m_half_cnt[ch][0]), t[HWS_ST_IN], t[HWS_ST_OUT], t[HWS_ST_DIRECT],
+		t[HWS_ST_OVERRUN], t[HWS_ST_STALE], t[HWS_ST_UNPAIRED], t[HWS_ST_OVERWRITE], t[HWS_ST_SKIP],
+		t[HWS_ST_NO_BUF], t[HWS_ST_IRQ_BUSY], t[HWS_ST_COALESCED], t[HWS_ST_EMPTY],
+		READ_ONCE(a->running) ? 1 : 0, atomic_read(&a->pkts_card), atomic_read(&a->pkts_silence),
+		READ_ONCE(pdx->m_PciDeviceLost) ? 1 : 0, READ_ONCE(pdx->irq_storm_off) ? 1 : 0);
+}
+static DEVICE_ATTR_RO(stats);
+
 static int hws_video_register(struct hws_pcie_dev *dev)
 {
 	int i;
@@ -2993,6 +3072,9 @@ static int hws_video_register(struct hws_pcie_dev *dev)
 			dev_err(&dev->pdev->dev, "video_register_device %d failed\n", i);
 			goto fail;
 		}
+		/* monitoring only: the channel works without it */
+		if (device_create_file(&vdev->dev, &dev_attr_stats))
+			dev_warn(&dev->pdev->dev, "no stats file for channel %d\n", i);
 	}
 	return 0;
 fail:
@@ -3089,6 +3171,7 @@ static void hws_audio_silence_work(struct work_struct *work)
 			if (atomic64_read(&drv->last_real_ns) != last)
 				break;	/* the card is sending again */
 			_deliver_samples(drv, hws_silence, bytes);
+			atomic_inc(&drv->pkts_silence);
 			drv->silence_next_ns += pkt_ns;
 		}
 	}
@@ -3644,8 +3727,12 @@ static void hws_video_unregister_nodes(struct hws_pcie_dev *dev)
 {
 	int i;
 
-	for (i = 0; i < dev->m_nCurreMaxVideoChl; i++)
+	for (i = 0; i < dev->m_nCurreMaxVideoChl; i++) {
+		/* first: waits for a running read of it */
+		if (video_is_registered(&dev->video[i].vdev))
+			device_remove_file(&dev->video[i].vdev.dev, &dev_attr_stats);
 		video_unregister_device(&dev->video[i].vdev);	/* no-op if never registered */
+	}
 }
 
 static void hws_video_release_v4l2(struct hws_pcie_dev *dev)
@@ -3884,8 +3971,7 @@ static int StartVideoCapture(struct hws_pcie_dev *pdx,int index)
 	pdx->tstats[index].interval_min = U64_MAX;
 	pdx->tstats[index].window_start_ns = ktime_get_ns();
 	/* counted from the same moment, or the first report shows inflated rates */
-	atomic_set(&pdx->tstats[index].frames_in, 0);
-	atomic_set(&pdx->tstats[index].frames_out, 0);
+	hws_tstat_fold(&pdx->tstats[index], NULL);
 	pdx->tstats[index].last_half0_cnt = READ_ONCE(pdx->m_half_cnt[index][0]);
 	pdx->m_VideoInfo[index].dwisRuning = 1;
 	pdx->m_VideoInfo[index].m_nVideoIndex =0;
@@ -5863,6 +5949,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		gdev->audio[i].index = i;
 		gdev->audio[i].dev = gdev;
 		spin_lock_init(&gdev->audio[i].ring_lock);
+		spin_lock_init(&gdev->tstats[i].fold_lock);
 		INIT_WORK(&gdev->audio[i].audiowork,audio_data_process);
 		INIT_DELAYED_WORK(&gdev->audio[i].silence_work, hws_audio_silence_work);
 	}

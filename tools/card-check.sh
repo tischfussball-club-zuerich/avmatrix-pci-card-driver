@@ -6,7 +6,11 @@
 #      size (direct path) and one at a different, scaled size (ring + conversion)
 #   2. all channels with a signal at once, plus audio on every card at the same
 #      time - the real streaming load - with CPU use and the driver's threads
-#   3. the driver's own drop counters and problem messages from the kernel log
+#   3. more behaviour (EXTRA=0 skips it): picture controls reach the picture,
+#      the scaled picture matches the input, user-pointer buffers, two apps on
+#      one channel, capture under full CPU load, apps killed at random moments
+#      (no hang, no crash, the channel keeps working), the audio sample clock
+#   4. the driver's own drop counters and problem messages from the kernel log
 #
 #   tools/card-check.sh                  # 10 s captures
 #   DUR=60 tools/card-check.sh           # longer captures (each phase)
@@ -21,8 +25,13 @@ set -u
 DUR=${DUR:-10}
 SCALE_DUR=${SCALE_DUR:-$(( DUR < 10 ? DUR : 10 ))}
 SKIP_COMPLIANCE=${SKIP_COMPLIANCE:-0}
+EXTRA=${EXTRA:-1}
+CHAOS=${CHAOS:-30}	# kill-test rounds
+ADUR=${ADUR:-20}	# audio clock measurement, seconds
 TMP=$(mktemp -d /tmp/hws-check.XXXXXX)
-trap 'rm -rf "$TMP"' EXIT
+LOAD_PIDS=()
+stop_load() { [ ${#LOAD_PIDS[@]} -eq 0 ] || { kill "${LOAD_PIDS[@]}"; wait "${LOAD_PIDS[@]}"; } 2>/dev/null; LOAD_PIDS=(); }
+trap 'stop_load; rm -rf "$TMP"' EXIT
 # kernel messages after a point in time. Timestamps, not line counts: once the
 # kernel's log buffer is full, old lines drop out as new ones arrive.
 dmesg_now() { dmesg 2>/dev/null | tail -1 | sed -n 's/^\[ *\([0-9.]*\)\].*/\1/p'; }
@@ -63,6 +72,37 @@ analyze() {
 		      if (cnt < want * 0.95 || lost > 0 || dup > 0 || wrong) exit 1 }' "$1"
 }
 
+# grid <YUYV frame> <width> <height> [x0 y0 w h]: average Y, U, V of an 8 x 6 grid
+# of cells over the frame (or a region of it), one cell per line. Every 4th row
+# and every 4th pixel pair: plenty for averages, and fast enough in awk.
+grid() {
+	od -An -tu1 -v -w$(( $2 * 2 )) "$1" | awk -v W="$2" -v H="$3" -v X0="${4:-0}" -v Y0="${5:-0}" -v CW="${6:-$2}" -v CH="${7:-$3}" '
+		(NR - 1) % 4 { next }
+		{ r = NR - 1; if (r < Y0 || r >= Y0 + CH) next
+		  gy = int((r - Y0) * 6 / CH)
+		  for (x = X0; x < X0 + CW; x += 8) {
+			i = x * 2 + 1; gx = int((x - X0) * 8 / CW); c = gy * 8 + gx
+			y[c] += $i + $(i + 2); u[c] += $(i + 1); v[c] += $(i + 3); n[c]++ } }
+		END { for (c = 0; c < 48; c++) if (n[c]) printf "%.2f %.2f %.2f\n", y[c] / n[c] / 2, u[c] / n[c], v[c] / n[c]; else print "0 0 0" }'
+}
+# corr <grid a> <grid b> <column 1-3>: correlation of the cells, and the spread
+# (standard deviation) of grid a, so a uniform picture can be told apart
+corr() {
+	paste -d' ' "$1" "$2" | awk -v c="$3" '
+		{ a = $c; b = $(c + 3); n++; sa += a; sb += b; saa += a * a; sbb += b * b; sab += a * b }
+		END { va = saa / n - (sa / n) ^ 2; vb = sbb / n - (sb / n) ^ 2
+		      r = 0; if (va > 0 && vb > 0) r = (sab / n - sa / n * sb / n) / sqrt(va * vb)
+		      sd = 0; if (va > 0) sd = sqrt(va)
+		      printf "%.3f %.1f\n", r, sd }'
+}
+# grab <device> <file> [<fmt>]: one frame, after the pipeline has settled
+grab() {
+	rm -f "$2"
+	timeout -s INT 20 v4l2-ctl -d "$1" ${3:+--set-fmt-video=$3} --stream-mmap=4 --stream-skip=10 --stream-count=1 --stream-to="$2" >/dev/null 2>&1
+}
+# card name of channel N (HAudioN), if there is one
+audio_of() { local c; for c in $cards; do [ "$c" = "HAudio$1" ] && echo "$c"; done; }
+
 for t in v4l2-ctl arecord; do
 	command -v $t >/dev/null || { say "missing $t (install v4l-utils / alsa-utils)"; exit 2; }
 done
@@ -76,6 +116,7 @@ for d in /dev/video*; do
 done
 [ ${#nodes[@]} -gt 0 ] || { say "no HwsCapture video devices found"; exit 2; }
 say "== ${#nodes[@]} video channel(s): ${nodes[*]}"
+cards=$(arecord -l 2>/dev/null | sed -n 's/^card [0-9]*: \(HAudio[0-9]*\) .*/\1/p')
 
 # ---------------------------------------------------------------- 1. per channel
 sig_nodes=()
@@ -137,12 +178,67 @@ for d in "${nodes[@]}"; do
 	elif [ "$vals" -lt 16 ]; then say "   scaled frame: only $vals different byte values (blank picture? check the source)"
 	else say "   scaled frame: $size bytes, $vals different byte values"; fi
 	res "${KEY[$d]}.picture values=$vals"
+
+	if [ "$EXTRA" = 1 ]; then
+		# the scaled picture must show the input: compare the brightness and colour
+		# of an 8 x 6 grid (the part of the input the scaler shows: the centre,
+		# cropped to the output's aspect ratio). A moving source lowers the match
+		# a little, a broken scaler (squeezed, shifted, U/V swapped) a lot.
+		if [ "$size" -eq $((sw * sh * 2)) ] && grab "$d" "$TMP/in.yuv" "$saved_fmt" &&
+		   [ "$(stat -c %s "$TMP/in.yuv" 2>/dev/null || echo 0)" -eq $((w * h * 2)) ]; then
+			read -r cx cy cw ch < <(awk -v w=$w -v h=$h -v sw=$sw -v sh=$sh 'BEGIN {
+				if (w * sh > h * sw) { cw = int(h * sw / sh); ch = h } else { cw = w; ch = int(w * sh / sw) }
+				printf "%d %d %d %d", int((w - cw) / 4) * 2, int((h - ch) / 2), cw, ch }')
+			grid "$TMP/in.yuv" $w $h $cx $cy $cw $ch > "$TMP/g.in"
+			grid "$TMP/frame.yuv" $sw $sh > "$TMP/g.sc"
+			read -r cy_ sy < <(corr "$TMP/g.in" "$TMP/g.sc" 1)
+			read -r cu su < <(corr "$TMP/g.in" "$TMP/g.sc" 2)
+			read -r cv sv < <(corr "$TMP/g.in" "$TMP/g.sc" 3)
+			say "   scaled vs. input picture: match brightness $cy_, colour U $cu V $cv (1 = same; spread of the input: $sy / $su / $sv)"
+			res "${KEY[$d]}.scalecheck luma=$cy_ u=$cu v=$cv"
+			awk -v c=$cy_ -v s=$sy 'BEGIN { exit !(s >= 4 && c < 0.5) }' && bad "the scaled picture doesn't match the input on $d (brightness match $cy_)"
+			awk -v c=$cy_ -v s=$sy 'BEGIN { exit !(s >= 4 && c >= 0.5 && c < 0.95) }' &&
+				say "   note: brightness match below 0.95: a moving picture, or a scaler that squeezes or shifts it"
+			awk -v c=$cy_ -v s=$sy 'BEGIN { exit !(s < 4) }' && say "   (the input is nearly uniform: show something with contrast for a meaningful scaler check)"
+			for x in "U $cu $su" "V $cv $sv"; do read -r nm c sp <<< "$x"
+				awk -v c=$c -v s=$sp 'BEGIN { exit !(s >= 3 && c < 0.5) }' && bad "the scaled picture's colour ($nm) doesn't match the input on $d (match $c)"
+			done
+		else
+			say "   scaled vs. input picture: could not grab both frames"
+		fi
+
+		# picture controls must change the picture (in the original driver they
+		# never reached the card): brightness at its minimum and its maximum
+		bline=$(v4l2-ctl -d "$d" --list-ctrls 2>/dev/null | grep -E '^ *brightness ')
+		bmin=$(printf '%s' "$bline" | sed -n 's/.*min=\(-*[0-9]*\).*/\1/p')
+		bmax=$(printf '%s' "$bline" | sed -n 's/.*max=\(-*[0-9]*\).*/\1/p')
+		bval=$(printf '%s' "$bline" | sed -n 's/.*value=\(-*[0-9]*\).*/\1/p')
+		if [ -n "$bmin" ] && [ -n "$bmax" ] && [ -n "$bval" ]; then
+			ylo=-1; yhi=-1
+			v4l2-ctl -d "$d" --set-ctrl=brightness=$bmin 2>/dev/null && grab "$d" "$TMP/b.yuv" "$saved_fmt" &&
+				ylo=$(grid "$TMP/b.yuv" $w $h | awk '{ s += $1 } END { printf "%.1f", s / NR }')
+			v4l2-ctl -d "$d" --set-ctrl=brightness=$bmax 2>/dev/null && grab "$d" "$TMP/b.yuv" "$saved_fmt" &&
+				yhi=$(grid "$TMP/b.yuv" $w $h | awk '{ s += $1 } END { printf "%.1f", s / NR }')
+			v4l2-ctl -d "$d" --set-ctrl=brightness=$bval 2>/dev/null
+			bd=$(awk -v a=$ylo -v b=$yhi 'BEGIN { printf "%.1f", (a < 0 || b < 0) ? -1 : b - a }')
+			say "   brightness control: average brightness $ylo at the minimum, $yhi at the maximum"
+			res "${KEY[$d]}.controls low=$ylo high=$yhi diff=$bd"
+			awk -v x=$bd 'BEGIN { exit !(x < 8) }' && bad "the brightness control doesn't change the picture on $d"
+		else
+			say "   brightness control: not found"
+			res "${KEY[$d]}.controls diff=-1"
+		fi
+
+		# user-pointer buffers (the app's own memory instead of the driver's)
+		n=$(awk -v f="$fps" -v t="$SCALE_DUR" 'BEGIN { printf "%d", f * t }')
+		timeout -s INT $(cap_limit $SCALE_DUR) v4l2-ctl -d "$d" --set-fmt-video="$saved_fmt" --stream-user=4 --stream-count="$n" --stream-to=/dev/null --verbose > "$TMP/user" 2>&1
+		analyze "$TMP/user" "$n" "$fps" $((w * h * 2)) "user-pointer buffers, ${SCALE_DUR} s" "${KEY[$d]}.userptr" || bad "capture with user-pointer buffers failed on $d"
+	fi
 	v4l2-ctl -d "$d" --set-fmt-video="$saved_fmt" 2>/dev/null
 done
 
 # ---------------------------------------------------------------- 2. everything at once
 say ""
-cards=$(arecord -l 2>/dev/null | sed -n 's/^card [0-9]*: \(HAudio[0-9]*\) .*/\1/p')
 if [ ${#sig_nodes[@]} -gt 0 ]; then
 	say "== all at once for $DUR s: ${#sig_nodes[@]} video channel(s) with signal + audio on $(echo $cards | wc -w) card(s)"
 	cpu() { awk '/^cpu / { idle = $5 + $6; tot = 0; for (i = 2; i <= NF; i++) tot += $i; print tot, idle }' /proc/stat; }
@@ -201,7 +297,132 @@ else
 	done
 fi
 
-# ---------------------------------------------------------------- 3. kernel log
+# ---------------------------------------------------------------- 3. more behaviour
+# frames wanted for <seconds> on <device>
+alive() { local st; st=$(awk '{ print $3 }' "/proc/$1/stat" 2>/dev/null); [ -n "$st" ] && [ "$st" != Z ]; }
+want_for() { awk -v f="${FPS[$1]}" -v t="$2" 'BEGIN { printf "%d", f * t }'; }
+if [ "$EXTRA" = 1 ] && [ ${#sig_nodes[@]} -gt 0 ]; then
+	d=${sig_nodes[0]}
+	dn=$(basename "$d")
+	w=$(v4l2-ctl -d "$d" --get-fmt-video | sed -n 's/.*Width\/Height *: *\([0-9]*\)\/.*/\1/p')
+	h=$(v4l2-ctl -d "$d" --get-fmt-video | sed -n 's/.*Width\/Height *: *[0-9]*\/\([0-9]*\).*/\1/p')
+
+	# two applications on the same channel: each must get every frame
+	say ""
+	say "== two applications on $d at once, $SCALE_DUR s"
+	n=$(want_for "$d" "$SCALE_DUR")
+	timeout -s INT $(cap_limit $SCALE_DUR) v4l2-ctl -d "$d" --stream-mmap=4 --stream-count="$n" --stream-to=/dev/null --verbose > "$TMP/app1" 2>&1 &
+	p1=$!
+	timeout -s INT $(cap_limit $SCALE_DUR) v4l2-ctl -d "$d" --stream-mmap=4 --stream-count="$n" --stream-to=/dev/null --verbose > "$TMP/app2" 2>&1 &
+	p2=$!
+	wait $p1 $p2
+	analyze "$TMP/app1" "$n" "${FPS[$d]}" $((w * h * 2)) "application 1" "${KEY[$d]}.app1" || bad "application 1 of 2 lost frames on $d"
+	analyze "$TMP/app2" "$n" "${FPS[$d]}" $((w * h * 2)) "application 2" "${KEY[$d]}.app2" || bad "application 2 of 2 lost frames on $d"
+
+	# every channel while all CPUs are busy (half pure computing, half memory
+	# traffic): the driver's real-time copy threads must still get every frame
+	say ""
+	say "== all channels with a signal while every CPU is busy, $SCALE_DUR s"
+	for i in $(seq 1 "$(nproc)"); do
+		if [ $((i % 2)) = 1 ]; then yes > /dev/null & else dd if=/dev/zero of=/dev/null bs=16M 2>/dev/null & fi
+		LOAD_PIDS+=($!)
+	done
+	sleep 1
+	pids=()
+	for x in "${sig_nodes[@]}"; do
+		n=$(want_for "$x" "$SCALE_DUR")
+		timeout -s INT $(cap_limit $SCALE_DUR) v4l2-ctl -d "$x" --stream-mmap=4 --stream-count="$n" --stream-to=/dev/null --verbose > "$TMP/load.$(basename "$x")" 2>&1 &
+		pids+=($!)
+	done
+	wait "${pids[@]}"
+	stop_load
+	for x in "${sig_nodes[@]}"; do
+		n=$(want_for "$x" "$SCALE_DUR")
+		xw=$(v4l2-ctl -d "$x" --get-fmt-video | sed -n 's/.*Width\/Height *: *\([0-9]*\)\/.*/\1/p')
+		xh=$(v4l2-ctl -d "$x" --get-fmt-video | sed -n 's/.*Width\/Height *: *[0-9]*\/\([0-9]*\).*/\1/p')
+		analyze "$TMP/load.$(basename "$x")" "$n" "${FPS[$x]}" $((xw * xh * 2)) "$x" "${KEY[$x]}.loaded" || bad "frames lost on $x under CPU load"
+	done
+
+	# applications killed at random moments (while starting, streaming, two at
+	# once, with audio): no hang, no crash, and the channel keeps working.
+	# Another channel streams all the while and must not notice.
+	say ""
+	obs=${sig_nodes[1]:-}
+	say "== kill test: $CHAOS rounds of applications on $d killed at random moments${obs:+ (meanwhile $obs streams)}"
+	ac=$(audio_of "${KEY[$d]#ch}")
+	if [ -n "$obs" ]; then
+		timeout -s INT $((CHAOS * 3 + 60)) v4l2-ctl -d "$obs" --stream-mmap=4 --stream-to=/dev/null --verbose > "$TMP/obs" 2>&1 &
+		opid=$!
+		ot0=$(date +%s.%N)
+	fi
+	hung=0; kills=0
+	# (stderr off: bash reports every killed job; bad() writes to stdout)
+	for i in $(seq 1 "$CHAOS"); do
+		vp=()
+		mode=$((RANDOM % 4))
+		v4l2-ctl -d "$d" $([ $mode = 1 ] && echo --stream-user=4 || echo --stream-mmap=4) --stream-to=/dev/null > /dev/null 2>&1 &
+		vp+=($!)
+		[ $mode -ge 2 ] && { v4l2-ctl -d "$d" --stream-mmap=2 --stream-to=/dev/null > /dev/null 2>&1 & vp+=($!); }
+		[ $mode = 3 ] && [ -n "$ac" ] && { arecord -q -D "hw:CARD=$ac" -f S16_LE -r 48000 -c 2 /dev/null > /dev/null 2>&1 & vp+=($!); }
+		# 0 - 1 s: sometimes while the app is still opening and setting up
+		sleep "0.$(printf '%03d' $((RANDOM % 1000)))"
+		for p in "${vp[@]}"; do
+			kill -9 "$p" 2>/dev/null; kills=$((kills + 1))
+			sleep "0.0$((RANDOM % 10))"
+		done
+		# a killed process that doesn't go away is stuck in the driver (one that
+		# has exited is a zombie until it's reaped: that counts as gone)
+		for p in "${vp[@]}"; do
+			for _ in $(seq 1 50); do alive "$p" || break; sleep 0.1; done
+			if alive "$p"; then
+				hung=$((hung + 1))
+				bad "a killed application (pid $p) is still there after 5 s: $(cat /proc/$p/wchan 2>/dev/null) $(awk '{ print "state " $3 }' /proc/$p/stat 2>/dev/null)"
+			fi
+			wait "$p"
+		done
+	done 2>/dev/null
+	say "   $kills applications killed, $hung stuck"
+	res "chaos kills=$kills hung=$hung"
+	n=$(want_for "$d" 2)
+	timeout -s INT $(cap_limit 2) v4l2-ctl -d "$d" --stream-mmap=4 --stream-count="$n" --stream-to=/dev/null --verbose > "$TMP/after" 2>&1
+	analyze "$TMP/after" "$n" "${FPS[$d]}" $((w * h * 2)) "$d afterwards, 2 s" "${KEY[$d]}.after" || bad "$d doesn't work properly after the kill test"
+	if [ -n "$obs" ]; then
+		kill -INT "$opid" 2>/dev/null; wait "$opid" 2>/dev/null
+		# frames for the time it ran, less a second for its start
+		n=$(awk -v f="${FPS[$obs]}" -v a="$ot0" -v b="$(date +%s.%N)" 'BEGIN { printf "%d", f * (b - a - 1) }')
+		ow=$(v4l2-ctl -d "$obs" --get-fmt-video | sed -n 's/.*Width\/Height *: *\([0-9]*\)\/.*/\1/p')
+		oh=$(v4l2-ctl -d "$obs" --get-fmt-video | sed -n 's/.*Width\/Height *: *[0-9]*\/\([0-9]*\).*/\1/p')
+		analyze "$TMP/obs" "$n" "${FPS[$obs]}" $((ow * oh * 2)) "$obs during the kill test" "${KEY[$obs]}.observer" || bad "$obs lost frames while applications on $d were killed"
+	fi
+fi
+
+# the audio sample clock of every card (also without a signal, where the
+# driver supplies the silence): $ADUR s of samples must take $ADUR s
+if [ "$EXTRA" = 1 ] && [ -n "$cards" ]; then
+	say ""
+	say "== audio clock: $ADUR s from every card at once"
+	pids=()
+	for c in $cards; do
+		( t0=$(date +%s%N)
+		  timeout -s INT $((ADUR * 2 + 15)) arecord -q -D "hw:CARD=$c" -f S16_LE -r 48000 -c 2 -t raw -d "$ADUR" "$TMP/a.$c.raw" > "$TMP/a.$c.log" 2>&1
+		  echo "$? $(( $(date +%s%N) - t0 ))" > "$TMP/a.$c.t" ) &
+		pids+=($!)
+	done
+	wait "${pids[@]}"
+	for c in $cards; do
+		read -r rc ns < "$TMP/a.$c.t"
+		bytes=$(stat -c %s "$TMP/a.$c.raw" 2>/dev/null || echo 0)
+		# samples per second of wall time (the start of arecord costs a few ms)
+		rate=$(awk -v b=$bytes -v ns=$ns 'BEGIN { r = 0; if (ns > 0) r = b / 4 / (ns / 1e9); printf "%.0f", r }')
+		peak=$(head -c 1920000 "$TMP/a.$c.raw" 2>/dev/null | od -An -td2 -v | awk '{ for (i = 1; i <= NF; i++) { v = $i < 0 ? -$i : $i; if (v > m) m = v } } END { print m + 0 }')
+		say "   $c: $bytes bytes in $(awk -v ns=$ns 'BEGIN { printf "%.2f", ns / 1e9 }') s = $rate samples/s, loudest sample $peak$([ "$peak" = 0 ] && echo ' (silence)')"
+		res "aclock.$c rate=$rate peak=$peak"
+		if [ "$rc" != 0 ] || [ "$bytes" -lt $((ADUR * 48000 * 4)) ]; then bad "$c: audio capture incomplete (arecord exit $rc, $bytes bytes): $(head -c 200 "$TMP/a.$c.log")"
+		elif [ "$rate" -lt 47520 ] || [ "$rate" -gt 48480 ]; then bad "$c: audio runs at $rate samples/s instead of 48000"; fi
+	done
+fi
+
+# ---------------------------------------------------------------- 4. kernel log
 say ""
 if [ $dmesg_ok = 0 ]; then
 	say "== kernel messages: not readable (run as root, or: sudo dmesg | grep -i hwscapture)"

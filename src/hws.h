@@ -383,6 +383,8 @@ struct hws_audio{
 	 * keeps the stream moving instead of stalling into an I/O error */
 	struct delayed_work		silence_work;
 	atomic64_t			last_real_ns;	/* last packet from the card (no torn reads on 32-bit) */
+	atomic_t			pkts_card;	/* audio packets delivered: from the card, */
+	atomic_t			pkts_silence;	/* and silence filled in by the driver */
 	u64				silence_next_ns;	/* silence_work only: next silent packet due */
 	int						pos;
 	int						index;
@@ -408,6 +410,11 @@ struct hws_audio{
  * irq/irq-thread/worker are not serialized against the reset; good enough
  * for diagnostics.
  */
+/* counters of hws_timing_stats, in hws_tstat_counters() order */
+enum { HWS_ST_IN, HWS_ST_OUT, HWS_ST_IRQ_BUSY, HWS_ST_STALE, HWS_ST_OVERRUN, HWS_ST_DIRECT,
+       HWS_ST_OVERWRITE, HWS_ST_COALESCED, HWS_ST_NO_BUF, HWS_ST_EMPTY, HWS_ST_SKIP,
+       HWS_ST_UNPAIRED, HWS_ST_N };
+
 struct hws_timing_stats {
 	atomic_t	frames_in;	/* complete frames committed to the ring */
 	atomic_t	frames_out;	/* frames handed to at least one app buffer */
@@ -432,6 +439,10 @@ struct hws_timing_stats {
 	u32		last_half0_cnt;	/* second-half interrupts seen at the last report */
 	atomic64_t	rate_sum_ns;	/* regular frame intervals, for the exact input rate */
 	atomic_t	rate_n;
+	/* totals since the driver loaded (the counters above are per report
+	 * window); fold_lock moves window counts into them atomically for readers */
+	spinlock_t	fold_lock;
+	u64		tot[HWS_ST_N];
 };
 
 struct hws_pcie_dev {
