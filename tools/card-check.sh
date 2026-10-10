@@ -33,8 +33,10 @@ TMP=$(mktemp -d /tmp/hws-check.XXXXXX)
 LOAD_PIDS=()
 stop_load() { [ ${#LOAD_PIDS[@]} -eq 0 ] || { kill "${LOAD_PIDS[@]}"; wait "${LOAD_PIDS[@]}"; } 2>/dev/null; LOAD_PIDS=(); }
 # background captures ignore Ctrl-C (non-interactive shell): end them too, or they
-# keep the device busy and the driver can't be unloaded afterwards
-trap 'stop_load; kill $(jobs -p) 2>/dev/null; rm -rf "$TMP"' EXIT
+# keep the device busy and the driver can't be unloaded afterwards. Their children
+# as well: timeout runs in its own process group, out of reach of the job's signal
+end_jobs() { local p; for p in $(jobs -p); do pkill -TERM -P "$p"; kill "$p"; done 2>/dev/null; }
+trap 'stop_load; end_jobs; rm -rf "$TMP"' EXIT
 # kernel messages after a point in time. Timestamps, not line counts: once the
 # kernel's log buffer is full, old lines drop out as new ones arrive.
 dmesg_now() { dmesg 2>/dev/null | tail -1 | sed -n 's/^\[ *\([0-9.]*\)\].*/\1/p'; }

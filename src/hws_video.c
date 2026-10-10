@@ -3210,7 +3210,7 @@ static void hws_audio_silence_work(struct work_struct *work)
 		 * drop the backlog instead of catching up */
 		if ((s64)(drv->silence_next_ns - (last + pkt_ns)) < 0)
 			drv->silence_next_ns = last + pkt_ns;
-		if ((s64)(now - drv->silence_next_ns) >= (s64)(burst * pkt_ns))	/* signed: "next" is usually ahead */
+		if ((s64)(now - drv->silence_next_ns) >= (s64)((burst + 2) * pkt_ns))	/* signed: "next" is usually ahead */
 			drv->silence_next_ns = now - (burst - 1) * pkt_ns;
 		for (n = 0; n < burst && (s64)(now - drv->silence_next_ns) >= 0; n++)
 		{
@@ -3226,11 +3226,12 @@ static void hws_audio_silence_work(struct work_struct *work)
 	 * could first be long enough, at most 125 ms on (a lost signal shortens
 	 * the gap that counts), instead of waking every other packet.
 	 */
-	if (filling)
-		delay_ns = pkt_ns;
+	if (filling)	/* at the next packet's time, so wake-up delays don't add up */
+		delay_ns = max_t(s64, (s64)(drv->silence_next_ns - ktime_get_ns()), 1);
 	else
 		delay_ns = clamp_t(s64, (s64)(last + gap_ns - now), 2 * pkt_ns, 125 * NSEC_PER_MSEC);
-	queue_delayed_work(pdx->wq, &drv->silence_work, max_t(unsigned long, 1, nsecs_to_jiffies(delay_ns)));
+	queue_delayed_work(pdx->wq, &drv->silence_work,
+			   max_t(unsigned long, 1, DIV_ROUND_UP_ULL((u64)delay_ns, NSEC_PER_SEC / HZ)));
 }
 
 /* deliveries run in the IRQ thread and the silence work: wait for one in progress */
@@ -3760,6 +3761,7 @@ static void hws_dev_release(struct kref *kref)
 		cancel_delayed_work_sync(&pdx->audio[i].silence_work);
 	if (pdx->wq)
 		destroy_workqueue(pdx->wq);
+	kfree(pdx->pci_state);
 	pci_dev_put(pdx->pdev);
 	kfree(pdx);
 }
@@ -5575,10 +5577,11 @@ static bool hws_card_reachable(struct hws_pcie_dev *pdx)
 	if (pci_read_config_word(pdx->pdev, PCI_COMMAND, &cmd) == 0 && !(cmd & PCI_COMMAND_MEMORY))
 	{
 		mutex_lock(&pdx->pm_lock);
-		if (!pdx->suspended && !READ_ONCE(pdx->removing))
+		/* never save here: the card's own (empty) state would replace the good one */
+		if (!pdx->suspended && !READ_ONCE(pdx->removing) && pdx->pci_state &&
+		    pci_load_saved_state(pdx->pdev, pdx->pci_state) == 0)
 		{
 			pci_restore_state(pdx->pdev);
-			pci_save_state(pdx->pdev);	/* a restore uses the saved copy up */
 			pdx->need_bringup = true;
 		}
 		mutex_unlock(&pdx->pm_lock);
@@ -5644,7 +5647,7 @@ static int MainKsThreadHandle(void *arg)
 		 * a second, so the default format matches the input before an app opens
 		 * the device (a few register reads) */
 		if((need_check==1 && hws_card_reachable(pdx)) ||
-		   (READ_ONCE(pdx->need_bringup) && pci_device_is_present(pdx->pdev)) ||
+		   (READ_ONCE(pdx->need_bringup) && pci_device_is_present(pdx->pdev) && hws_card_reachable(pdx)) ||
 		   (tick % 4 == 0 && !READ_ONCE(pdx->need_bringup) &&
 		    pci_device_is_present(pdx->pdev) && hws_card_reachable(pdx)))
 		{
@@ -6171,8 +6174,10 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		dev_err(&pdev->dev, "cannot get IRQ %d: %d\n", pdev->irq, err);
 		goto err_mem;
 	}
-	/* restored if the card comes back after a reset (link down, power loss) */
+	/* restored if the card comes back after a reset (link down, power loss);
+	 * our own copy: the PCI core's saved state is used up by its own restores */
 	pci_save_state(pdev);
+	gdev->pci_state = pci_store_saved_state(pdev);
 	InitVideoSys(gdev,0);
 	StartKSThread(gdev);
 
@@ -6309,7 +6314,16 @@ static int __maybe_unused hws_resume(struct device *dev)
 		return 0;
 	}
 	hws_hw_bringup(pdx);
-	pci_save_state(pdx->pdev);	/* the PM core's restore used up the copy saved at probe */
+	if (pci_save_state(pdx->pdev) == 0)	/* a working card: refresh our copy */
+	{
+		struct pci_saved_state *st = pci_store_saved_state(pdx->pdev);
+
+		if (st)
+		{
+			kfree(pdx->pci_state);
+			pdx->pci_state = st;
+		}
+	}
 	for (i = 0; i < pdx->m_nCurreMaxVideoChl; i++)
 		if (pdx->video[i].engine_users > 0)
 			StartVideoCapture(pdx, i);

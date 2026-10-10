@@ -77,6 +77,8 @@ extern atomic_long sim_ratelimited_warnings;
 #define div64_u64(a, b) ((u64)(a) / (b))
 #define msecs_to_jiffies(ms) (ms)
 #define nsecs_to_jiffies(ns) ((unsigned long)((ns) / NSEC_PER_MSEC))	/* jiffies are ms here */
+#define HZ 1000
+#define DIV_ROUND_UP_ULL(n, d) (((unsigned long long)(n) + (d) - 1) / (d))
 
 static inline u64 ktime_get_ns(void)
 {

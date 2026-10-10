@@ -455,6 +455,7 @@ struct hws_timing_stats {
 
 struct hws_pcie_dev {
 	struct pci_dev			*pdev;
+	struct pci_saved_state		*pci_state;	/* config space of a working card, for a reset one */
 	struct kref			kref;		/* probe + one per registered v4l2_device */
 	spinlock_t			reg_lock;	/* read-modify-write of shared control registers */
 	bool				removing;	/* hws_remove() started, hardware is going away */

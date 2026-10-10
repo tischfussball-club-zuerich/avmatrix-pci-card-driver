@@ -208,7 +208,7 @@ restore() {
 	fi
 	say "== restoring the original driver"
 	# a capture that is still closing can hold the device for a moment
-	for i in 1 2 3 4 5; do
+	for i in 1 2 3 4 5 6 7 8 9 10; do
 		[ -d /sys/module/HwsCapture ] || break
 		sudo rmmod HwsCapture 2>/dev/null && break
 		sleep 1
