@@ -1300,7 +1300,13 @@ static void SetNoVideoMem(uint8_t * pDest, int  w,int h)
  * runtime happens under ring_lock and only while the stream runs, so a
  * concurrent STOP/close can't free dma_area underneath us.
  */
-static void _deliver_samples(struct hws_audio *drv, const u8 *aud_data, u32 aud_len)
+/*
+ * fill_after 0: a packet from the card (its time is noted in the same locked
+ * step). Otherwise silence, written only if no real packet came since
+ * last_real_ns was fill_after - checked under the lock, so a real packet can't
+ * slip in between and get silence after it. Returns false if skipped for that.
+ */
+static bool _deliver_samples(struct hws_audio *drv, const u8 *aud_data, u32 aud_len, u64 fill_after)
 {
 	struct snd_pcm_substream *substream;
 	struct snd_pcm_runtime *runtime;
@@ -1309,13 +1315,19 @@ static void _deliver_samples(struct hws_audio *drv, const u8 *aud_data, u32 aud_
 	int elapsed = 0;
 
 	spin_lock_irqsave(&drv->ring_lock, flags);
+	if (!fill_after)
+		atomic64_set(&drv->last_real_ns, ktime_get_ns());
+	else if (atomic64_read(&drv->last_real_ns) != fill_after) {
+		spin_unlock_irqrestore(&drv->ring_lock, flags);
+		return false;
+	}
 	substream = drv->substream;
 	runtime = substream ? substream->runtime : NULL;
 	if (!drv->running || !runtime || !runtime->dma_area ||
 	    drv->ring_size_byframes == 0 || drv->period_size_byframes == 0 ||
 	    drv->channels == 0) {
 		spin_unlock_irqrestore(&drv->ring_lock, flags);
-		return;
+		return true;
 	}
 
 	frame_bytes = 2 * drv->channels;
@@ -1340,6 +1352,7 @@ static void _deliver_samples(struct hws_audio *drv, const u8 *aud_data, u32 aud_
 	/* outside ring_lock: this may call back into trigger(STOP) and pointer() */
 	if (elapsed)
 		snd_pcm_period_elapsed(substream);
+	return true;
 }
 
 static void audio_data_process(struct work_struct *p_work)
@@ -1378,8 +1391,7 @@ static void audio_data_process(struct work_struct *p_work)
 
 		if (bBuf && aud_len > 0)
 		{
-			atomic64_set(&drv->last_real_ns, ktime_get_ns());
-			_deliver_samples(drv, bBuf, aud_len);
+			_deliver_samples(drv, bBuf, aud_len, 0);
 			atomic_inc(&drv->pkts_card);
 		}
 
@@ -3176,7 +3188,7 @@ static void hws_audio_silence_work(struct work_struct *work)
 	struct hws_pcie_dev *pdx = drv->dev;
 	unsigned int bytes = min_t(unsigned int, pdx->m_dwAudioPTKSize, sizeof(hws_silence));
 	u64 pkt_ns = div_u64((u64)(bytes / 4) * NSEC_PER_SEC, 48000);	/* S16 stereo: 4 bytes per frame */
-	u64 last = atomic64_read(&drv->last_real_ns), now = ktime_get_ns();	/* last first: now >= last */
+	u64 last, now;
 	/*
 	 * No signal: the card sends nothing, fill at once. With a signal, a gap
 	 * is usually just late delivery - inserting silence then would push the
@@ -3190,10 +3202,13 @@ static void hws_audio_silence_work(struct work_struct *work)
 	s64 delay_ns;
 	int n, burst, ring_pkts;
 
+	/* under the lock: START sets the timing and running together */
 	spin_lock_irqsave(&drv->ring_lock, flags);
 	running = drv->running;
 	ring_frames = drv->ring_size_byframes;
+	last = atomic64_read(&drv->last_real_ns);
 	spin_unlock_irqrestore(&drv->ring_lock, flags);
+	now = ktime_get_ns();	/* after last: now >= last */
 	if (!running || !pkt_ns)
 		return;
 	/*
@@ -3218,9 +3233,8 @@ static void hws_audio_silence_work(struct work_struct *work)
 			drv->silence_next_ns = now - (burst - 1) * pkt_ns;
 		for (n = 0; n < burst && (s64)(now - drv->silence_next_ns) >= 0; n++)
 		{
-			if (atomic64_read(&drv->last_real_ns) != last)
+			if (!_deliver_samples(drv, hws_silence, bytes, last))
 				break;	/* the card is sending again */
-			_deliver_samples(drv, hws_silence, bytes);
 			atomic_inc(&drv->pkts_silence);
 			drv->silence_next_ns += pkt_ns;
 		}
@@ -3310,10 +3324,12 @@ static int hws_pcie_audio_trigger(struct snd_pcm_substream *substream, int cmd)
 			spin_lock_irqsave(&chip->ring_lock, flags);
 			chip->ring_wpos_byframes = 0;
 			chip->period_used_byframes = 0;
-			chip->running = true;
-			spin_unlock_irqrestore(&chip->ring_lock, flags);
+			/* fresh timing before running is seen: a silence work queued late
+			 * by the status thread must not fill from the last run's state */
 			atomic64_set(&chip->last_real_ns, ktime_get_ns());
 			chip->silence_next_ns = 0;
+			chip->running = true;
+			spin_unlock_irqrestore(&chip->ring_lock, flags);
 			/* not racing a cancel: ALSA's prepare (which cancels synchronously)
 			 * always comes between a STOP and the next START */
 			mod_delayed_work(dev->wq, &chip->silence_work, msecs_to_jiffies(64));
