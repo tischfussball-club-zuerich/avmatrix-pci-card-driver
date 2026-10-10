@@ -703,7 +703,12 @@ static void *status_thread(void *a)
 		for (int ch = 0; ch < NCH; ch++) {
 			/* source events: loss of signal or a mode change every few seconds;
 			 * on ch0 in 10 s bursts with 10 s calm in between (the driver needs
-			 * a stable source for a few seconds to measure its exact rate) */
+			 * two agreeing 3.3 s windows of a stable source for its exact rate).
+			 * A calm period starts with a signal: a burst may end with it off */
+			if (ch == 0 && tick % 40 == 0 && (tick / 40) % 2 == 1 && !atomic_load(&src_present[0])) {
+				atomic_store(&src_present[0], 1);
+				atomic_store(&last_src_change[0], ktime_get_ns());
+			}
 			if (tick % 12 == 3 + ch * 4 && (ch != 0 || (tick / 40) % 2 == 0)) {
 				int r = rand_r(&seed) % 3;
 				if (r == 0) {

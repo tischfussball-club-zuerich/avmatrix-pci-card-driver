@@ -274,3 +274,10 @@ typedef int irqreturn_t;
 #define IRQ_WAKE_THREAD 2
 
 #endif
+#define pci_device_is_present(p) (1)	/* the simulated card is never unplugged */
+#define CONFIG_X86 1
+#define PCI_COMMAND 0x04
+#define PCI_COMMAND_MEMORY 0x2
+#define pci_read_config_word(p, off, v) ((void)(p), (void)(off), *(v) = PCI_COMMAND_MEMORY, 0)
+#define IS_ENABLED(x) (x)
+#define dev_warn_ratelimited(d, ...) fprintf(stderr, __VA_ARGS__)

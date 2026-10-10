@@ -21,6 +21,7 @@
 
 typedef unsigned long long u64; typedef unsigned long long __le64;
 typedef unsigned int u32; typedef unsigned int __le32;
+typedef unsigned short u16; typedef unsigned char u8;
 #define le32_to_cpu(x) ((u32)(x))
 #define cpu_to_le64(x) ((__le64)(x))
 #define le64_to_cpu(x) ((u64)(x))
@@ -38,8 +39,10 @@ typedef long long s64;
 #define MAX_VIDEO_QUEUE 4
 #define MAX_MM_VIDEO_SIZE 0x400000
 
+struct hws_scaler;
 typedef struct {
 	BYTE *m_pVideoScalerBuf;
+	struct hws_scaler *m_pScaler;
 	BYTE *m_pVideoYUV2Buf;
 	BYTE *m_pRotateVideoBuf;
 } ACAP_VIDEO_INFO;
@@ -97,7 +100,7 @@ static u64_t fnv(const BYTE *p, size_t n) { u64_t h = 1469598103934665603ULL; wh
 static int run_one(int yv12, int res_w, int res_h, int il, int ow, int oh, int at_end)
 {
 	struct hws_pcie_dev pdx = { .m_Device_SupportYV12 = yv12, .m_MaxHWVideoBufferSize = MAX_MM_VIDEO_SIZE };
-	struct gbuf ring, sc, y2, rot, dst;
+	struct gbuf ring, sc, tab, y2, rot, dst;
 	int in_width = res_w, in_height = res_h, in_vsize, nCopySize, out_size = ow * oh * 2;
 	int needRotateVideo = 0, ok, fault;
 
@@ -119,6 +122,7 @@ static int run_one(int yv12, int res_w, int res_h, int il, int ow, int oh, int a
 
 	galloc(&ring, MAX_MM_VIDEO_SIZE, at_end);
 	galloc(&sc, MAX_VIDEO_HW_W * MAX_VIDEO_HW_H * 2, at_end);
+	galloc(&tab, sizeof(struct hws_scaler), at_end);
 	galloc(&y2, MAX_VIDEO_HW_W * MAX_VIDEO_HW_H * 2, at_end);
 	galloc(&rot, MAX_VIDEO_HW_W * MAX_VIDEO_HW_H * 2, at_end);
 	galloc(&dst, out_size, at_end);	/* exact size: stricter than vb2's page rounding */
@@ -129,6 +133,7 @@ static int run_one(int yv12, int res_w, int res_h, int il, int ow, int oh, int a
 	} else
 		memset(ring.p, 0x5a, ring.len);
 	pdx.m_VideoInfo[0].m_pVideoScalerBuf = sc.p;
+	pdx.m_VideoInfo[0].m_pScaler = getenv("NO_SCALER_TABLES") ? NULL : (struct hws_scaler *)tab.p;
 	pdx.m_VideoInfo[0].m_pVideoYUV2Buf = y2.p;
 	pdx.m_VideoInfo[0].m_pRotateVideoBuf = rot.p;
 
@@ -153,7 +158,7 @@ static int run_one(int yv12, int res_w, int res_h, int il, int ow, int oh, int a
 		       fault == 1 ? "convert" : "novideo", at_end ? "overrun" : "underrun",
 		       yv12, res_w, res_h, il ? "i" : "p", ow, oh);
 	}
-	gfree(&ring); gfree(&sc); gfree(&y2); gfree(&rot); gfree(&dst);
+	gfree(&ring); gfree(&sc); gfree(&tab); gfree(&y2); gfree(&rot); gfree(&dst);
 	n_run++;
 	return fault != 0;
 }
@@ -168,6 +173,7 @@ static double time_case(int yv12, int w, int h, int il, int ow, int oh)
 	int i, n = 60;
 
 	pdx.m_VideoInfo[0].m_pVideoScalerBuf = malloc(1920 * 1080 * 2);
+	pdx.m_VideoInfo[0].m_pScaler = getenv("NO_SCALER_TABLES") ? NULL : malloc(sizeof(struct hws_scaler));
 	pdx.m_VideoInfo[0].m_pVideoYUV2Buf = malloc(1920 * 1080 * 2);
 	pdx.m_VideoInfo[0].m_pRotateVideoBuf = malloc(1920 * 1080 * 2);
 	memset(ring, 0x5a, MAX_MM_VIDEO_SIZE);
@@ -179,7 +185,7 @@ static double time_case(int yv12, int w, int h, int il, int ow, int oh)
 	clock_gettime(CLOCK_MONOTONIC, &b);
 	free(ring); free(dst);
 	free(pdx.m_VideoInfo[0].m_pVideoScalerBuf); free(pdx.m_VideoInfo[0].m_pVideoYUV2Buf);
-	free(pdx.m_VideoInfo[0].m_pRotateVideoBuf);
+	free(pdx.m_VideoInfo[0].m_pRotateVideoBuf); free(pdx.m_VideoInfo[0].m_pScaler);
 	return ((b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6) / n;
 }
 

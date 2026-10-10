@@ -73,7 +73,10 @@ driver made for that card, e.g.
 
 - **Input:** HDMI or SDI (depending on the card), up to 1920×1080 progressive
   or 1080i. Frames are passed through at the input's rate, which the driver
-  reports exactly (59.94 fps as 1001/60000 s per frame, not 60).
+  reports exactly (59.94 fps as 1001/60000 s per frame, not 60). A larger
+  input (e.g. 1920×1200 from a PC) is shown as "no signal", with the card's
+  DMA for that channel switched off until the mode fits, and a message in the
+  kernel log.
 - **Output:** YUYV (4:2:2) at 1920×1080, 1680×1050, 1440×900, 1360×768,
   1280×1024, 1280×800, 1280×768, 1280×720, 1024×768, 800×600, 720×576,
   720×480, 640×480 and 1080×1920 (portrait, rotated). At the input size the
@@ -211,8 +214,12 @@ with a file `/etc/modprobe.d/hwscapture.conf` containing e.g.
 | Parameter | Default | Meaning |
 |---|---|---|
 | `direct_io` | `1` | Copy frames straight from the card into the application's buffer when no conversion is needed. `0`: always go through the driver's internal ring (for comparison). |
-| `nt_copy` | `0` | `1`: on the direct path, write frames with non-temporal stores that bypass the CPU cache. May help with several channels, may cost if the application reads each frame right away; measure on your system. |
+| `nt_copy` | `0` | `1`: on the direct path, write frames with non-temporal stores that bypass the CPU cache. May help with several channels, may cost if the application reads each frame right away; measure on your system. Interlaced input always uses them (each line is written twice, ~40% faster). |
 | `timing_debug` | `0` | `1`: log statistics for each streaming channel to the kernel log (see below); `2`: a line every second and warnings about late frames. |
+| `buf_limit_mb` | `1024` | Buffer memory all applications together may allocate on one channel, in MiB (an application with 32 buffers at 1080p uses 133 MiB, so 8 such applications fit). Without a limit, any program with access to the device could hold gigabytes of kernel memory. Buffers an application freed while still mapping them no longer count until it unmaps them. |
+
+Up to 8 applications can stream from one channel at the same time; a ninth
+gets `EBUSY` on `STREAMON`.
 
 With `timing_debug=1`, `sudo dmesg -w | grep HwsCapture` shows a line per channel
 for every second in which a frame was dropped or late, and otherwise one every
@@ -430,7 +437,7 @@ sudo depmod -a
 | Installer: "missing kernel development packages" | Install the headers for the running kernel (step 1); reboot if the kernel was just updated. |
 | `Key was rejected by service` | Secure Boot: enroll the DKMS key (see [Secure Boot](#secure-boot)). |
 | No `/dev/video*` device | `lspci -nn` must list the card with an ID from the table above (the VC12-4K needs a different driver); check `sudo dmesg \| grep -i hwscapture`. |
-| Picture shows "no signal" | No or unsupported input signal. Check the source and cable; inputs above 1920×1080 are not supported. |
+| Picture shows "no signal" | No or unsupported input signal. Check the source and cable; inputs above 1920×1080 are not supported (`sudo dmesg \| grep -i hwscapture` names the mode). |
 | Stutter or dropped frames | Run `sudo tools/stutter-monitor.py` while streaming (see [Monitoring while streaming](#monitoring-while-streaming)): it tells card, driver, application and system causes apart. `tools/card-check.sh` tests the card on its own (see [Testing on your card](#testing-on-your-card)); `direct_io=0` rules out the fast path. |
 | Module does not unload (`in use`) | Close all applications using the video or audio devices, including PipeWire (`systemctl --user stop pipewire.socket pipewire-pulse.socket pipewire wireplumber`), or reboot. |
 
@@ -468,8 +475,26 @@ have also been verified on a VC42 (see [Status](#status)).
   unregistered the wrong devices.
 - **Interrupt-handler lockup:** interrupt sources the driver didn't handle
   were never acknowledged, so the CPU stayed in the handler. All sources are
-  acknowledged; a stuck status bit or an interrupt storm (1000 empty
-  interrupts within 100 ms) pauses the card's interrupts for a second.
+  acknowledged; a stuck status bit or an interrupt storm (1000 stuck or
+  re-asserted interrupts within 100 ms) pauses the card's interrupts for a
+  second. A storm of ever-changing status bits used to escape that check and
+  could hold a CPU in the handler indefinitely; if pausing doesn't stop a
+  storm, the kernel's own spurious-interrupt guard takes over.
+- **Card DMA into unrelated memory:** the card reaches each buffer through a
+  512 MiB address window; a buffer crossing a window boundary (possible with
+  CMA allocations, e.g. on arm64 boards) would have the card write its end
+  elsewhere. Such buffers are now refused at allocation.
+- **Input modes the buffers aren't made for** (above 1920×1080, or tiny) kept
+  the card's DMA running with the old layout; on older firmware nothing
+  capped how much the card writes.
+- **A board variant with a smaller register window** (BAR0) would have
+  faulted at the first register access; probe now checks it.
+- **Denial of service by local users:** every open file has its own buffer
+  queue, so a program could hold unlimited kernel memory (now limited per
+  channel, see `buf_limit_mb`, and charged to the program), stream from one
+  channel dozens of times to keep a real-time kernel thread busy (now at most
+  8), hang `poll()` unkillably, or flood the kernel log (`LOG_STATUS`, now
+  once a second).
 - **Reboot/kexec/hibernation:** there was no shutdown handler, so the card
   kept writing to memory and could hold a shared interrupt line asserted into
   the next kernel.
@@ -526,7 +551,10 @@ have also been verified on a VC42 (see [Status](#status)).
   it; up to three applications per channel are served directly.
 - **Faster converters** with byte-identical output: 1080p→720p 0.43→0.19 ms,
   720p→1080p 0.33→0.24 ms, YV12 1080p 0.77→0.53 ms, NV12 1080p 0.65→0.37 ms
-  per frame (kernel compiler flags).
+  per frame (kernel compiler flags). The bilinear scaler for sizes without a
+  dedicated converter (e.g. 1366×768 or 1440×900 in, 1080p out) computes each
+  source row once and blends 4 bytes at a time: 6.9→2.7 ms per frame, 42%→16%
+  of a CPU core at 60 fps, same output byte for byte.
 - **Mode changes** are noticed within 250 ms instead of up to 1 s; while there
   is no signal nothing is copied and the "no signal" picture comes at ~30 fps
   (it used to come once per second).

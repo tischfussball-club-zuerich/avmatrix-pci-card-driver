@@ -51,7 +51,7 @@ MODULE_PARM_DESC(direct_io, "Copy frames straight from DMA into app buffers when
  */
 static int nt_copy;
 module_param(nt_copy, int, 0644);
-MODULE_PARM_DESC(nt_copy, "Direct path: write frames with non-temporal stores, bypassing the CPU cache (default 0)");
+MODULE_PARM_DESC(nt_copy, "Direct path: write frames with non-temporal stores, bypassing the CPU cache (default 0; interlaced input always does)");
 
 /* direct path into an app buffer */
 static inline void hws_dcopy(void *dst, const void *src, size_t n, bool nt)
@@ -61,6 +61,14 @@ static inline void hws_dcopy(void *dst, const void *src, size_t n, bool nt)
 	else
 		memcpy(dst, src, n);
 }
+
+/*
+ * Every open file has its own buffer queue, so without a limit any user with
+ * the device could hold gigabytes of kernel memory nobody is charged for.
+ */
+static int buf_limit_mb = 1024;	/* 8 apps with 32 buffers of 1080p fit */
+module_param(buf_limit_mb, int, 0644);
+MODULE_PARM_DESC(buf_limit_mb, "Buffer memory of all applications on one channel, MiB (default 1024)");
 
 static int timing_debug;
 module_param(timing_debug, int, 0644);
@@ -222,7 +230,8 @@ static void hws_tstat_report(struct hws_pcie_dev *pdx)
 }
 
 
-static	void VideoScaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h);
+struct hws_scaler;
+static	void VideoScaler(struct hws_scaler *sc, BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h);
 static	void FHD_To_HD_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h);
 static	void HD_To_FHD_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h);
 static	void FHD_To_800X600_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h);
@@ -242,7 +251,7 @@ static	void HD_To_SD_NTSC_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out
 static	void HD_To_SD_PAL_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h);
 static	void V1280X1024_NTSC_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h);
 static	void V1280X1024_PAL_Scaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h);
-static	void All_VideoScaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h);
+static	void All_VideoScaler(struct hws_scaler *sc, BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h);
 #define MAKE_ENTRY( __vend, __chip, __subven, __subdev, __configptr) {	\
 .vendor		= (__vend),					\
 .device		= (__chip),					\
@@ -695,7 +704,7 @@ static int hws_open(struct file *file)
     struct vb2_queue *q;
     int ret;
 
-    ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+    ctx = kzalloc(sizeof(*ctx), GFP_KERNEL_ACCOUNT);
     if (!ctx)
         return -ENOMEM;
 
@@ -947,14 +956,38 @@ static int hws_create_bufs(struct file *file, void *priv, struct v4l2_create_buf
 	return ret;
 }
 
+/* a user buffer larger than any frame needs: refused before vb2 pins it */
+static bool hws_userptr_too_big(const struct v4l2_buffer *b)
+{
+	return b->memory == V4L2_MEMORY_USERPTR && b->length > 2 * PAGE_ALIGN(MAX_VIDEO_SCLAER_SIZE);
+}
+
+/*
+ * ...and one too small for the format: vb2 would unpin the buffer's old
+ * memory on that error without buf_cleanup, and its charge would stay
+ * counted for good. qmutex held.
+ */
+static bool hws_userptr_too_short(struct vb2_queue *q, const struct v4l2_buffer *b)
+{
+	struct vb2_buffer *vb;
+
+	if (b->memory != V4L2_MEMORY_USERPTR || b->type != q->type)
+		return false;
+	vb = vb2_get_buffer(q, b->index);
+	return vb && b->length < vb->planes[0].min_length;
+}
+
 static int hws_prepare_buf(struct file *file, void *priv, struct v4l2_buffer *b)
 {
 	struct hws_vfh_ctx *ctx = hws_ctx_from_file(file);
 	int ret;
 
+	if (hws_userptr_too_big(b))
+		return -EINVAL;
 	if (mutex_lock_interruptible(&ctx->qmutex))
 		return -ERESTARTSYS;
-	ret = vb2_prepare_buf(&ctx->vbq, HWS_VB2_MDEV(file) b);
+	ret = hws_userptr_too_short(&ctx->vbq, b) ? -EINVAL :
+	      vb2_prepare_buf(&ctx->vbq, HWS_VB2_MDEV(file) b);
 	mutex_unlock(&ctx->qmutex);
 	return ret;
 }
@@ -971,14 +1004,29 @@ static int hws_querybuf(struct file *file, void *priv, struct v4l2_buffer *b)
 	return ret;
 }
 
+/* the controls' state in the kernel log; at most once a second per channel */
+static int hws_log_status(struct file *file, void *priv)
+{
+	struct hws_video *videodev = video_drvdata(file);
+	u64 now = get_jiffies_64();
+
+	if (time_before64(now, READ_ONCE(videodev->log_status_next)))
+		return 0;
+	WRITE_ONCE(videodev->log_status_next, now + HZ);
+	return v4l2_ctrl_log_status(file, priv);
+}
+
 static int hws_qbuf(struct file *file, void *priv, struct v4l2_buffer *b)
 {
 	struct hws_vfh_ctx *ctx = hws_ctx_from_file(file);
 	int ret;
 
+	if (hws_userptr_too_big(b))
+		return -EINVAL;
 	if (mutex_lock_interruptible(&ctx->qmutex))
 		return -ERESTARTSYS;
-	ret = vb2_qbuf(&ctx->vbq, HWS_VB2_MDEV(file) b);
+	ret = hws_userptr_too_short(&ctx->vbq, b) ? -EINVAL :
+	      vb2_qbuf(&ctx->vbq, HWS_VB2_MDEV(file) b);
 	mutex_unlock(&ctx->qmutex);
 	return ret;
 }
@@ -1031,10 +1079,12 @@ static __poll_t hws_poll(struct file *file, struct poll_table_struct *wait)
 	/*
 	 * vb2_poll() looks at a done buffer after dropping done_lock, so it must
 	 * not race STREAMOFF/REQBUFS(0) on another thread: hold the queue lock.
-	 * Uninterruptibly, so a signal can't turn into EPOLLERR; it is held only
-	 * briefly (a blocking DQBUF drops it while waiting).
+	 * Only a fatal signal ends the wait, so an ordinary one can't turn into
+	 * EPOLLERR; it is held briefly, except by a QBUF pinning user memory that
+	 * may itself wait (a FUSE file): killable, so that can't hang a task.
 	 */
-	mutex_lock(&ctx->qmutex);
+	if (mutex_lock_killable(&ctx->qmutex))
+		return EPOLLERR;
 	ret = vb2_poll(&ctx->vbq, file, wait);
 	mutex_unlock(&ctx->qmutex);
 
@@ -1093,7 +1143,7 @@ static const struct v4l2_ioctl_ops hws_ioctl_fops = {
 	.vidioc_enum_input = hws_vidioc_enum_input,
 	.vidioc_g_input = hws_vidioc_g_input,
 	.vidioc_s_input = hws_vidioc_s_input,
-	.vidioc_log_status = v4l2_ctrl_log_status,
+	.vidioc_log_status = hws_log_status,
 	//.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
 	.vidioc_g_parm = hws_vidioc_g_parm,
 	.vidioc_s_parm = hws_vidioc_s_parm,
@@ -1130,6 +1180,37 @@ static int hws_queue_setup_multi(struct vb2_queue *q,
     *num_planes = 1;
     sizes[0] = size;
     return 0;
+}
+
+/* mmap buffers when allocated, user buffers whenever (re)pinned */
+static int hws_buffer_init_multi(struct vb2_buffer *vb)
+{
+    struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+    struct hwsvideo_buffer *buf = container_of(vbuf, struct hwsvideo_buffer, vb);
+    struct hws_vfh_ctx *ctx = vb->vb2_queue->drv_priv;
+    struct hws_video *videodev = ctx->video;
+    s64 size = vb2_plane_size(vb, 0);
+    s64 limit = (s64)max(READ_ONCE(buf_limit_mb), 16) << 20;
+
+    /* a charge vb2 dropped without buf_cleanup (it shouldn't, see hws_userptr_too_short) */
+    atomic64_sub(buf->charged, &videodev->buf_bytes);
+    buf->charged = 0;
+    if (atomic64_add_return(size, &videodev->buf_bytes) > limit) {
+        atomic64_sub(size, &videodev->buf_bytes);
+        return -ENOMEM;
+    }
+    buf->charged = size;
+    return 0;
+}
+
+static void hws_buffer_cleanup_multi(struct vb2_buffer *vb)
+{
+    struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+    struct hwsvideo_buffer *buf = container_of(vbuf, struct hwsvideo_buffer, vb);
+    struct hws_vfh_ctx *ctx = vb->vb2_queue->drv_priv;
+
+    atomic64_sub(buf->charged, &ctx->video->buf_bytes);
+    buf->charged = 0;
 }
 
 static int hws_buffer_prepare_multi(struct vb2_buffer *vb)
@@ -1198,6 +1279,11 @@ static int hws_start_streaming_multi(struct vb2_queue *q, unsigned int count)
         hws_return_buffers(ctx, VB2_BUF_STATE_QUEUED);
         return -ENODEV;
     }
+    if (videodev->engine_users >= HWS_MAX_STREAMERS) {
+        mutex_unlock(&videodev->engine_lock);
+        hws_return_buffers(ctx, VB2_BUF_STATE_QUEUED);
+        return -EBUSY;
+    }
     /* Start hardware engine only once, on first streamer; resume starts it if suspended */
     mutex_lock(&pdx->pm_lock);
     if (videodev->engine_users++ == 0 && !pdx->suspended) {
@@ -1262,6 +1348,8 @@ static void hws_stop_streaming_multi(struct vb2_queue *q)
 
 static const struct vb2_ops hwspcie_video_multi_qops = {
     .queue_setup    = hws_queue_setup_multi,
+    .buf_init       = hws_buffer_init_multi,
+    .buf_cleanup    = hws_buffer_cleanup_multi,
     .buf_prepare    = hws_buffer_prepare_multi,
     .buf_finish     = hws_buffer_finish,
     .buf_queue      = hws_buffer_queue_multi,
@@ -2065,13 +2153,113 @@ static inline int hws_lerp(int a, int b, int w)
 	return a + (((b - a) * w) >> 8);
 }
 
+/* one sample's two neighbours in a source row: c0 and c0 + 1, weight of c0 + 1 */
+struct hws_scale_col {
+	u16 c0;
+	u8 w;
+};
+
+/* All_VideoScaler's per-channel column tables and two-row cache */
+struct hws_scaler {
+	struct hws_scale_col luma[MAX_VIDEO_HW_W];
+	struct hws_scale_col chroma[MAX_VIDEO_HW_W / 2];
+	BYTE row[2][MAX_VIDEO_HW_W * 2];
+};
+
+static inline u32 hws_ld_le32(const BYTE *p)
+{
+	__le32 v;
+
+	memcpy(&v, p, 4);
+	return le32_to_cpu(v);
+}
+
+static inline u64 hws_ld_le64(const BYTE *p)
+{
+	__le64 v;
+
+	memcpy(&v, p, 8);
+	return le64_to_cpu(v);
+}
+
+/*
+ * One source row scaled horizontally (YUYV). Where both neighbours of every
+ * sample lie inside the row (x < fast), one 32-bit load fetches a luma pair
+ * and one 64-bit load both chroma pairs; a + (b - a) * w / 256 is computed as
+ * (a * (256 - w) + b * w) / 256, U and V in 16-bit lanes of one product. The
+ * last columns, whose right neighbour is clamped to the row's end, go byte by
+ * byte: no load ever reaches past the row.
+ */
+static void hws_scale_hrow(const struct hws_scaler *sc, BYTE *o, const BYTE *a,
+			   int out_w, int fast, int cw)
+{
+	int x;
+
+	for (x = 0; x < fast; x += 2, o += 4)
+	{
+		const struct hws_scale_col *l0 = &sc->luma[x], *l1 = &sc->luma[x + 1], *c = &sc->chroma[x / 2];
+		u32 y0 = hws_ld_le32(a + 2 * l0->c0), y1 = hws_ld_le32(a + 2 * l1->c0);
+		u64 q = hws_ld_le64(a + 4 * c->c0);
+		u32 p0 = ((q >> 8) & 0xFF) | ((q >> 24) & 0xFF) << 16;		/* U, V of pair c0 */
+		u32 p1 = ((q >> 40) & 0xFF) | ((q >> 56) & 0xFF) << 16;		/* and of c0 + 1 */
+		u32 uv = ((p0 * (256 - c->w) + p1 * c->w) >> 8) & 0x00FF00FF;
+
+		o[0] = ((y0 & 0xFF) * (256 - l0->w) + ((y0 >> 16) & 0xFF) * l0->w) >> 8;
+		o[1] = uv;
+		o[2] = ((y1 & 0xFF) * (256 - l1->w) + ((y1 >> 16) & 0xFF) * l1->w) >> 8;
+		o[3] = uv >> 16;
+	}
+	for (; x < out_w; x += 2, o += 4)
+	{
+		const struct hws_scale_col *l0 = &sc->luma[x], *l1 = &sc->luma[x + 1], *c = &sc->chroma[x / 2];
+		int r0 = min(l0->c0 + 1, cw - 1), r1 = min(l1->c0 + 1, cw - 1), rc = min(c->c0 + 1, cw / 2 - 1);
+
+		o[0] = hws_lerp(a[2 * l0->c0], a[2 * r0], l0->w);
+		o[1] = hws_lerp(a[4 * c->c0 + 1], a[4 * rc + 1], c->w);
+		o[2] = hws_lerp(a[2 * l1->c0], a[2 * r1], l1->w);
+		o[3] = hws_lerp(a[4 * c->c0 + 3], a[4 * rc + 3], c->w);
+	}
+}
+
+/* two horizontally scaled rows blended into an output row, 4 bytes per 64-bit step */
+static void hws_scale_vmix(BYTE *d, const BYTE *a, const BYTE *b, int n, int wy)
+{
+	const u64 m = 0x00FF00FF00FF00FFULL;
+	u64 wa = 256 - wy, wb = wy;
+	int i;
+
+	if (!wy)
+	{
+		memcpy(d, a, n);
+		return;
+	}
+	for (i = 0; i + 8 <= n; i += 8)
+	{
+		u64 x, y;
+
+		memcpy(&x, a + i, 8);
+		memcpy(&y, b + i, 8);
+		/* every byte in its own 16-bit lane: at most 255 * 256, no carry out */
+		x = ((((x & m) * wa + (y & m) * wb) >> 8) & m) |
+		    ((((x >> 8) & m) * wa + ((y >> 8) & m) * wb) & ~m);
+		memcpy(d + i, &x, 8);
+	}
+	for (; i < n; i++)
+		d[i] = hws_lerp(a[i], b[i], wy);
+}
+
 /*
  * Any size to any size, for the pairs without a dedicated scaler. Like those
  * (e.g. 1080p -> 800x600), the centre of the picture with the output's aspect
  * ratio is scaled to fill the output: no distortion, no black bars. Bilinear
  * in YUYV, 16.16 fixed point, sample centres aligned; integer only.
+ *
+ * Horizontal first, then vertical - the same arithmetic the per-pixel loop
+ * below does, byte for byte - so each source row's horizontal result is
+ * computed once and reused by the output rows that need it (with sc, the
+ * channel's tables; without, the per-pixel loop: ~2.5x slower).
  */
-static void All_VideoScaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h)
+static void All_VideoScaler(struct hws_scaler *sc, BYTE *pSrc, BYTE *pOut, int in_w, int in_h, int out_w, int out_h)
 {
 	int cw = in_w, chh = in_h, cx, cy, x, y;
 	int pitch = in_w * 2;
@@ -2093,6 +2281,58 @@ static void All_VideoScaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,in
 	stepc = (int)div_s64((s64)(cw / 2) << 16, out_w / 2);	/* chroma, per output pair */
 	stepy = (int)div_s64((s64)chh << 16, out_h);
 	posy = stepy / 2 - 32768;
+
+	if (sc && out_w <= MAX_VIDEO_HW_W && !(out_w & 1))
+	{
+		int posx = stepx / 2 - 32768, posc = stepc / 2 - 32768, fast = 0;
+		int have[2] = { -1, -1 };	/* source row in each slot of sc->row */
+
+		for (x = 0; x < out_w; x++, posx += stepx)
+		{
+			int px = max(posx, 0);
+
+			sc->luma[x].c0 = px >> 16;
+			sc->luma[x].w = (px >> 8) & 255;
+		}
+		for (x = 0; x < out_w / 2; x++, posc += stepc)
+		{
+			int px = max(posc, 0);
+
+			sc->chroma[x].c0 = px >> 16;
+			sc->chroma[x].w = (px >> 8) & 255;
+		}
+		/* positions only grow: the columns with both neighbours in the row come first */
+		while (fast < out_w && sc->luma[fast].c0 <= cw - 2 && sc->luma[fast + 1].c0 <= cw - 2 &&
+		       sc->chroma[fast / 2].c0 <= cw / 2 - 2)
+			fast += 2;
+
+		for (y = 0; y < out_h; y++, posy += stepy)
+		{
+			int py = max(posy, 0), r0 = py >> 16, wy = (py >> 8) & 255;
+			int r1 = min(r0 + 1, chh - 1), s0, s1;
+
+			s0 = have[0] == r0 ? 0 : have[1] == r0 ? 1 : -1;
+			if (s0 < 0)
+			{
+				s0 = have[0] == r1 ? 1 : 0;	/* keep r1 if it is there */
+				hws_scale_hrow(sc, sc->row[s0], pSrc + (size_t)(cy + r0) * pitch + cx * 2, out_w, fast, cw);
+				have[s0] = r0;
+			}
+			s1 = s0;
+			if (wy)
+			{
+				s1 = have[!s0] == r1 ? !s0 : have[s0] == r1 ? s0 : -1;
+				if (s1 < 0)
+				{
+					s1 = !s0;
+					hws_scale_hrow(sc, sc->row[s1], pSrc + (size_t)(cy + r1) * pitch + cx * 2, out_w, fast, cw);
+					have[s1] = r1;
+				}
+			}
+			hws_scale_vmix(pOut + (size_t)y * out_w * 2, sc->row[s0], sc->row[s1], out_w * 2, wy);
+		}
+		return;
+	}
 
 	for (y = 0; y < out_h; y++, posy += stepy)
 	{
@@ -2131,7 +2371,7 @@ static void All_VideoScaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,in
 	}
 }
 
-static void VideoScaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h)
+static void VideoScaler(struct hws_scaler *sc, BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h)
 {
 	if((in_w == 1920)&&(in_h==1080)&&(out_w==1280)&&(out_h==720))
 	{
@@ -2211,7 +2451,7 @@ static void VideoScaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int ou
 	}
 	else
 	{
-		All_VideoScaler(pSrc,pOut,in_w,in_h,out_w,out_h);
+		All_VideoScaler(sc, pSrc,pOut,in_w,in_h,out_w,out_h);
 	}
 }
 /*
@@ -2614,14 +2854,14 @@ static int hws_convert_frame(struct hws_pcie_dev *pdx, int nDecoder, BYTE *bBuf,
             }
             if (!needRotateVideo) {
                 FillYUU2(bBuf, pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf, in_width, in_height, interlace);
-                VideoScaler(pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf, dst, in_width, in_height, nWidth, nHeight);
+                VideoScaler(pdx->m_VideoInfo[nDecoder].m_pScaler, pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf, dst, in_width, in_height, nWidth, nHeight);
             } else {
                 if (!pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf) {
                     return -1;
                 }
                 FillYUU2(bBuf, pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf, in_width, in_height, interlace);
                 /* scale to the unrotated size, then rotate (as for YUYV) */
-                VideoScaler(pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf, pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf, in_width, in_height, nHeight, nWidth);
+                VideoScaler(pdx->m_VideoInfo[nDecoder].m_pScaler, pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf, pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf, in_width, in_height, nHeight, nWidth);
                 VideoRotate90deg(pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf, dst, nHeight, nWidth, nWidth, nHeight);
             }
         } else {
@@ -2642,14 +2882,14 @@ static int hws_convert_frame(struct hws_pcie_dev *pdx, int nDecoder, BYTE *bBuf,
             }
             if (!needRotateVideo) {
                 FillNV12ToYUY2(bBuf, pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf, in_width, in_height, interlace);
-                VideoScaler(pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf, dst, in_width, in_height, nWidth, nHeight);
+                VideoScaler(pdx->m_VideoInfo[nDecoder].m_pScaler, pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf, dst, in_width, in_height, nWidth, nHeight);
             } else {
                 if (!pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf) {
                     return -1;
                 }
                 FillNV12ToYUY2(bBuf, pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf, in_width, in_height, interlace);
                 /* scale to the unrotated size, then rotate (as for YUYV) */
-                VideoScaler(pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf, pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf, in_width, in_height, nHeight, nWidth);
+                VideoScaler(pdx->m_VideoInfo[nDecoder].m_pScaler, pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf, pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf, in_width, in_height, nHeight, nWidth);
                 VideoRotate90deg(pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf, dst, nHeight, nWidth, nWidth, nHeight);
             }
         } else {
@@ -2671,17 +2911,17 @@ static int hws_convert_frame(struct hws_pcie_dev *pdx, int nDecoder, BYTE *bBuf,
             if (!needRotateVideo) {
                 if (interlace == 0) {
                     /* progressive: the ring slot (MEM_READING) is the source, no staging copy */
-                    VideoScaler(bBuf, dst, in_width, in_height, nWidth, nHeight);
+                    VideoScaler(pdx->m_VideoInfo[nDecoder].m_pScaler, bBuf, dst, in_width, in_height, nWidth, nHeight);
                 } else {
                     SetDeInterlace(bBuf, pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf, in_width, in_height, interlace);
-                    VideoScaler(pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf, dst, in_width, in_height, nWidth, nHeight);
+                    VideoScaler(pdx->m_VideoInfo[nDecoder].m_pScaler, pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf, dst, in_width, in_height, nWidth, nHeight);
                 }
             } else {
                 if (!pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf) {
                     return -1;
                 }
                 SetDeInterlace(bBuf, pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf, in_width, in_height, interlace);
-                VideoScaler(pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf, pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf, in_width, in_height, nHeight, nWidth);
+                VideoScaler(pdx->m_VideoInfo[nDecoder].m_pScaler, pdx->m_VideoInfo[nDecoder].m_pVideoScalerBuf, pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf, in_width, in_height, nHeight, nWidth);
                 VideoRotate90deg(pdx->m_VideoInfo[nDecoder].m_pRotateVideoBuf, dst, nHeight, nWidth, nWidth, nHeight);
             }
         } else {
@@ -3496,7 +3736,8 @@ static void EnableVideoCapture(struct hws_pcie_dev *pdx,int index,int en)
 	/* one register holds the enable bits of all channels: serialize the RMW */
 	spin_lock_irqsave(&pdx->reg_lock, flags);
 	status = READ_REGISTER_ULONG(pdx,(CVBS_IN_BASE+2*PCIE_BARADDROFSIZE));
-	if(en)
+	/* read under reg_lock: see hws_park_channel() */
+	if(en && !READ_ONCE(pdx->mode_unsupported[index]))
 	{
 		enable =1;
 		enable = enable<<index;
@@ -3513,6 +3754,34 @@ static void EnableVideoCapture(struct hws_pcie_dev *pdx,int index,int en)
 	status = READ_REGISTER_ULONG(pdx,(CVBS_IN_BASE+2*PCIE_BARADDROFSIZE));
 	spin_unlock_irqrestore(&pdx->reg_lock, flags);
 }
+/*
+ * An input mode the buffers aren't made for (status thread): the channel's
+ * DMA goes off while capture stays "started" - apps get the no-signal
+ * picture - and comes back on once the mode fits. The bit follows both
+ * m_bVCapStarted and mode_unsupported, each written before and read inside
+ * reg_lock here and in EnableVideoCapture(), so the last writer of either
+ * leaves the right bit.
+ */
+static void hws_park_channel(struct hws_pcie_dev *pdx, int ch, bool park)
+{
+	ULONG status;
+	unsigned long flags;
+
+	WRITE_ONCE(pdx->mode_unsupported[ch], park);
+	/* lost, or back but not brought up yet (its address table is empty):
+	 * bring-up and StartVideoCapture apply the flag */
+	if (READ_ONCE(pdx->m_PciDeviceLost) || READ_ONCE(pdx->need_bringup))
+		return;
+	spin_lock_irqsave(&pdx->reg_lock, flags);
+	status = READ_REGISTER_ULONG(pdx, CVBS_IN_BASE + 2 * PCIE_BARADDROFSIZE);
+	if (!park && READ_ONCE(pdx->m_bVCapStarted[ch]))
+		status |= 1u << ch;
+	else
+		status &= ~(1u << ch);
+	WRITE_REGISTER_ULONG(pdx, CVBS_IN_BASE + 2 * PCIE_BARADDROFSIZE, status);
+	spin_unlock_irqrestore(&pdx->reg_lock, flags);
+}
+
 static void EnableAudioCapture(struct hws_pcie_dev *pdx,int index,int en)
 {
 	ULONG status;
@@ -3595,6 +3864,13 @@ static int SetVideoFormteSize(struct hws_pcie_dev *pdx,int ch,int w,int h)
 
 }
 
+/* [a, a + len) not inside one 512 MiB window of the card's address table */
+static bool hws_dma_crosses_window(dma_addr_t a, size_t len)
+{
+	return ((u64)a & ~(u64)PCI_E_BAR_ADD_LOWMASK) !=
+	       (((u64)a + len - 1) & ~(u64)PCI_E_BAR_ADD_LOWMASK);
+}
+
 static void DmaMemFreePool(struct hws_pcie_dev *pdx)
 {
 	int i, k;
@@ -3615,6 +3891,8 @@ static void DmaMemFreePool(struct hws_pcie_dev *pdx)
 	{
 		vfree(pdx->m_VideoInfo[i].m_pVideoScalerBuf);
 		pdx->m_VideoInfo[i].m_pVideoScalerBuf = NULL;
+		vfree(pdx->m_VideoInfo[i].m_pScaler);
+		pdx->m_VideoInfo[i].m_pScaler = NULL;
 		vfree(pdx->m_VideoInfo[i].m_pVideoYUV2Buf);
 		pdx->m_VideoInfo[i].m_pVideoYUV2Buf = NULL;
 		vfree(pdx->m_VideoInfo[i].m_pRotateVideoBuf);
@@ -3648,7 +3926,36 @@ static int  DmaMemAllocPool(struct hws_pcie_dev *pdx)
 	pdx->m_bBufferAllocate = TRUE;
 	for(i=0; i<pdx->m_nMaxChl; i++)
 	{
-		pdx->m_pbyVideoBuffer[i] = dma_alloc_coherent(&pdx->pdev->dev, pdx->m_MaxHWVideoBufferSize, &pdx->m_pbyVideo_phys[i], GFP_KERNEL);
+		/*
+		 * The card reaches a buffer through one 512 MiB window of its address
+		 * table (SetDMAAddress): one that crosses a window boundary would have
+		 * the card write its end into unrelated memory. Normal and IOMMU
+		 * allocations are aligned to their size; CMA's only to 1 MiB. Hold a
+		 * crossing one while asking again, so the next one lands elsewhere.
+		 */
+		void *rej_va[8];
+		dma_addr_t rej_pa[8], pa = 0;
+		void *va;
+		int nrej = 0;
+
+		for (;;)
+		{
+			va = dma_alloc_coherent(&pdx->pdev->dev, pdx->m_MaxHWVideoBufferSize, &pa, GFP_KERNEL);
+			if (!va || !hws_dma_crosses_window(pa, pdx->m_MaxHWVideoBufferSize))
+				break;
+			if (nrej == ARRAY_SIZE(rej_va))
+			{
+				dma_free_coherent(&pdx->pdev->dev, pdx->m_MaxHWVideoBufferSize, va, pa);
+				va = NULL;
+				break;
+			}
+			rej_va[nrej] = va;
+			rej_pa[nrej++] = pa;
+		}
+		while (nrej--)
+			dma_free_coherent(&pdx->pdev->dev, pdx->m_MaxHWVideoBufferSize, rej_va[nrej], rej_pa[nrej]);
+		pdx->m_pbyVideoBuffer[i] = va;
+		pdx->m_pbyVideo_phys[i] = pa;
 		if(pdx->m_pbyVideoBuffer[i]== NULL)
 		{
 			dev_err(&pdx->pdev->dev, "DMA buffer %d allocation failed\n", i);
@@ -3672,6 +3979,7 @@ static int  DmaMemAllocPool(struct hws_pcie_dev *pdx)
 	for(i=0; i<pdx->m_nCurreMaxVideoChl; i++)
 	{
 		pdx->m_VideoInfo[i].m_pVideoScalerBuf = vmalloc(MAX_VIDEO_HW_W*MAX_VIDEO_HW_H*2);
+		pdx->m_VideoInfo[i].m_pScaler = vmalloc(sizeof(struct hws_scaler));	/* optional: 19 KB */
 		pdx->m_VideoInfo[i].m_pRotateVideoBuf = vmalloc(MAX_VIDEO_HW_W*MAX_VIDEO_HW_H*2);
 		if (!pdx->m_VideoInfo[i].m_pVideoScalerBuf || !pdx->m_VideoInfo[i].m_pRotateVideoBuf)
 			goto fail;
@@ -4366,12 +4674,16 @@ static int hws_direct_half(struct hws_pcie_dev *pdx, int ch, int half, BYTE *src
 		}
 		pdx->direct_out_size[ch] = out_size;
 		pdx->direct_il[ch] = interlace != 0;
-		pdx->direct_nt[ch] = READ_ONCE(nt_copy) != 0;	/* the same for both halves */
+		/* the same for both halves. Interlaced: each line written twice, line
+		 * by line, where cached stores read every line first (~40% slower) */
+		pdx->direct_nt[ch] = READ_ONCE(nt_copy) != 0 || (IS_ENABLED(CONFIG_X86) && interlace);
 		pdx->direct_frame[ch] = true;
 		if (interlace)
 			hws_copy_doubled(first->mem, src, 0, halfsize, nw * 2, pdx->direct_nt[ch]);
 		else
 			hws_dcopy(first->mem, src, halfsize, pdx->direct_nt[ch]);
+		if (pdx->direct_nt[ch])
+			wmb();	/* the second half may be copied on another CPU, or the ring take the buffer */
 
 		/* see the overrun check in MemCopyVideoToSteam() */
 		smp_rmb();
@@ -4963,9 +5275,21 @@ static irqreturn_t irqhandler(int irq, void  *info)
 	bool ours = false;
 	bool stuck = false;
 
-	/* being removed after the card vanished: a shared line's neighbour fired */
-	if (READ_ONCE(pdx->m_PciDeviceLost) && READ_ONCE(pdx->removing))
-		return IRQ_NONE;
+	/*
+	 * Card lost: a shared line's neighbour fired. Its registers aren't read
+	 * until it is back on the bus (some platforms fault on reads of a gone
+	 * device); the config-space check is atomic-safe and only runs then.
+	 */
+	if (READ_ONCE(pdx->m_PciDeviceLost))
+	{
+		u16 cmd;
+
+		/* back after a reset, it doesn't decode memory until the status
+		 * thread restores its config */
+		if (READ_ONCE(pdx->removing) || !pci_device_is_present(pdx->pdev) ||
+		    pci_read_config_word(pdx->pdev, PCI_COMMAND, &cmd) || !(cmd & PCI_COMMAND_MEMORY))
+			return IRQ_NONE;
+	}
 	dma_status =  READ_REGISTER_ULONG(pdx,(u32)(CVBS_IN_BASE));
 	if((dma_status == 0xffffffff) || ((dma_status&0x04) != 0x04))
 	{
@@ -5073,7 +5397,15 @@ static irqreturn_t irqhandler(int irq, void  *info)
 			pdx->irq_stuck_t0 = now;
 			pdx->irq_stuck_passes = 0;
 		}
-		if (++pdx->irq_stuck_passes >= 1000 && !READ_ONCE(pdx->irq_storm_off))
+		/*
+		 * A stuck bit counts once per call; a status that keeps changing ran
+		 * the whole loop: count its passes, or a storm of 100-pass calls
+		 * (~160 us each) never reaches the limit.
+		 */
+		if (READ_ONCE(pdx->irq_storm_off))
+			return IRQ_NONE;	/* paused and still storming: the kernel's spurious-IRQ guard decides */
+		pdx->irq_stuck_passes += stuck ? 1 : cnt;
+		if (pdx->irq_stuck_passes >= 1000)
 		{
 			WRITE_REGISTER_ULONG(pdx, INT_EN_REG_BASE, 0);
 			atomic64_set(&pdx->irq_storm_off_ns, ktime_get_ns());
@@ -5470,10 +5802,29 @@ static int Get_Video_Status(struct hws_pcie_dev *pdx,unsigned int  ch)
 		value =  READ_REGISTER_ULONG(pdx,(DWORD)(CVBS_IN_BASE + (offset*PCIE_BARADDROFSIZE)));
 		res_w = value&0xFFFF;
 		res_h = (value>>16)&0xFFFF;
-		/* 0 x 0 shows up while the source switches modes; it would divide by zero later */
-		if ((res_w > 0) && (res_h > 0) &&
-		    (((res_w <=MAX_VIDEO_HW_W) &&(res_h<=MAX_VIDEO_HW_H)&&(interlace==0))||((res_w <=MAX_VIDEO_HW_W) &&(res_h*2<=MAX_VIDEO_HW_H)&&(interlace==1))))
+		/*
+		 * 0 x 0 (or one side 0) shows up while the source switches modes: keep
+		 * what we had. A mode the buffers aren't made for - above 1920x1080, or
+		 * tiny (a zero DMA half size) - counts as no signal, with the channel's
+		 * DMA off until the mode fits: the card might write past the buffer.
+		 */
+		if ((res_w > 0) && (res_h > 0))
 		{
+			bool fits = res_w >= HWS_MIN_IN_W && res_w <= MAX_VIDEO_HW_W &&
+				    res_h >= HWS_MIN_IN_H && (interlace ? 2 * res_h : res_h) <= MAX_VIDEO_HW_H;
+
+			if (!fits)
+			{
+				if (!pdx->mode_unsupported[ch])
+				{
+					hws_park_channel(pdx, ch, true);
+					dev_warn_ratelimited(&pdx->pdev->dev,
+						 "channel %u: input %dx%d%s not supported (%dx%d to %dx%d), shown as no signal\n",
+						 ch, res_w, interlace ? 2 * res_h : res_h, interlace ? "i" : "p",
+						 HWS_MIN_IN_W, HWS_MIN_IN_H, MAX_VIDEO_HW_W, MAX_VIDEO_HW_H);
+				}
+				return 1;
+			}
 			if((res_w !=pdx->m_pVCAPStatus[ch][0].dwWidth )||(res_h!= pdx->m_pVCAPStatus[ch][0].dwHeight)||(pdx->m_pVCAPStatus[ch][0].dwinterlace!=interlace))
 			{
 				ChangeVideoSize(pdx,ch,res_w,res_h,interlace);
@@ -5482,6 +5833,13 @@ static int Get_Video_Status(struct hws_pcie_dev *pdx,unsigned int  ch)
 				hws_notify_source_change(&pdx->video[ch]);
 
 			}
+			/* programmed for the mode first, then the DMA back on */
+			if (pdx->mode_unsupported[ch])
+				hws_park_channel(pdx, ch, false);
+		}
+		else if (pdx->mode_unsupported[ch])
+		{
+			return 1;	/* still switching away from the unsupported mode */
 		}
 
 		no_video = 0;
@@ -6057,6 +6415,13 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	pcie_set_readrq(pdev, 128);
 	#endif
 
+	/* another board variant or a fallback FPGA image: don't map what we can't use */
+	if (!(pci_resource_flags(pdev, 0) & IORESOURCE_MEM) ||
+	    pci_resource_len(pdev, 0) < HWS_BAR0_MIN) {
+		dev_err(&pdev->dev, "BAR0 is not a memory region of at least %#x bytes\n", HWS_BAR0_MIN);
+		err = -ENODEV;
+		goto err_msi;
+	}
 	gdev->info.mem[0].internal_addr = ioremap(pci_resource_start(pdev, 0),
 											  pci_resource_len(pdev, 0));
 	gdev->map_bar0_addr = gdev->info.mem[0].internal_addr;
@@ -6094,6 +6459,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		gdev->m_VideoInfo[i].dwisRuning= 0;
 		gdev->m_VideoInfo[i].m_nVideoIndex= 0;
 		gdev->m_VideoInfo[i].m_pVideoScalerBuf = NULL;
+		gdev->m_VideoInfo[i].m_pScaler = NULL;
 		gdev->m_VideoInfo[i].m_pVideoYUV2Buf = NULL;
 		gdev->m_VideoInfo[i].m_pRotateVideoBuf = NULL;
 		for (j = 0; j<MAX_VIDEO_QUEUE; j++)

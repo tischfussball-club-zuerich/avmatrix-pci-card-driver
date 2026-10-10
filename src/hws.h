@@ -150,6 +150,13 @@ typedef unsigned char BOOL;
 
 #define MAX_VIDEO_HW_W 1920
 #define MAX_VIDEO_HW_H 1080
+/* smallest input mode taken: lines per frame, or per field when interlaced */
+#define HWS_MIN_IN_W	64
+#define HWS_MIN_IN_H	32
+/* streaming applications per channel: each costs a frame copy in a real-time thread */
+#define HWS_MAX_STREAMERS	8
+/* every register the driver uses lies below this offset in BAR0 */
+#define HWS_BAR0_MIN	(CVBS_IN_BASE + 134 * PCIE_BARADDROFSIZE)
 #define MAX_VIDEO_SCLAER_SIZE (1920*1080*2)
 
 struct TMemParam
@@ -219,6 +226,7 @@ typedef struct
 	u32         seq_counter;			/* next capture sequence number */
 	DWORD        m_nVideoIndex;
 	BYTE		*m_pVideoScalerBuf;
+	struct hws_scaler *m_pScaler;	/* bilinear scaler tables; NULL: its per-pixel loop */
 	BYTE        *m_pVideoYUV2Buf;
 	BYTE        *m_pRotateVideoBuf;
 	DWORD		dwisRuning;
@@ -296,6 +304,7 @@ struct hwsvideo_buffer {
 	struct list_head		queue;
 	void *					mem;
 	bool					mem_bad;	/* worker only: copy into it was skipped */
+	size_t					charged;	/* counted in hws_video.buf_bytes (buf_init) */
 
 };
 
@@ -348,6 +357,8 @@ struct hws_video{
 	spinlock_t			consumers_lock;
 	struct list_head		consumers;
 	int				engine_users;	/* protected by engine_lock */
+	atomic64_t			buf_bytes;	/* buffer memory of all its open files' queues */
+	u64				log_status_next;	/* LOG_STATUS: jiffies64 of the next one allowed */
 	spinlock_t				slock;
 	u32						pixfmt; //V4L2_PIX_FMT_YUYV(fourcc)
 	struct v4l2_ctrl_handler	ctrl_handler;	/* picture controls; freed with v4l2_dev */
@@ -552,6 +563,8 @@ struct hws_pcie_dev {
 
 	struct task_struct *mMain_tsk;
 	int m_curr_No_Video[MAX_VID_CHANNELS];
+	/* status thread: the input's mode doesn't fit the buffers, the channel's DMA is off */
+	bool mode_unsupported[MAX_VID_CHANNELS];
 	dma_addr_t   		m_pbyAudio_phys[MAX_VID_CHANNELS] ;
 	uint8_t     *m_pbyAudioBuffer[MAX_VID_CHANNELS];
 	uint8_t		*m_pbyUserAudioBuffer[MAX_VID_CHANNELS];
