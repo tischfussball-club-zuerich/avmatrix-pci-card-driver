@@ -11,6 +11,8 @@
 #   tools/card-check.sh                  # 10 s captures
 #   DUR=60 tools/card-check.sh           # longer captures (each phase)
 #   SKIP_COMPLIANCE=1 tools/card-check.sh   # e.g. to compare with another driver
+#   RESULTS=file tools/card-check.sh     # also write the numbers to a file
+#                                        # (tools/test-on-card.sh --compare uses it)
 #
 # v4l2-compliance changes format and picture controls while it tests, the scaled
 # capture changes the format; the script puts them back afterwards.
@@ -30,24 +32,35 @@ dmesg_ok=1; dmesg >/dev/null 2>&1 || dmesg_ok=0; dmesg_start=$(dmesg_now)
 fail=0
 say() { printf '%s\n' "$*"; }
 bad() { printf '  !! %s\n' "$*"; fail=1; }
+# machine-readable results: "<key> name=value ..." per line
+RESULTS=${RESULTS:-}
+res() { [ -z "$RESULTS" ] || printf '%s\n' "$*" >> "$RESULTS"; }
+# a capture that hangs (e.g. a driver that stops delivering) must not hang the check
+cap_limit() { echo $(( $1 * 2 + 15 )); }
 
-# analyze <v4l2-ctl --verbose output> <frames wanted> <fps> <expected bytesused> <label>
+# analyze <v4l2-ctl --verbose output> <frames wanted> <fps> <expected bytesused> <label> [<results key>]
 # sequence gaps = frames the app lost, timestamp gaps = pacing
 analyze() {
-	awk -v want="$2" -v fps="$3" -v size="$4" -v label="$5" '
+	awk -v want="$2" -v fps="$3" -v size="$4" -v label="$5" -v key="${6:-}" -v res="$RESULTS" '
 		/seq:/ { for (i = 1; i <= NF; i++) {
 				if ($i == "seq:") s = $(i+1)
 				if ($i == "ts:") t = $(i+1)
 				if ($i == "bytesused:") b = $(i+1) }
-			 if (cnt++ && s != ps + 1) lost += s - ps - 1
+			 # a sequence number that does not increase: a duplicate or reordered frame
+			 if (cnt++) { if (s > ps + 1) lost += s - ps - 1; else if (s <= ps) dup++ }
 			 if (cnt > 1) { dt = (t - pt) * 1000; if (dt > max) max = dt; if (dt > 1500 / fps) late++ }
 			 if (size && b != size) wrong++
 			 if (cnt == 1) t0 = t
 			 ps = s; pt = t }
-		END { printf "   %s: %d frames, %d lost, %d late (>1.5 frame periods), max gap %.1f ms%s%s\n",
-			  label, cnt, lost, late, max, wrong ? sprintf(", %d with wrong size", wrong) : "",
-			  (pt > t0) ? sprintf(", %.3f fps from the timestamps", (cnt - 1 + late) / (pt - t0)) : ""
-		      if (cnt < want * 0.95 || lost > 0 || wrong) exit 1 }' "$1"
+		END { rate = (pt > t0) ? (cnt - 1 + late) / (pt - t0) : 0
+		      printf "   %s: %d of %d frames, %d lost, %d late (>1.5 frame periods), max gap %.1f ms%s%s%s\n",
+			  label, cnt, want, lost, late, max, dup ? sprintf(", %d duplicate/out of order", dup) : "",
+			  wrong ? sprintf(", %d with wrong size", wrong) : "",
+			  rate ? sprintf(", %.3f fps from the timestamps", rate) : ""
+		      if (res != "" && key != "")
+			  printf "%s frames=%d want=%d lost=%d late=%d maxgap=%.1f dup=%d wrong=%d fps=%.3f\n",
+				 key, cnt, want, lost, late, max, dup, wrong, rate >> res
+		      if (cnt < want * 0.95 || lost > 0 || dup > 0 || wrong) exit 1 }' "$1"
 }
 
 for t in v4l2-ctl arecord; do
@@ -66,8 +79,11 @@ say "== ${#nodes[@]} video channel(s): ${nodes[*]}"
 
 # ---------------------------------------------------------------- 1. per channel
 sig_nodes=()
-declare -A FPS
+declare -A FPS KEY
+ci=0
 for d in "${nodes[@]}"; do
+	# results by channel number: the device names may differ between drivers
+	ci=$((ci + 1)); KEY[$d]=ch$ci
 	say ""
 	say "== $d ($(v4l2-ctl -d "$d" --info | sed -n 's/.*Card type *: *//p'))"
 	nosig=$(v4l2-ctl -d "$d" --get-input --list-inputs 2>/dev/null | grep -c 'no signal')
@@ -89,31 +105,38 @@ for d in "${nodes[@]}"; do
 		[ -n "$saved_ctrls" ] && v4l2-ctl -d "$d" --set-ctrl="$saved_ctrls" 2>/dev/null
 		sum=$(printf '%s\n' "$comp" | grep -E '^Total for' | tail -1)
 		say "   v4l2-compliance: ${sum:-no summary}"
+		# "Total for HwsCapture device /dev/video0: 55, Succeeded: 54, Failed: 1, Warnings: 0"
+		res "${KEY[$d]}.compliance $(printf '%s' "$sum" | sed -n 's/.*: \([0-9]*\), Succeeded: \([0-9]*\), Failed: \([0-9]*\), Warnings: \([0-9]*\).*/tests=\1 ok=\2 failed=\3 warnings=\4/p')"
 		printf '%s\n' "$comp" | grep -E 'fail:' | sed 's/^/      /' | head -12
 	fi
 
+	res "${KEY[$d]}.info fmt=${w}x${h} fps=$fps signal=$([ "$nosig" -gt 0 ] && echo 0 || echo 1)"
 	[ "$nosig" -gt 0 ] && { say "   captures skipped: no signal"; continue; }
 	sig_nodes+=("$d")
 
 	# input size: straight from DMA into the app's buffer
 	n=$(awk -v f="$fps" -v t="$DUR" 'BEGIN { printf "%d", f * t }')
-	v4l2-ctl -d "$d" --set-fmt-video="$saved_fmt" --stream-mmap=4 --stream-count="$n" --stream-to=/dev/null --verbose > "$TMP/seq" 2>&1
-	analyze "$TMP/seq" "$n" "$fps" $((w * h * 2)) "capture ${w}x${h}, ${DUR} s" || bad "frames lost or capture incomplete on $d"
+	timeout -s INT $(cap_limit $DUR) v4l2-ctl -d "$d" --set-fmt-video="$saved_fmt" --stream-mmap=4 --stream-count="$n" --stream-to=/dev/null --verbose > "$TMP/seq" 2>&1
+	analyze "$TMP/seq" "$n" "$fps" $((w * h * 2)) "capture ${w}x${h}, ${DUR} s" "${KEY[$d]}.input" || bad "frames lost or capture incomplete on $d"
 	# measured by the driver during that capture (59.94 vs 60), what apps get from G_PARM
-	say "   frame rate reported to applications now: $(v4l2-ctl -d "$d" --get-parm | sed -n 's/.*Frames per second: *//p')"
+	rfps=$(v4l2-ctl -d "$d" --get-parm | sed -n 's/.*Frames per second: *//p')
+	say "   frame rate reported to applications now: $rfps"
+	res "${KEY[$d]}.rate reported=$(printf '%s' "${rfps:-?}" | sed 's/ .*//')"
 
 	# another size: through the ring and the conversion thread
 	if [ "$w" = 1920 ]; then sw=1280; sh=720; else sw=1920; sh=1080; fi
 	n=$(awk -v f="$fps" -v t="$SCALE_DUR" 'BEGIN { printf "%d", f * t }')
-	v4l2-ctl -d "$d" --set-fmt-video="width=$sw,height=$sh,pixelformat=YUYV" --stream-mmap=4 --stream-count="$n" --stream-to=/dev/null --verbose > "$TMP/scaled" 2>&1
-	analyze "$TMP/scaled" "$n" "$fps" $((sw * sh * 2)) "scaled to ${sw}x${sh}, ${SCALE_DUR} s" || bad "scaled capture failed on $d"
+	timeout -s INT $(cap_limit $SCALE_DUR) v4l2-ctl -d "$d" --set-fmt-video="width=$sw,height=$sh,pixelformat=YUYV" --stream-mmap=4 --stream-count="$n" --stream-to=/dev/null --verbose > "$TMP/scaled" 2>&1
+	analyze "$TMP/scaled" "$n" "$fps" $((sw * sh * 2)) "scaled to ${sw}x${sh}, ${SCALE_DUR} s" "${KEY[$d]}.scaled" || bad "scaled capture failed on $d"
 	# one scaled frame must look like a picture, not a blank or garbage buffer
-	v4l2-ctl -d "$d" --set-fmt-video="width=$sw,height=$sh,pixelformat=YUYV" --stream-mmap=4 --stream-skip=10 --stream-count=1 --stream-to="$TMP/frame.yuv" >/dev/null 2>&1
+	rm -f "$TMP/frame.yuv"
+	timeout -s INT 20 v4l2-ctl -d "$d" --set-fmt-video="width=$sw,height=$sh,pixelformat=YUYV" --stream-mmap=4 --stream-skip=10 --stream-count=1 --stream-to="$TMP/frame.yuv" >/dev/null 2>&1
 	size=$(stat -c %s "$TMP/frame.yuv" 2>/dev/null || echo 0)
 	vals=$(head -c 2000000 "$TMP/frame.yuv" 2>/dev/null | od -An -tu1 -v | tr -s ' ' '\n' | sort -un | wc -l)
 	if [ "$size" -ne $((sw * sh * 2)) ]; then bad "scaled frame has $size bytes, expected $((sw * sh * 2))"
 	elif [ "$vals" -lt 16 ]; then say "   scaled frame: only $vals different byte values (blank picture? check the source)"
 	else say "   scaled frame: $size bytes, $vals different byte values"; fi
+	res "${KEY[$d]}.picture values=$vals"
 	v4l2-ctl -d "$d" --set-fmt-video="$saved_fmt" 2>/dev/null
 done
 
@@ -130,11 +153,12 @@ if [ ${#sig_nodes[@]} -gt 0 ]; then
 	pids=()
 	for d in "${sig_nodes[@]}"; do
 		n=$(awk -v f="${FPS[$d]}" -v t="$DUR" 'BEGIN { printf "%d", f * t }')
-		v4l2-ctl -d "$d" --stream-mmap=4 --stream-count="$n" --stream-to=/dev/null --verbose > "$TMP/par.$(basename "$d")" 2>&1 &
+		timeout -s INT $(cap_limit $DUR) v4l2-ctl -d "$d" --stream-mmap=4 --stream-count="$n" --stream-to=/dev/null --verbose > "$TMP/par.$(basename "$d")" 2>&1 &
 		pids+=($!)
 	done
 	for c in $cards; do
-		arecord -q -D "hw:CARD=$c" -f S16_LE -r 48000 -c 2 -d "$DUR" /dev/null > "$TMP/aud.$c" 2>&1 &
+		{ timeout -s INT $(cap_limit $DUR) arecord -q -D "hw:CARD=$c" -f S16_LE -r 48000 -c 2 -d "$DUR" /dev/null > "$TMP/aud.$c" 2>&1 ||
+			echo "error: arecord failed or hung (exit $?)" >> "$TMP/aud.$c"; } &
 		pids+=($!)
 	done
 	wait "${pids[@]}"
@@ -143,15 +167,16 @@ if [ ${#sig_nodes[@]} -gt 0 ]; then
 		n=$(awk -v f="${FPS[$d]}" -v t="$DUR" 'BEGIN { printf "%d", f * t }')
 		w=$(v4l2-ctl -d "$d" --get-fmt-video | sed -n 's/.*Width\/Height *: *\([0-9]*\)\/.*/\1/p')
 		h=$(v4l2-ctl -d "$d" --get-fmt-video | sed -n 's/.*Width\/Height *: *[0-9]*\/\([0-9]*\).*/\1/p')
-		analyze "$TMP/par.$(basename "$d")" "$n" "${FPS[$d]}" $((w * h * 2)) "$d" || bad "frames lost on $d while all channels ran"
+		analyze "$TMP/par.$(basename "$d")" "$n" "${FPS[$d]}" $((w * h * 2)) "$d" "${KEY[$d]}.together" || bad "frames lost on $d while all channels ran"
 	done
 	for c in $cards; do
-		if grep -qiE 'error|overrun' "$TMP/aud.$c"; then bad "$c: $(head -c 200 "$TMP/aud.$c")"
-		else say "   $c: audio ok"; fi
+		if grep -qiE 'error|overrun' "$TMP/aud.$c"; then bad "$c: $(head -c 200 "$TMP/aud.$c")"; res "audio.$c ok=0"
+		else say "   $c: audio ok"; res "audio.$c ok=1"; fi
 	done
 	busy=$(awk -v t=$((tot1 - tot0)) -v i=$((idle1 - idle0)) 'BEGIN { printf "%.0f", t ? 100 * (t - i) / t : 0 }')
 	drv=$(awk -v d=$((thr1 - thr0)) -v hz="$(getconf CLK_TCK)" -v s="$DUR" 'BEGIN { printf "%.1f", 100 * d / hz / s }')
 	say "   CPU: whole system ${busy}% busy ($(nproc) cores); the driver's copy/conversion threads used ${drv}% of one core"
+	res "cpu busy=$busy"
 	# frames the card completed vs. frames the driver took in (timing_debug=1):
 	# equal = a late frame never came from the card; more card frames = lost in the driver
 	if [ $dmesg_ok = 1 ]; then
@@ -170,9 +195,9 @@ if [ ${#sig_nodes[@]} -gt 0 ]; then
 else
 	say "== all at once: skipped, no channel has a signal"
 	for c in $cards; do
-		out=$(arecord -q -D "hw:CARD=$c" -f S16_LE -r 48000 -c 2 -d 5 /dev/null 2>&1); rc=$?
-		if [ $rc -ne 0 ] || echo "$out" | grep -qi overrun; then bad "$c: arecord: $out"
-		else say "   $c: 5 s audio capture ok"; fi
+		out=$(timeout -s INT 30 arecord -q -D "hw:CARD=$c" -f S16_LE -r 48000 -c 2 -d 5 /dev/null 2>&1); rc=$?
+		if [ $rc -ne 0 ] || echo "$out" | grep -qi overrun; then bad "$c: arecord: $out (exit $rc)"; res "audio.$c ok=0"
+		else say "   $c: 5 s audio capture ok"; res "audio.$c ok=1"; fi
 	done
 fi
 
@@ -198,9 +223,11 @@ else
 	# a crash in any module while we drove the card counts; older messages don't
 	probs=$(printf '%s\n' "$new" | grep -iE 'hwscapture.*(stuck|not respond|stopped|failed)|BUG:|Oops|WARNING: CPU' | head)
 	[ -n "$probs" ] && { say "$probs" | sed 's/^/   !! /'; fail=1; }
+	res "kernel problems=$(printf '%s' "$probs" | grep -c .)"
 fi
 
 say ""
 say "RESULT: $([ $fail = 0 ] && echo OK || echo 'PROBLEMS FOUND (see !! above)')"
+res "result ok=$([ $fail = 0 ] && echo 1 || echo 0)"
 say "For frame pacing over time: tools/stutter-monitor.py --device ${nodes[0]}"
 exit $fail

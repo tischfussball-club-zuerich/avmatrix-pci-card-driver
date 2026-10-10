@@ -13,19 +13,27 @@
 #   tools/test-on-card.sh            # test, then restore the original driver
 #   tools/test-on-card.sh --keep     # leave the new driver loaded afterwards
 #   tools/test-on-card.sh --leak     # memory leak check (tools/leak-check.sh) instead
+#   tools/test-on-card.sh --compare  # same check on the installed driver first, then
+#                                    # on this one, and a table of both results
 #   DUR=60 tools/test-on-card.sh     # longer captures (each phase)
+#
+# --compare leaves v4l2-compliance out for the installed driver (older versions
+# of this driver crash the kernel in the control ioctls it tests);
+# OLD_COMPLIANCE=1 runs it there too.
 #
 # A reboot always brings back the installed driver.
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
-KEEP=0; LEAK=0
+KEEP=0; LEAK=0; COMPARE=0
 for a in "$@"; do
 	case "$a" in
 	--keep) KEEP=1 ;;
 	--leak) LEAK=1 ;;
-	*) echo "unknown option $a (--keep, --leak)"; exit 2 ;;
+	--compare) COMPARE=1 ;;
+	*) echo "unknown option $a (--keep, --leak, --compare)"; exit 2 ;;
 	esac
 done
+[ $LEAK = 1 ] && [ $COMPARE = 1 ] && { echo "--leak and --compare can't be combined"; exit 2; }
 BUILD=""
 SWAPPED=0
 LOG=$PWD/test-on-card-$(date +%Y%m%d-%H%M%S).log
@@ -33,6 +41,78 @@ exec > >(tee "$LOG") 2>&1
 
 say() { printf '%s\n' "$*"; }
 die() { say "ERROR: $*"; exit 1; }
+
+# compare_results <old results> <new results>: one row per number, both drivers side by side
+compare_results() {
+	say ""
+	say "################################################################ comparison"
+	say "old: $OLD_DESC"
+	say "new: this checkout (srcversion $NEW_SRC)"
+	say ""
+	touch "$1" "$2"
+	awk '
+		function kv(line, which,   n, i, a, key, f) {
+			n = split(line, a, " "); key = a[1]
+			if (!(key in seen)) { seen[key] = 1; order[++nk] = key }
+			for (i = 2; i <= n; i++) if (split(a[i], f, "=") == 2) v[which, key, f[1]] = f[2]
+		}
+		# the new run first: its order (with v4l2-compliance) sets the rows
+		FILENAME == ARGV[1] { kv($0, "new"); next }
+		{ kv($0, "old") }
+		function get(w, k, f) { return ((w, k, f) in v) ? v[w, k, f] : "-" }
+		function row(label, o, n,   mark) {
+			mark = ""
+			if (o != n && substr(o, 1, 1) != "-" && substr(n, 1, 1) != "-" && better != "") {
+				if ((better == "low" && n + 0 < o + 0) || (better == "high" && n + 0 > o + 0)) mark = "  better"
+				else if ((better == "low" && n + 0 > o + 0) || (better == "high" && n + 0 < o + 0)) mark = "  worse"
+			}
+			printf "%-46s %16s %16s%s\n", label, o, n, mark
+		}
+		function cap(k, label,   w) {
+			better = "high"; row(label ": frames received",
+				get("old", k, "frames") "/" get("old", k, "want"), get("new", k, "frames") "/" get("new", k, "want"))
+			better = "low"
+			row("   lost (sequence gaps)", get("old", k, "lost"), get("new", k, "lost"))
+			row("   duplicate / out of order", get("old", k, "dup"), get("new", k, "dup"))
+			row("   late (>1.5 frame periods)", get("old", k, "late"), get("new", k, "late"))
+			row("   longest gap, ms", get("old", k, "maxgap"), get("new", k, "maxgap"))
+			if (get("old", k, "wrong") + get("new", k, "wrong") > 0) row("   wrong size", get("old", k, "wrong"), get("new", k, "wrong"))
+			better = ""; row("   fps from the timestamps", get("old", k, "fps"), get("new", k, "fps"))
+			for (w = 1; w <= 2; w++) {
+				which = w == 1 ? "old" : "new"
+				if (get(which, k, "lost") != "-") {
+					tl[which] += get(which, k, "lost") + get(which, k, "dup")
+					tlate[which] += get(which, k, "late")
+					tmiss[which] += get(which, k, "want") - get(which, k, "frames")
+				}
+			}
+		}
+		END {
+			printf "%-46s %16s %16s\n", "", "installed", "new"
+			for (i = 1; i <= nk; i++) {
+				k = order[i]; split(k, p, "."); ch = p[1]; what = p[2]
+				if (what == "info") { better = ""; row(ch ": input", get("old", k, "fmt") "@" get("old", k, "fps"), get("new", k, "fmt") "@" get("new", k, "fps")) }
+				else if (what == "compliance") { better = "low"; row(ch ": v4l2-compliance failures", get("old", k, "failed"), get("new", k, "failed")) }
+				else if (what == "input") cap(k, ch ": capture at the input size")
+				else if (what == "rate") { better = ""; row(ch ": frame rate reported to apps", get("old", k, "reported"), get("new", k, "reported")) }
+				else if (what == "scaled") cap(k, ch ": capture scaled")
+				else if (what == "picture") { better = ""; row(ch ": scaled picture, distinct byte values", get("old", k, "values"), get("new", k, "values")) }
+				else if (what == "together") cap(k, ch ": all channels + audio at once")
+				else if (ch == "audio") { better = "high"; row("audio " what " ok (1 = yes)", get("old", k, "ok"), get("new", k, "ok")) }
+				else if (ch == "cpu") { better = "low"; row("whole system CPU busy, % (all at once)", get("old", k, "busy"), get("new", k, "busy")) }
+				else if (ch == "kernel") { better = "low"; row("kernel errors (Oops, BUG, WARNING)", get("old", k, "problems"), get("new", k, "problems")) }
+				else if (ch == "result") { better = "high"; row("card-check result OK (1 = yes)", get("old", k, "ok"), get("new", k, "ok")) }
+			}
+			print ""
+			better = "low"
+			row("TOTAL frames lost or duplicated", tl["old"] + 0, tl["new"] + 0)
+			row("TOTAL frames missing (not received)", tmiss["old"] + 0, tmiss["new"] + 0)
+			row("TOTAL late frames", tlate["old"] + 0, tlate["new"] + 0)
+		}' "$2" "$1"
+	say ""
+	say "\"-\" = not measured (e.g. no signal, or v4l2-compliance skipped for the installed driver)."
+	say "Late frames with equal frame counts from card and driver come from the card/source."
+}
 
 # ---------------------------------------------------------------- checks
 say "== $(date)  kernel $(uname -r)  repo $(git -C "$HERE" log -1 --format='%h %s' 2>/dev/null)"
@@ -127,10 +207,28 @@ if [ -n "$users" ]; then
 	die "close these programs first, nothing was changed"
 fi
 
-# ---------------------------------------------------------------- swap, with guaranteed restore
+# ---------------------------------------------------------------- --compare: the installed driver first
+OLD_RES=$BUILD/results.old; NEW_RES=$BUILD/results.new
+OLD_DESC=""
+if [ $COMPARE = 1 ]; then
+	say ""
+	if [ $ORIG_LOADED = 0 ]; then
+		say "== loading the installed driver for the comparison"
+		sudo modprobe HwsCapture 2>/dev/null || die "no installed HwsCapture driver to compare with (modprobe failed)"
+		SWAPPED=1	# from now on the exit handler unloads it again (it wasn't loaded before)
+		sleep 3	# let udev create the device nodes
+	fi
+	OLD_DESC="installed driver $(modinfo -F version HwsCapture 2>/dev/null) (srcversion $(cat /sys/module/HwsCapture/srcversion 2>/dev/null))"
+	say "################################################################ 1/2: $OLD_DESC"
+	sudo env DUR="${DUR:-10}" ${SCALE_DUR:+SCALE_DUR=$SCALE_DUR} SKIP_COMPLIANCE="$([ "${OLD_COMPLIANCE:-0}" = 1 ] && echo 0 || echo 1)" \
+		RESULTS="$OLD_RES" "$HERE/tools/card-check.sh"
+	say ""
+	say "################################################################ 2/2: this checkout (srcversion $NEW_SRC)"
+fi
 
-if [ $ORIG_LOADED = 1 ]; then
-	sudo rmmod HwsCapture || die "can't unload the current driver (still in use?), nothing was changed"
+# ---------------------------------------------------------------- swap, with guaranteed restore
+if [ -d /sys/module/HwsCapture ]; then
+	sudo rmmod HwsCapture || die "can't unload the current driver (still in use?)"
 fi
 SWAPPED=1
 # timestamps, not line counts: a full kernel log buffer drops old lines as new ones come
@@ -152,9 +250,11 @@ if [ $LEAK = 1 ]; then
 	# with the module file, so it can also unload and reload the driver
 	sudo env HWS_KO="$BUILD/HwsCapture.ko" ${CYCLES:+CYCLES=$CYCLES} ${ACYCLES:+ACYCLES=$ACYCLES} ${RELOADS:+RELOADS=$RELOADS} "$HERE/tools/leak-check.sh"
 else
-	sudo env DUR="${DUR:-10}" ${SCALE_DUR:+SCALE_DUR=$SCALE_DUR} SKIP_COMPLIANCE="${SKIP_COMPLIANCE:-0}" "$HERE/tools/card-check.sh"
+	sudo env DUR="${DUR:-10}" ${SCALE_DUR:+SCALE_DUR=$SCALE_DUR} SKIP_COMPLIANCE="${SKIP_COMPLIANCE:-0}" \
+		$([ $COMPARE = 1 ] && echo "RESULTS=$NEW_RES") "$HERE/tools/card-check.sh"
 fi
 rc=$?
+[ $COMPARE = 1 ] && compare_results "$OLD_RES" "$NEW_RES"
 
 say ""
 say "== all kernel messages during the test"

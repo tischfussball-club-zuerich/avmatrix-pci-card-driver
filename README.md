@@ -244,6 +244,20 @@ brings back the installed driver.
 DUR=60 tools/test-on-card.sh
 ```
 
+**Old vs. new:** `tools/test-on-card.sh --compare` first runs the same check on
+the installed driver, then on this one, and ends with a table of both results
+side by side (frames received, lost, duplicated and late per capture, the
+longest gap, the frame rate reported to applications, audio, CPU use, kernel
+errors), with totals and each difference marked "better" or "worse".
+`v4l2-compliance` is left out for the installed driver, because older versions
+of this driver crash the kernel in the control ioctls it tests;
+`OLD_COMPLIANCE=1` runs it there too. If no driver was loaded before, the
+installed one is loaded for its part of the test and unloaded again at the end.
+
+```sh
+DUR=30 tools/test-on-card.sh --compare
+```
+
 **`tools/card-check.sh`: check the loaded driver.** Connect a source to the
 inputs you want checked. Per channel it runs `v4l2-compliance`, a capture at
 the input size and one scaled to another size, counting lost and late frames,
@@ -254,7 +268,8 @@ same time, reports the CPU use, compares the frames the card produced with the
 frames the driver took in, and lists the driver's drop counters and problem
 messages from the kernel log. `DUR=60` makes the captures longer;
 `SKIP_COMPLIANCE=1` leaves out `v4l2-compliance`, e.g. to compare with another
-driver.
+driver; `RESULTS=<file>` also writes the numbers to a file. Every capture has a
+time limit, so a driver that stops delivering frames can't hang the check.
 
 Expected results: `v4l2-compliance` fails only its multi-open test ("a
 second open can't request buffers or stream", see above). Occasional "late"
