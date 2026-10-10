@@ -8,6 +8,9 @@ typedef unsigned int u32; typedef unsigned int __le32;
 #define le64_to_cpu(x) ((u64)(x))
 typedef unsigned int DWORD; typedef unsigned char BYTE; typedef unsigned char BOOL;
 #define min(a, b) ((a) < (b) ? (a) : (b))
+#define max(a, b) ((a) > (b) ? (a) : (b))
+typedef long long s64;
+#define div_s64(a, b) ((s64)(a) / (b))
 typedef struct { BYTE *m_pVideoScalerBuf, *m_pVideoYUV2Buf, *m_pRotateVideoBuf; } ACAP_VIDEO_INFO;
 struct hws_pcie_dev { int m_Device_SupportYV12; int m_MaxHWVideoBufferSize; ACAP_VIDEO_INFO m_VideoInfo[4]; };
 #include "driver_conv.inc"

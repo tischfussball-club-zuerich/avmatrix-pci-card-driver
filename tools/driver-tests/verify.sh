@@ -20,12 +20,12 @@ rm -f $S/sim/sim $S/sim/sim_tsan
 if ! $S/sim/build.sh $SRC > $S/sim/build.log 2>&1; then echo "!! simulator build FAILED:"; grep -m5 error $S/sim/build.log; echo "RESULT: FAIL"; exit 1; fi
 for mode in race logic nodirect irqfaults; do for f in 60 240 480; do
 	o=$S/sim/out_${mode}_$f.txt
-	unset SIM_DMA_LOCK SIM_NO_DIRECT SIM_LOSE_IRQ SIM_DUP_IRQ
-	if [ $mode = logic ]; then export SIM_DMA_LOCK=1; fi
+	unset SIM_DMA_LOCK SIM_NO_DIRECT SIM_LOSE_IRQ SIM_DUP_IRQ SIM_NTSC
+	if [ $mode = logic ]; then export SIM_DMA_LOCK=1 SIM_NTSC=1; fi	# also: 59.94 instead of 60
 	if [ $mode = nodirect ]; then export SIM_NO_DIRECT=1; fi
 	if [ $mode = irqfaults ]; then export SIM_LOSE_IRQ=40 SIM_DUP_IRQ=40; fi
 	ASAN_OPTIONS=detect_leaks=0 timeout 300 $S/sim/sim $f 45 > $o 2>&1; rc=$?
-	echo "== sim $f fps, mode=$mode (race=card DMA race present, logic=race removed, nodirect=ring path only, irqfaults=lost+duplicate IRQs): exit $rc"
+	echo "== sim $f fps, mode=$mode (race=card DMA race present, logic=race removed + 59.94 fps, nodirect=ring path only, irqfaults=lost+duplicate IRQs): exit $rc"
 	grep -E "^frames|delivered|restarts|steady|duplicate|out of order|mod 100|sequence not|timestamp not|STREAMOFF|ERROR b|stalls|latency|driver stats" $o | sed 's/^/    /'
 	for k in "torn/mixed, steady state" "duplicate frames" "frames out of order" "sequence not increasing" "timestamp not increasing" "left in driver after STREAMOFF" "completed after STREAMOFF" "2 s stalls"; do
 		v=$(grep "$k" $o | grep -o '[0-9]\+' | tail -1); [ "${v:-1}" = 0 ] || { echo "    !! $k = $v"; fail=1; }; done
@@ -36,12 +36,15 @@ for mode in race logic nodirect irqfaults; do for f in 60 240 480; do
 		p=$(grep -o "frames: [0-9]*%" $o | grep -o "[0-9]*"); echo "    steady 2-buffer app got ${p:-?}% of the frames"
 		[ "${p:-0}" -ge 75 ] || { echo "    !! steady 2-buffer app got only ${p:-0}% of the frames"; fail=1; }
 	fi
+	# the exact frame rate reported by G_PARM (1001/60000 vs 1/60)
+	ok=$(grep -o "frame rate measurements: right [0-9]*" $o | grep -o "[0-9]*$"); echo "    exact frame rate measured right ${ok:-?} times"
+	[ $f != 60 ] || [ "${ok:-0}" -gt 0 ] || { echo "    !! the frame rate was never measured"; fail=1; }
 	# a capture with no audio from the card must keep moving with silence at 48 kHz
 	a=$(grep -o "expected [0-9]*: [0-9]*%" $o | grep -o "[0-9]*%" | tr -d %); echo "    audio without card audio ran at ${a:-?}% of 48 kHz"
 	[ "${a:-0}" -ge 95 ] && [ "${a:-0}" -le 105 ] || { echo "    !! silent audio stream at ${a:-?}% of its rate"; fail=1; }
 	scan $o; [ $rc = 0 ] || fail=1
 done; done
-unset SIM_DMA_LOCK SIM_NO_DIRECT SIM_LOSE_IRQ SIM_DUP_IRQ
+unset SIM_DMA_LOCK SIM_NO_DIRECT SIM_LOSE_IRQ SIM_DUP_IRQ SIM_NTSC
 for f in 60 240; do
 	o=$S/sim/out_hostile_$f.txt
 	SIM_HOSTILE=1 ASAN_OPTIONS=detect_leaks=0 timeout 300 $S/sim/sim $f 45 > $o 2>&1; rc=$?

@@ -29,6 +29,9 @@ typedef unsigned long long u64_t;
 typedef unsigned char BYTE;
 typedef unsigned char BOOL;
 #define min(a, b) ((a) < (b) ? (a) : (b))
+#define max(a, b) ((a) > (b) ? (a) : (b))
+typedef long long s64;
+#define div_s64(a, b) ((s64)(a) / (b))
 
 #define MAX_VIDEO_HW_W 1920
 #define MAX_VIDEO_HW_H 1080

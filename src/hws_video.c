@@ -64,7 +64,7 @@ static inline void hws_dcopy(void *dst, const void *src, size_t n, bool nt)
 
 static int timing_debug;
 module_param(timing_debug, int, 0644);
-MODULE_PARM_DESC(timing_debug, "Frame timing diagnostics: 0=off, 1=per-second summary, 2=also warn on late frames");
+MODULE_PARM_DESC(timing_debug, "Frame timing diagnostics: 0=off, 1=statistics (each second with a drop or late frame, else every 10 s), 2=every second and warn on late frames");
 
 static u64 hws_frame_period_ns(struct hws_pcie_dev *pdx, int ch)
 {
@@ -103,7 +103,16 @@ static void hws_tstat_frame_in(struct hws_pcie_dev *pdx, int ch, u64 irq_ns)
 	hws_tstat_max(&ts->copy_lat_max, ktime_get_ns() - irq_ns);
 
 	if (ts->last_frame_ns) {
+		u64 period = hws_frame_period_ns(pdx, ch);
+
 		interval = irq_ns - ts->last_frame_ns;
+		/* the exact rate (59.94 vs 60) from regular intervals; a frame the
+		 * card skipped would bias it */
+		if (interval > period / 2 && interval < period * 7 / 5)
+		{
+			atomic64_add(interval, &ts->rate_sum_ns);
+			atomic_inc(&ts->rate_n);
+		}
 		if (interval < ts->interval_min)
 			ts->interval_min = interval;
 		hws_tstat_max(&ts->interval_max, interval);
@@ -122,12 +131,26 @@ static void hws_tstat_report(struct hws_pcie_dev *pdx)
 	for (ch = 0; ch < pdx->m_nCurreMaxVideoChl; ch++) {
 		struct hws_timing_stats *ts = &pdx->tstats[ch];
 		u64 elapsed_ms = div_u64(now - ts->window_start_ns, NSEC_PER_MSEC);
-		unsigned int in = atomic_xchg(&ts->frames_in, 0);
-		unsigned int out = atomic_xchg(&ts->frames_out, 0);
+		/*
+		 * A line per second only when something happened (a drop, or a frame
+		 * gap of over 1.5 frame periods); otherwise one every 10 s. The
+		 * counters keep adding up in between, so totals stay complete.
+		 */
+		bool eventful = atomic_read(&ts->stale_half) || atomic_read(&ts->dma_overrun) ||
+				atomic_read(&ts->unpaired) || atomic_read(&ts->ring_overwrite) ||
+				atomic_read(&ts->ring_skip) || atomic_read(&ts->no_app_buf) ||
+				ts->interval_max * 2 > 3 * hws_frame_period_ns(pdx, ch);
+		unsigned int in, out;
+		u32 c0, card;
+
+		if (pdx->m_bVCapStarted[ch] && !eventful && timing_debug < 2 && elapsed_ms < 10000)
+			continue;
+		in = atomic_xchg(&ts->frames_in, 0);
+		out = atomic_xchg(&ts->frames_out, 0);
 		/* frames the card completed (one second-half interrupt each) vs.
 		 * frames the driver committed: more interrupts = frames lost in the driver */
-		u32 c0 = READ_ONCE(pdx->m_half_cnt[ch][0]);
-		u32 card = c0 - ts->last_half0_cnt;
+		c0 = READ_ONCE(pdx->m_half_cnt[ch][0]);
+		card = c0 - ts->last_half0_cnt;
 
 		ts->last_half0_cnt = c0;
 
@@ -497,6 +520,7 @@ static int vidioc_s_fmt_vid_cap(struct file *file, void *priv,struct v4l2_format
 	videodev->current_out_width      = f->fmt.pix.width;
 	videodev->curren_out_height     = f->fmt.pix.height;
 	spin_unlock_irqrestore(&pdx->videoslock[videodev->index], flags);
+	videodev->fmt_by_app = true;
 	mutex_unlock(&videodev->video_lock);
 	return 0;
 }
@@ -508,6 +532,21 @@ static int hws_input_fps(struct hws_video *videodev)
 	return (r >= 1 && r <= 240) ? r : 60;
 }
 
+/* time per frame: measured exactly when known (59.94 = 1001/60000), else 1/the card's rate */
+static void hws_timeperframe(struct hws_video *videodev, u32 *num, u32 *den)
+{
+	u64 tpf = atomic64_read(&videodev->tpf);	/* one load: never half of an old value */
+	u32 n = tpf >> 32, d = (u32)tpf;
+
+	if (n && d) {
+		*num = n;
+		*den = d;
+	} else {
+		*num = 1;
+		*den = hws_input_fps(videodev);
+	}
+}
+
 /* frames come at the input's rate; there is no frame rate to choose */
 static int hws_vidioc_g_parm(struct file *file,void *fh, struct v4l2_streamparm *setfps)
 {
@@ -517,8 +556,8 @@ static int hws_vidioc_g_parm(struct file *file,void *fh, struct v4l2_streamparm 
 		return -EINVAL;
 	memset(&setfps->parm.capture, 0, sizeof(setfps->parm.capture));
 	setfps->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
-	setfps->parm.capture.timeperframe.numerator = 1;
-	setfps->parm.capture.timeperframe.denominator = hws_input_fps(videodev);
+	hws_timeperframe(videodev, &setfps->parm.capture.timeperframe.numerator,
+			 &setfps->parm.capture.timeperframe.denominator);
 	return 0;
 }
 static int hws_vidioc_enum_framesizes(struct file *file, void *fh, struct v4l2_frmsizeenum *fsize)
@@ -675,14 +714,20 @@ static int hws_release(struct file *file)
     ctx = hws_ctx_from_file(file);
     videodev = ctx->video;
     pdx = videodev->dev;
+    /* release vb2 queue resources; stops streaming and waits for the worker */
+    /* video_lock: S_FMT on another handle walks the consumers and looks at
+     * this queue (vb2_is_busy); it must not see it half released */
+    mutex_lock(&ctx->qmutex);
+    mutex_lock(&videodev->video_lock);
+    vb2_queue_release(&ctx->vbq);
     spin_lock_irqsave(&pdx->videoslock[videodev->index], flags);
     if (videodev->fileindex > 0)
         videodev->fileindex--;
+    /* the format stays as set, but the next input change may replace it */
+    if (videodev->fileindex == 0)
+        videodev->fmt_by_app = false;
     spin_unlock_irqrestore(&pdx->videoslock[videodev->index], flags);
-
-    /* release vb2 queue resources; stops streaming and waits for the worker */
-    mutex_lock(&ctx->qmutex);
-    vb2_queue_release(&ctx->vbq);
+    mutex_unlock(&videodev->video_lock);
     mutex_unlock(&ctx->qmutex);
 
     /* remove from consumers */
@@ -795,8 +840,7 @@ static int hws_vidioc_enum_frameintervals(struct file *file, void *fh,
 	if (Get_input_framesizeIndex(fival->width, fival->height) == NULL)
 		return -EINVAL;
 	fival->type = V4L2_FRMIVAL_TYPE_DISCRETE;
-	fival->discrete.numerator = 1;
-	fival->discrete.denominator = hws_input_fps(videodev);
+	hws_timeperframe(videodev, &fival->discrete.numerator, &fival->discrete.denominator);
 	return 0;
 }
 static int hws_vidioc_s_parm(struct file *file, void *fh,struct v4l2_streamparm *a)
@@ -964,6 +1008,14 @@ static const struct v4l2_file_operations hws_fops = {
 };
 
 
+/* control events, and V4L2_EVENT_SOURCE_CHANGE when the input's resolution changes */
+static int hws_subscribe_event(struct v4l2_fh *fh, const struct v4l2_event_subscription *sub)
+{
+	if (sub->type == V4L2_EVENT_SOURCE_CHANGE)
+		return v4l2_src_change_event_subscribe(fh, sub);
+	return v4l2_ctrl_subscribe_event(fh, sub);
+}
+
 static const struct v4l2_ioctl_ops hws_ioctl_fops = {
 	.vidioc_querycap = hws_vidioc_querycap,
 	.vidioc_enum_fmt_vid_cap = hws_vidioc_enum_fmt_vid_cap,
@@ -980,7 +1032,7 @@ static const struct v4l2_ioctl_ops hws_ioctl_fops = {
 	.vidioc_streamoff     = hws_streamoff,
 	.vidioc_enum_framesizes   	= hws_vidioc_enum_framesizes,
 	.vidioc_enum_frameintervals = hws_vidioc_enum_frameintervals,
-	.vidioc_subscribe_event = v4l2_ctrl_subscribe_event,
+	.vidioc_subscribe_event = hws_subscribe_event,
 	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
 	.vidioc_enum_input = hws_vidioc_enum_input,
 	.vidioc_g_input = hws_vidioc_g_input,
@@ -1270,7 +1322,7 @@ static void audio_data_process(struct work_struct *p_work)
 
 		if (bBuf && aud_len > 0)
 		{
-			WRITE_ONCE(drv->last_real_ns, ktime_get_ns());
+			atomic64_set(&drv->last_real_ns, ktime_get_ns());
 			_deliver_samples(drv, bBuf, aud_len);
 		}
 
@@ -1939,43 +1991,76 @@ static void FillBlackYUYV(BYTE *pDst, int pixels)
  * black. Offsets are even so Y-U-Y-V pairs stay intact, and the copied area
  * never extends past the source, so the padding stays black.
  */
+/* a + (b - a) * w / 256 */
+static inline int hws_lerp(int a, int b, int w)
+{
+	return a + (((b - a) * w) >> 8);
+}
+
+/*
+ * Any size to any size, for the pairs without a dedicated scaler. Like those
+ * (e.g. 1080p -> 800x600), the centre of the picture with the output's aspect
+ * ratio is scaled to fill the output: no distortion, no black bars. Bilinear
+ * in YUYV, 16.16 fixed point, sample centres aligned; integer only.
+ */
 static void All_VideoScaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h)
 {
-	BYTE *pSrcBuf = pSrc;
-	BYTE *pDestBuf = pOut;
-	int missX = 0, missY = 0, dumyX = 0, dumyY = 0;
-	int copyW, copyH, padR, padB;
-	int y;
+	int cw = in_w, chh = in_h, cx, cy, x, y;
+	int pitch = in_w * 2;
+	int stepx, stepc, stepy, posy;
 
-	if (in_w > out_w)
-		missX = ((in_w - out_w) / 2) & ~1;
+	if (in_w < 2 || in_h < 1 || out_w < 2 || out_h < 1)
+		return;
+	/* source region with the output's aspect ratio */
+	if ((s64)in_w * out_h > (s64)in_h * out_w)
+		cw = (int)div_s64((s64)in_h * out_w, out_h);
 	else
-		dumyX = ((out_w - in_w) / 2) & ~1;
-	if (in_h > out_h)
-		missY = (in_h - out_h) / 2;
-	else
-		dumyY = (out_h - in_h) / 2;
+		chh = (int)div_s64((s64)in_w * out_h, out_w);
+	cw = max(cw & ~1, 2);
+	chh = max(chh, 1);
+	cx = ((in_w - cw) / 2) & ~1;	/* even: YUYV pairs share their chroma */
+	cy = (in_h - chh) / 2;
 
-	copyW = min(out_w - 2 * dumyX, in_w - missX);
-	copyH = min(out_h - 2 * dumyY, in_h - missY);
-	padR = out_w - dumyX - copyW;
-	padB = out_h - dumyY - copyH;
+	stepx = (int)div_s64((s64)cw << 16, out_w);		/* luma, per output pixel */
+	stepc = (int)div_s64((s64)(cw / 2) << 16, out_w / 2);	/* chroma, per output pair */
+	stepy = (int)div_s64((s64)chh << 16, out_h);
+	posy = stepy / 2 - 32768;
 
-	FillBlackYUYV(pDestBuf, dumyY * out_w);
-	pDestBuf += dumyY * out_w * 2;
-	pSrcBuf += missY * in_w * 2;
-
-	for (y = 0; y < copyH; y++)
+	for (y = 0; y < out_h; y++, posy += stepy)
 	{
-		FillBlackYUYV(pDestBuf, dumyX);
-		pDestBuf += dumyX * 2;
-		memcpy(pDestBuf, pSrcBuf + missX * 2, copyW * 2);
-		pDestBuf += copyW * 2;
-		FillBlackYUYV(pDestBuf, padR);
-		pDestBuf += padR * 2;
-		pSrcBuf += in_w * 2;
+		int py = max(posy, 0), r0 = py >> 16, wy = (py >> 8) & 255;
+		int r1 = min(r0 + 1, chh - 1);
+		const BYTE *a = pSrc + (size_t)(cy + r0) * pitch + cx * 2;
+		const BYTE *b = pSrc + (size_t)(cy + r1) * pitch + cx * 2;
+		BYTE *d = pOut + (size_t)y * out_w * 2;
+		int posx = stepx / 2 - 32768, posc = stepc / 2 - 32768;
+
+		for (x = 0; x < out_w; x += 2, d += 4)
+		{
+			int k, px, c0, c1, wx, v[2];
+
+			for (k = 0; k < 2; k++, posx += stepx)
+			{
+				px = max(posx, 0);
+				c0 = px >> 16;
+				c1 = min(c0 + 1, cw - 1);
+				wx = (px >> 8) & 255;
+				v[k] = hws_lerp(hws_lerp(a[2 * c0], a[2 * c1], wx),
+						hws_lerp(b[2 * c0], b[2 * c1], wx), wy);
+			}
+			px = max(posc, 0);
+			c0 = px >> 16;
+			c1 = min(c0 + 1, cw / 2 - 1);
+			wx = (px >> 8) & 255;
+			posc += stepc;
+			d[0] = v[0];
+			d[1] = hws_lerp(hws_lerp(a[4 * c0 + 1], a[4 * c1 + 1], wx),
+					hws_lerp(b[4 * c0 + 1], b[4 * c1 + 1], wx), wy);
+			d[2] = v[1];
+			d[3] = hws_lerp(hws_lerp(a[4 * c0 + 3], a[4 * c1 + 3], wx),
+					hws_lerp(b[4 * c0 + 3], b[4 * c1 + 3], wx), wy);
+		}
 	}
-	FillBlackYUYV(pDestBuf, padB * out_w);
 }
 
 static void VideoScaler(BYTE *pSrc,BYTE *pOut,int in_w,int in_h,int out_w,int out_h)
@@ -2974,7 +3059,7 @@ static void hws_audio_silence_work(struct work_struct *work)
 	struct hws_pcie_dev *pdx = drv->dev;
 	unsigned int bytes = min_t(unsigned int, pdx->m_dwAudioPTKSize, sizeof(hws_silence));
 	u64 pkt_ns = div_u64((u64)(bytes / 4) * NSEC_PER_SEC, 48000);	/* S16 stereo: 4 bytes per frame */
-	u64 last = READ_ONCE(drv->last_real_ns), now = ktime_get_ns();	/* last first: now >= last */
+	u64 last = atomic64_read(&drv->last_real_ns), now = ktime_get_ns();	/* last first: now >= last */
 	/*
 	 * No signal: the card sends nothing, fill at once. With a signal, a gap
 	 * is usually just late delivery - inserting silence then would push the
@@ -3001,7 +3086,7 @@ static void hws_audio_silence_work(struct work_struct *work)
 			drv->silence_next_ns = now - 4 * pkt_ns;
 		for (n = 0; n < 8 && (s64)(now - drv->silence_next_ns) >= 0; n++)
 		{
-			if (READ_ONCE(drv->last_real_ns) != last)
+			if (atomic64_read(&drv->last_real_ns) != last)
 				break;	/* the card is sending again */
 			_deliver_samples(drv, hws_silence, bytes);
 			drv->silence_next_ns += pkt_ns;
@@ -3086,7 +3171,7 @@ static int hws_pcie_audio_trigger(struct snd_pcm_substream *substream, int cmd)
 			chip->period_used_byframes = 0;
 			chip->running = true;
 			spin_unlock_irqrestore(&chip->ring_lock, flags);
-			WRITE_ONCE(chip->last_real_ns, ktime_get_ns());
+			atomic64_set(&chip->last_real_ns, ktime_get_ns());
 			chip->silence_next_ns = 0;
 			/* not racing a cancel: ALSA's prepare (which cancels synchronously)
 			 * always comes between a STOP and the next START */
@@ -3095,10 +3180,12 @@ static int hws_pcie_audio_trigger(struct snd_pcm_substream *substream, int cmd)
 		case SNDRV_PCM_TRIGGER_STOP:
 		case SNDRV_PCM_TRIGGER_SUSPEND:
 			//stop dma
-			StopAudioCapture(dev,chip->index);
+			/* not running first: the status thread restarts running streams
+			 * after a card recovery, under ring_lock */
 			spin_lock_irqsave(&chip->ring_lock, flags);
 			chip->running = false;
 			spin_unlock_irqrestore(&chip->ring_lock, flags);
+			StopAudioCapture(dev,chip->index);
 			break;
 		default:
 			return -EINVAL;
@@ -3949,6 +4036,12 @@ static void hws_fanout_work(struct kthread_work *work)
 	hws_fanout_drain(container_of(work, struct hws_video, fanout_work));
 }
 
+/* a copy thread serving extra apps delays other channels' copies on few cores */
+static int hws_inline_fanout(void)
+{
+	return num_online_cpus() >= 8 ? HWS_INLINE_FANOUT : 1;
+}
+
 static int hws_list_count(struct list_head *list)
 {
 	struct list_head *pos;
@@ -3977,7 +4070,7 @@ static void hws_direct_complete(struct hws_pcie_dev *pdx, int ch, struct list_he
 	 * the copy deadline), so nobody waits for another thread. More apps, or
 	 * older frames still being fanned out: the conversion thread does it.
 	 */
-	if ((queued_ahead || hws_list_count(bufs) > HWS_INLINE_FANOUT) && !list_empty(&v->fanout_free)) {
+	if ((queued_ahead || hws_list_count(bufs) > hws_inline_fanout()) && !list_empty(&v->fanout_free)) {
 		f = list_first_entry(&v->fanout_free, struct hws_fanout, node);
 		list_del(&f->node);
 		list_splice_init(bufs, &f->bufs);
@@ -4175,6 +4268,7 @@ static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder,int mVideoB
 	int  line_cnt=0;
 	int downsize;
 	u32 gen, fmt_cnt0;
+	bool fmt_armed;
 	u32 cnt_self, peer_at_irq;
 	u64 t_irq;
 	unsigned long flags;
@@ -4243,6 +4337,7 @@ static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder,int mVideoB
 	downsize = pdx->m_format[nDecoder].DWON_SIZE;
 	gen = pdx->m_fmt_gen[nDecoder];
 	fmt_cnt0 = pdx->m_fmt_cnt0[nDecoder];
+	fmt_armed = pdx->m_fmt_armed[nDecoder];
 	spin_unlock_irqrestore(&pdx->videoslock[nDecoder], flags);
 	if((nw <=0)||(nh<=0)||(nw>MAX_VIDEO_HW_W)||(nh>MAX_VIDEO_HW_H))
 	{
@@ -4312,7 +4407,7 @@ static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder,int mVideoB
 				pdx->m_nVideoHalfDone[nDecoder] =0;
 			}
 		}
-		else if ((s32)(peer_at_irq - fmt_cnt0) <= 0)
+		else if (fmt_armed && (s32)(peer_at_irq - fmt_cnt0) <= 0)
 		{
 			/*
 			 * The card started this first half before the new format was
@@ -4329,6 +4424,15 @@ static int MemCopyVideoToSteam(struct hws_pcie_dev *pdx,int nDecoder,int mVideoB
 			pdx->m_nVideoHalfDone[nDecoder] = 1;
 			pdx->m_half1_gen[nDecoder] = gen;
 			pdx->m_half1_ts[nDecoder] = t_irq;
+			/* one check per format change: a counter compared for months
+			 * would wrap (2^31 second halves = 414 days at 60 fps) */
+			if (fmt_armed)
+			{
+				spin_lock_irqsave(&pdx->videoslock[nDecoder], flags);
+				if (pdx->m_fmt_gen[nDecoder] == gen)
+					pdx->m_fmt_armed[nDecoder] = false;
+				spin_unlock_irqrestore(&pdx->videoslock[nDecoder], flags);
+			}
 		}
 	}
 	if(vi->dwisRuning ==1)
@@ -4893,6 +4997,7 @@ static void ChangeVideoSize(struct hws_pcie_dev *pdx,int ch,int w,int h,int inte
 	pdx->m_fmt_gen[ch]++;
 	/* first halves are in the new layout only once another second half has come */
 	pdx->m_fmt_cnt0[ch] = READ_ONCE(pdx->m_half_cnt[ch][0]);
+	pdx->m_fmt_armed[ch] = true;
 	halfframeLength = pdx->m_format[ch].HLAF_SIZE/16;
 	spin_unlock_irqrestore(&pdx->videoslock[ch], flags);
 	/* SetDMAAddress (CheckCardStatus) writes the same register under reg_lock */
@@ -4904,7 +5009,92 @@ static void ChangeVideoSize(struct hws_pcie_dev *pdx,int ch,int w,int h,int inte
 	spin_lock_irqsave(&pdx->videoslock[ch], flags);
 	pdx->m_fmt_gen[ch]++;
 	pdx->m_fmt_cnt0[ch] = READ_ONCE(pdx->m_half_cnt[ch][0]);
+	pdx->m_fmt_armed[ch] = true;
 	spin_unlock_irqrestore(&pdx->videoslock[ch], flags);
+}
+
+/* tell subscribed apps (GStreamer, PipeWire, ...) that the input changed */
+static void hws_notify_source_change(struct hws_video *videodev)
+{
+	static const struct v4l2_event ev = {
+		.type = V4L2_EVENT_SOURCE_CHANGE,
+		.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION,
+	};
+
+	if (video_is_registered(&videodev->vdev))
+		v4l2_event_queue(&videodev->vdev, &ev);
+}
+
+/*
+ * New input size: if no application holds buffers, make it the default
+ * output size, so an app that keeps the default gets the input as it is
+ * (direct path, no scaling). Only sizes the driver offers.
+ */
+static void hws_follow_input(struct hws_video *videodev, int w, int h)
+{
+	struct hws_pcie_dev *pdx = videodev->dev;
+	v4l2_model_timing_t *t;
+	unsigned long flags;
+	int i;
+
+	for (i = 0; (t = v4l2_model_get_support_videoformat(i)) != NULL; i++)
+		if (t->frame_size.width == w && t->frame_size.height == h)
+			break;
+	if (!t)
+		return;
+	mutex_lock(&videodev->video_lock);
+	/* not under an application that chose its format or has buffers */
+	if (!videodev->fmt_by_app && !hws_video_busy(videodev))
+	{
+		spin_lock_irqsave(&pdx->videoslock[videodev->index], flags);
+		videodev->current_out_size_index = i;
+		videodev->current_out_width = w;
+		videodev->curren_out_height = h;
+		spin_unlock_irqrestore(&pdx->videoslock[videodev->index], flags);
+	}
+	mutex_unlock(&videodev->video_lock);
+}
+
+/*
+ * Every few seconds of capture: the input's exact rate from the frame
+ * intervals, snapped to a standard rate (59.94 and 60 differ by 0.1%; the
+ * mean over a few hundred frames is good to ~0.01%).
+ */
+static void hws_measure_rate(struct hws_pcie_dev *pdx, int ch)
+{
+	static const struct { u32 mhz, num, den; } std[] = {
+		{ 60000, 1, 60 }, { 59940, 1001, 60000 }, { 50000, 1, 50 },
+		{ 30000, 1, 30 }, { 29970, 1001, 30000 }, { 25000, 1, 25 },
+		{ 24000, 1, 24 }, { 23976, 1001, 24000 },
+	};
+	struct hws_timing_stats *ts = &pdx->tstats[ch];
+	struct hws_video *v = &pdx->video[ch];
+	u64 sum, mhz;
+	int n, i;
+
+	if (atomic_read(&ts->rate_n) < 200)
+		return;
+	n = atomic_xchg(&ts->rate_n, 0);
+	sum = atomic64_xchg(&ts->rate_sum_ns, 0);
+	if (n <= 0 || !sum)
+		return;
+	mhz = div64_u64((u64)n * 1000000000000ULL, sum);
+	for (i = 0; i < ARRAY_SIZE(std); i++)
+		if (mhz * 2500 > (u64)std[i].mhz * 2499 && mhz * 2500 < (u64)std[i].mhz * 2501)
+		{
+			/* within 0.04% */
+			atomic64_set(&v->tpf, (u64)std[i].num << 32 | std[i].den);
+			return;
+		}
+	atomic64_set(&v->tpf, 0);	/* nothing standard: the card's own figure */
+}
+
+/* new mode or signal: the old measurement doesn't apply */
+static void hws_reset_rate(struct hws_pcie_dev *pdx, int ch)
+{
+	atomic64_set(&pdx->video[ch].tpf, 0);
+	atomic_set(&pdx->tstats[ch].rate_n, 0);
+	atomic64_set(&pdx->tstats[ch].rate_sum_ns, 0);
 }
 
 static int Get_Video_Status(struct hws_pcie_dev *pdx,unsigned int  ch)
@@ -5044,6 +5234,9 @@ static int Get_Video_Status(struct hws_pcie_dev *pdx,unsigned int  ch)
 			if((res_w !=pdx->m_pVCAPStatus[ch][0].dwWidth )||(res_h!= pdx->m_pVCAPStatus[ch][0].dwHeight)||(pdx->m_pVCAPStatus[ch][0].dwinterlace!=interlace))
 			{
 				ChangeVideoSize(pdx,ch,res_w,res_h,interlace);
+				hws_reset_rate(pdx, ch);
+				hws_follow_input(&pdx->video[ch], res_w, interlace ? 2 * res_h : res_h);
+				hws_notify_source_change(&pdx->video[ch]);
 
 			}
 		}
@@ -5071,6 +5264,13 @@ static void CheckVideFmt (struct hws_pcie_dev *pdx)
 		int now = Get_Video_Status(pdx,i);
 
 		WRITE_ONCE(pdx->m_curr_No_Video[i], now);
+		if (was != now)
+		{
+			hws_reset_rate(pdx, i);
+			hws_notify_source_change(&pdx->video[i]);	/* signal lost or back */
+		}
+		else if (!now)
+			hws_measure_rate(pdx, i);
 		if (was && !now)
 		{
 			/* signal back: count the frame rate from here, not across the gap */
@@ -5106,6 +5306,21 @@ static void CheckVideFmt (struct hws_pcie_dev *pdx)
 			}
 			mutex_unlock(&pdx->pm_lock);
 			mutex_unlock(&pdx->video[ch].engine_lock);
+		}
+		/* audio streams still running: the re-init switched their capture off */
+		for (ch = 0; ch < pdx->m_nCurreMaxVideoChl; ch++)
+		{
+			struct hws_audio *drv = &pdx->audio[ch];
+			unsigned long aflags;
+
+			/* under ring_lock: a trigger STOP can't come in between */
+			spin_lock_irqsave(&drv->ring_lock, aflags);
+			if (drv->running && !READ_ONCE(pdx->removing) && !READ_ONCE(pdx->m_PciDeviceLost))
+			{
+				pdx->m_bACapStarted[ch] = 0;	/* not on the card any more */
+				StartAudioCapture(pdx, ch);
+			}
+			spin_unlock_irqrestore(&drv->ring_lock, aflags);
 		}
 	}
 	if((pdx->m_curr_No_Video[i] ==0x1)&&(pdx->m_bVCapStarted[i]==TRUE))
@@ -5812,6 +6027,11 @@ static int __maybe_unused hws_resume(struct device *dev)
 	{
 		WRITE_ONCE(pdx->m_PciDeviceLost, 1);
 		pdx->need_bringup = true;	/* the status thread re-inits it if it comes back */
+		/* streams that ran before the sleep get "no signal" frames instead
+		 * of nothing (only the flags are set: the registers are skipped) */
+		for (i = 0; i < pdx->m_nCurreMaxVideoChl; i++)
+			if (pdx->video[i].engine_users > 0)
+				StartVideoCapture(pdx, i);
 		pdx->suspended = false;
 		mutex_unlock(&pdx->pm_lock);
 		dev_warn(dev, "card not responding after resume\n");

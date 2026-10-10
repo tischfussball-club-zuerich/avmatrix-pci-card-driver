@@ -138,6 +138,9 @@ static void *sim_memcpy(void *d, const void *s, size_t n)
 /* resume/re-init is not simulated (needs the PCI core) */
 static void hws_hw_bringup(struct hws_pcie_dev *p) { (void)p; }
 static const u8 hws_silence[MAX_DMA_AUDIO_PK_SIZE];	/* a variable: not extracted with the functions */
+/* V4L2 events and the default-format update need the V4L2 core: not simulated */
+static void hws_notify_source_change(struct hws_video *v) { (void)v; }
+static void hws_follow_input(struct hws_video *v, int w, int h) { (void)v; (void)w; (void)h; }
 #include "core.inc"
 #undef memcpy
 
@@ -413,6 +416,8 @@ static struct workqueue_struct dummy_wq;
 static atomic_bool run = true;
 static int fps = 60;
 static int seconds = 30;
+static int ntsc;	/* SIM_NTSC=1: fps * 1000/1001, like 59.94 */
+static atomic_long rate_ok, rate_bad;	/* exact frame rate measurements */
 
 /* source state per channel, driven by the status thread */
 static _Atomic int src_w[NCH], src_h[NCH], src_il[NCH], src_present[NCH];	/* src_h: field height when interlaced */
@@ -498,7 +503,7 @@ static void sleep_until(u64 t)
 static void *hw_thread(void *a)
 {
 	int ch = (int)(intptr_t)a;
-	u64 slot = NSEC_PER_SEC / fps / 2, t0 = ktime_get_ns(), k = 0;
+	u64 slot = (ntsc ? NSEC_PER_SEC * 1001 / (fps * 1000ULL) : NSEC_PER_SEC / fps) / 2, t0 = ktime_get_ns(), k = 0;
 	u32 f = 0;
 
 	while (atomic_load(&run)) {
@@ -715,11 +720,27 @@ static void *status_thread(void *a)
 			if (tick % 4 == 0) {
 				int present = atomic_load(&src_present[ch]);
 				int w = atomic_load(&src_w[ch]), h = atomic_load(&src_h[ch]), il = atomic_load(&src_il[ch]);
+				int was_present = !READ_ONCE(pdx->m_curr_No_Video[ch]);
 				if (present && (pdx->m_pVCAPStatus[ch][0].dwWidth != (DWORD)w ||
 						pdx->m_pVCAPStatus[ch][0].dwHeight != (DWORD)h ||
-						pdx->m_pVCAPStatus[ch][0].dwinterlace != (DWORD)il))
+						pdx->m_pVCAPStatus[ch][0].dwinterlace != (DWORD)il)) {
 					ChangeVideoSize(pdx, ch, w, h, il);
+					hws_reset_rate(pdx, ch);
+				}
 				WRITE_ONCE(pdx->m_curr_No_Video[ch], !present);
+				/* the exact rate, as CheckVideFmt measures it */
+				if (present != was_present)
+					hws_reset_rate(pdx, ch);
+				else if (present) {
+					u32 before = atomic64_read(&pdx->video[ch].tpf) >> 32;
+					hws_measure_rate(pdx, ch);
+					u64 tpf = atomic64_read(&pdx->video[ch].tpf);
+					u32 num = tpf >> 32, den = (u32)tpf;
+					if (num && (ntsc ? num == 1001 && den == fps * 1000u : (u64)den == (u64)num * fps))
+						atomic_fetch_add(&rate_ok, 1);
+					else if (num || before)
+						atomic_fetch_add(&rate_bad, 1);	/* wrong, or a known rate lost */
+				}
 				if (!present && pdx->m_bVCapStarted[ch] == TRUE)
 					kthread_queue_work(pdx->conv_worker[ch], &pdx->video[ch].videowork);
 			}
@@ -991,6 +1012,7 @@ int main(int argc, char **argv)
 	if (argc > 2) seconds = atoi(argv[2]);
 	dma_lock_mode = getenv("SIM_DMA_LOCK") != NULL;
 	hostile = getenv("SIM_HOSTILE") != NULL;
+	ntsc = getenv("SIM_NTSC") != NULL;
 	atomic_store(&hostile_now, hostile);
 	if (hostile) printf("HOSTILE hardware: garbage registers, interrupt storm, DMA garbage, fake ALSA\n");
 	if (getenv("SIM_LOSE_IRQ")) lose_irq = atoi(getenv("SIM_LOSE_IRQ"));
@@ -1109,7 +1131,7 @@ int main(int argc, char **argv)
 		spin_unlock_irqrestore(&drv->ring_lock, fl);
 		/* as trigger START does */
 		silence_t0 = ktime_get_ns();
-		WRITE_ONCE(drv->last_real_ns, silence_t0);
+		atomic64_set(&drv->last_real_ns, silence_t0);
 		drv->silence_next_ns = 0;
 		mod_delayed_work(pdx->wq, &drv->silence_work, 64);
 	}
@@ -1183,5 +1205,8 @@ int main(int argc, char **argv)
 		       atomic_read(&ts->direct), atomic_read(&ts->dma_overrun), atomic_read(&ts->ring_overwrite), atomic_read(&ts->ring_skip), atomic_read(&ts->stale_half),
 		       atomic_read(&ts->no_app_buf), atomic_read(&ts->worker_empty), atomic_read(&ts->wq_coalesced));
 	}
-	return (torn_steady || true_dups || order_err || seq_err || ts_err || stop_leaks || done_after_stop) ? 1 : 0;
+	/* the measured rate (G_PARM) */
+	long rate_err = atomic_load(&rate_bad);
+	printf("frame rate measurements: right %ld, wrong %ld <- must be 0\n", (long)atomic_load(&rate_ok), rate_err);
+	return (torn_steady || true_dups || order_err || seq_err || ts_err || stop_leaks || done_after_stop || rate_err) ? 1 : 0;
 }

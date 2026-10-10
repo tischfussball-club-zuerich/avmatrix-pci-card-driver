@@ -42,9 +42,11 @@ analyze() {
 			 if (cnt++ && s != ps + 1) lost += s - ps - 1
 			 if (cnt > 1) { dt = (t - pt) * 1000; if (dt > max) max = dt; if (dt > 1500 / fps) late++ }
 			 if (size && b != size) wrong++
+			 if (cnt == 1) t0 = t
 			 ps = s; pt = t }
-		END { printf "   %s: %d frames, %d lost, %d late (>1.5 frame periods), max gap %.1f ms%s\n",
-			  label, cnt, lost, late, max, wrong ? sprintf(", %d with wrong size", wrong) : ""
+		END { printf "   %s: %d frames, %d lost, %d late (>1.5 frame periods), max gap %.1f ms%s%s\n",
+			  label, cnt, lost, late, max, wrong ? sprintf(", %d with wrong size", wrong) : "",
+			  (pt > t0) ? sprintf(", %.3f fps from the timestamps", (cnt - 1 + late) / (pt - t0)) : ""
 		      if (cnt < want * 0.95 || lost > 0 || wrong) exit 1 }' "$1"
 }
 
@@ -97,6 +99,8 @@ for d in "${nodes[@]}"; do
 	n=$(awk -v f="$fps" -v t="$DUR" 'BEGIN { printf "%d", f * t }')
 	v4l2-ctl -d "$d" --set-fmt-video="$saved_fmt" --stream-mmap=4 --stream-count="$n" --stream-to=/dev/null --verbose > "$TMP/seq" 2>&1
 	analyze "$TMP/seq" "$n" "$fps" $((w * h * 2)) "capture ${w}x${h}, ${DUR} s" || bad "frames lost or capture incomplete on $d"
+	# measured by the driver during that capture (59.94 vs 60), what apps get from G_PARM
+	say "   frame rate reported to applications now: $(v4l2-ctl -d "$d" --get-parm | sed -n 's/.*Frames per second: *//p')"
 
 	# another size: through the ring and the conversion thread
 	if [ "$w" = 1920 ]; then sw=1280; sh=720; else sw=1920; sh=1080; fi

@@ -359,6 +359,7 @@ struct hws_video{
 	/* direct-path fan-out to further consumers, off the IRQ thread */
 	struct kthread_work		fanout_work;	/* on conv_worker[index] */
 	struct kthread_work		copy_work;	/* half-frame copies, on copy_worker[index] */
+	atomic64_t			tpf;	/* measured time per frame, num << 32 | den (1001/60000); 0 = unknown */
 	spinlock_t			fanout_lock;
 	struct list_head		fanout_q;	/* frames to fan out, in order */
 	struct list_head		fanout_free;
@@ -367,6 +368,7 @@ struct hws_video{
 	int						Interlaced;
 	int current_out_width;
 	int curren_out_height;
+	bool fmt_by_app;	/* an application chose the format: don't follow the input (video_lock) */
 	int current_out_framerate;
 	int current_out_pixfmt;
 	int current_out_size_index;
@@ -380,7 +382,7 @@ struct hws_audio{
 	/* no packets from the card (no signal, or a source without audio): silence
 	 * keeps the stream moving instead of stalling into an I/O error */
 	struct delayed_work		silence_work;
-	u64				last_real_ns;	/* last packet from the card */
+	atomic64_t			last_real_ns;	/* last packet from the card (no torn reads on 32-bit) */
 	u64				silence_next_ns;	/* silence_work only: next silent packet due */
 	int						pos;
 	int						index;
@@ -428,6 +430,8 @@ struct hws_timing_stats {
 	int		backlog_max;		/* ready slots waiting when worker ran */
 	u64		window_start_ns;
 	u32		last_half0_cnt;	/* second-half interrupts seen at the last report */
+	atomic64_t	rate_sum_ns;	/* regular frame intervals, for the exact input rate */
+	atomic_t	rate_n;
 };
 
 struct hws_pcie_dev {
@@ -483,6 +487,7 @@ struct hws_pcie_dev {
 	u32				m_half_done_cnt[MAX_VID_CHANNELS][2];	/* copy thread: last completion handled */
 	u64				m_half1_ts[MAX_VID_CHANNELS];	/* IRQ time of that first half */
 	u32				m_fmt_cnt0[MAX_VID_CHANNELS];
+	bool				m_fmt_armed[MAX_VID_CHANNELS];	/* videoslock: m_fmt_cnt0 still to be checked */
 	u64				m_sw_rate_t0[MAX_VID_CHANNELS];	/* status thread: start of the frame-rate count */	/* videoslock: second-half count at the last format change */
 	//spinlock_t lock; /* guards command register accesses */
 	int irq_count;	/* interrupt counter */

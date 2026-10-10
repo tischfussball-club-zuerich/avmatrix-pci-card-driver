@@ -64,6 +64,9 @@ extern atomic_long sim_ratelimited_warnings;
 #define smp_store_release(p, v) do { atomic_thread_fence(memory_order_release); WRITE_ONCE(*(p), (v)); } while (0)
 #define smp_load_acquire(p) ({ __typeof__(*(p)) ___v = READ_ONCE(*(p)); atomic_thread_fence(memory_order_acquire); ___v; })
 #define max_t(t, a, b) ((t)(a) > (t)(b) ? (t)(a) : (t)(b))
+#define max(a, b) ((a) > (b) ? (a) : (b))
+#define div_s64(a, b) ((s64)(a) / (b))
+#define num_online_cpus() 16
 #define min_t(t, a, b) ((t)(a) < (t)(b) ? (t)(a) : (t)(b))
 #define queue_delayed_work(wq, d, j) mod_delayed_work((wq), (d), (j))
 #define cpu_relax() sched_yield()
@@ -94,6 +97,9 @@ struct kref { atomic_t refcount; };
 typedef struct { _Atomic s64 v; } atomic64_t;
 #define atomic64_set(a, x) atomic_store(&(a)->v, (x))
 #define atomic64_read(a) atomic_load(&(a)->v)
+#define atomic64_add(x, a) atomic_fetch_add(&(a)->v, (x))
+#define atomic64_xchg(a, x) atomic_exchange(&(a)->v, (x))
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
 /* ---- locks ---- */
 typedef struct { pthread_mutex_t m; } spinlock_t;

@@ -72,13 +72,15 @@ driver made for that card, e.g.
 [GloriousEggroll/AVMATRIX-VC12-4K-CAPTURE](https://github.com/GloriousEggroll/AVMATRIX-VC12-4K-CAPTURE).
 
 - **Input:** HDMI or SDI (depending on the card), up to 1920×1080 progressive
-  or 1080i. The card reports the input frame rate; frames are passed through
-  at that rate.
+  or 1080i. Frames are passed through at the input's rate, which the driver
+  reports exactly (59.94 fps as 1001/60000 s per frame, not 60).
 - **Output:** YUYV (4:2:2) at 1920×1080, 1680×1050, 1440×900, 1360×768,
   1280×1024, 1280×800, 1280×768, 1280×720, 1024×768, 800×600, 720×576,
   720×480, 640×480 and 1080×1920 (portrait, rotated). At the input size the
   frame is copied straight from the card into your buffer; other sizes are
-  scaled, padded or cropped by the driver.
+  scaled by the driver (bilinear, keeping the aspect ratio: e.g. 1080p to
+  640×480 crops the sides instead of squeezing the picture). Until an
+  application sets a format, the default is the input's size.
 - **Audio:** 48 kHz, stereo, 16-bit, one ALSA card per channel.
 
 ## Supported kernels and distributions
@@ -207,10 +209,11 @@ with a file `/etc/modprobe.d/hwscapture.conf` containing e.g.
 |---|---|---|
 | `direct_io` | `1` | Copy frames straight from the card into the application's buffer when no conversion is needed. `0`: always go through the driver's internal ring (for comparison). |
 | `nt_copy` | `0` | `1`: on the direct path, write frames with non-temporal stores that bypass the CPU cache. May help with several channels, may cost if the application reads each frame right away; measure on your system. |
-| `timing_debug` | `0` | `1`: log per-second statistics for each streaming channel to the kernel log (see below); `2`: also warn about late frames. |
+| `timing_debug` | `0` | `1`: log statistics for each streaming channel to the kernel log (see below); `2`: a line every second and warnings about late frames. |
 
-With `timing_debug=1`, `sudo dmesg -w | grep HwsCapture` shows a line per second
-and channel, e.g.
+With `timing_debug=1`, `sudo dmesg -w | grep HwsCapture` shows a line per channel
+for every second in which a frame was dropped or late, and otherwise one every
+10 seconds (counting since the last line), e.g.
 
 ```
 HwsCapture ch0: in 60 fps (hw 60) out 60 fps | frames card 61 in 61 | ... dma_overrun 0 unpaired 0 direct 61 ...
@@ -406,7 +409,9 @@ have also been verified on a VC42 (see [Status](#status)).
   0.2–0.9 ms per buffer).
 - **Accurate timing:** timestamps come from the frame's interrupt; sequence
   numbers are per application and always increase, so a gap is a real drop;
-  the reported frame rate is the real input rate instead of a fixed 60.
+  the reported frame rate is the real input rate instead of a fixed 60,
+  measured from the frame interrupts so that 59.94 and 60 fps are told apart
+  (an encoder given 60 for a 59.94 source drifts 3.6 s per hour).
 - **Applications with few buffers** get every frame they have room for, and
   an application that queues a buffer while a frame is arriving still gets
   it; up to three applications per channel are served directly.
@@ -427,22 +432,34 @@ have also been verified on a VC42 (see [Status](#status)).
 - Audio is delivered directly from the interrupt thread, without an extra
   wakeup per packet, and never waits behind video copies; buffers up to
   ~680 ms; the card's long name includes its PCI address.
+- Audio keeps running when the driver recovers a hung card (the card's
+  re-init switches audio capture off; the driver switches it back on).
 
 ### V4L2, controls and system integration
 
 - **Picture controls** (brightness, contrast, saturation, hue) never reached
   the hardware; they now use the kernel's control framework (`v4l2-ctl`
   lists them, events and `LOG_STATUS` work, the hue default is right).
+- **Source change events:** applications that subscribe to
+  `V4L2_EVENT_SOURCE_CHANGE` are told when the input resolution changes or
+  the signal is lost or comes back, so they can follow the input instead of
+  showing a wrong-sized picture.
 - **Format replies** are complete (colorimetry fields), the input reports
   "no signal", there is no fake analog TV standard, and `bus_info` is unique
   (`PCI:<address>`) so tools can tell two cards apart.
-- **Suspend/resume** was missing (the card came back unconfigured).
+- **Suspend/resume** was missing (the card came back unconfigured). If the
+  card is gone after a resume, running captures get "no signal" frames until
+  it comes back, instead of hanging.
 - **PCI setup:** explicit 32-bit DMA mask, PCI regions requested, bus
   mastering only after the card reset, Relaxed Ordering no longer forced on
   root ports where the kernel disables it as broken.
 - **Memory:** the 16 × 4 MB ring buffers no longer need physically contiguous
   memory (which failed after long uptime); applications can't allocate
   oversized buffers.
+- **Scaler:** sizes without a dedicated converter (e.g. 1366×768 in, 1080p
+  out) weren't scaled at all: the picture was cut to its centre or framed in
+  black. A bilinear scaler that keeps the aspect ratio now handles all of
+  them.
 - **Scaler fixes:** U/V swapped and junk pixels when centring small inputs,
   stale bytes read past the NV12 frame, an unaligned read, width and height
   swapped for portrait output on 4:2:0 boards.
