@@ -11,7 +11,7 @@ python3 -I $H/extract.py $SRC/hws_video.c hws_frame_period_ns hws_copy_too_late 
   EnableVideoCapture hws_park_channel CheckVideoCapture CheckCardStatus StartVideoCapture StopVideoCapture \
   SetVideoFormteSize ChangeVideoSize hws_get_mark hws_put_mark hws_direct_requeue_locked hws_direct_reclaim hws_fanout_drain hws_fanout_work hws_direct_complete hws_dcopy hws_copy_doubled hws_take_late_buffers hws_inline_fanout hws_list_count hws_frame_drop hws_direct_half hws_copy_half MemCopyVideoToSteam MemCopyAudioToSteam SetAudioQuene \
   hws_audio_dpc SetQuene hws_video_dpc irqhandler hws_irq_thread hws_copy_work \
-  hws_enable_card_irqs CheckAudioCapture StartAudioCapture StopAudioCapture EnableAudioCapture SetDMAAddress InitVideoSys hws_measure_rate hws_rate_signal_change hws_reset_rate hws_watchdog Get_Video_Status CheckVideFmt _deliver_samples audio_data_process hws_audio_silence_work > $H/named.inc
+  hws_enable_card_irqs CheckAudioCapture StartAudioCapture StopAudioCapture EnableAudioCapture SetDMAAddress InitVideoSys hws_measure_rate hws_rate_matches_card hws_rate_signal_change hws_rate_check hws_reset_rate hws_watchdog Get_Video_Status CheckVideFmt hws_ring_write _deliver_samples audio_data_process hws_audio_silence_work > $H/named.inc
 # forward declarations for everything extracted
 python3 -I - $H/conv.inc $H/named.inc > $H/protos.inc <<'PY'
 import re, sys

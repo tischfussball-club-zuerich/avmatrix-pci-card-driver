@@ -1398,6 +1398,24 @@ static void SetNoVideoMem(uint8_t * pDest, int  w,int h)
 		pNS = pNS+w*2;
 	}
 }
+static const u8 hws_silence[MAX_DMA_AUDIO_PK_SIZE];
+
+/* frames into the ALSA ring at the write position; ring_lock held */
+static void hws_ring_write(struct hws_audio *drv, struct snd_pcm_runtime *runtime,
+			   const u8 *data, u32 frames, u32 frame_bytes)
+{
+	/* the packet may be larger than the whole ring: wrap as often as needed */
+	while (frames) {
+		u32 chunk = min(frames, drv->ring_size_byframes - drv->ring_wpos_byframes);
+
+		memcpy(runtime->dma_area + drv->ring_wpos_byframes * frame_bytes, data, chunk * frame_bytes);
+		data += chunk * frame_bytes;
+		frames -= chunk;
+		drv->ring_wpos_byframes = (drv->ring_wpos_byframes + chunk) % drv->ring_size_byframes;
+		drv->period_used_byframes += chunk;
+	}
+}
+
 /*
  * Append one captured packet to the ALSA ring. Everything that touches the
  * runtime happens under ring_lock and only while the stream runs, so a
@@ -1407,12 +1425,14 @@ static void SetNoVideoMem(uint8_t * pDest, int  w,int h)
  * step). Otherwise silence, written only if no real packet came since
  * last_real_ns was fill_after - checked under the lock, so a real packet can't
  * slip in between and get silence after it. Returns false if skipped for that.
+ * Silence covers the time up to fill_until (the end of its packet).
  */
-static bool _deliver_samples(struct hws_audio *drv, const u8 *aud_data, u32 aud_len, u64 fill_after)
+static bool _deliver_samples(struct hws_audio *drv, const u8 *aud_data, u32 aud_len,
+			     u64 fill_after, u64 fill_until)
 {
 	struct snd_pcm_substream *substream;
 	struct snd_pcm_runtime *runtime;
-	u32 frame_bytes, frames, chunk;
+	u32 frame_bytes, frames;
 	unsigned long flags;
 	int elapsed = 0;
 
@@ -1434,16 +1454,44 @@ static bool _deliver_samples(struct hws_audio *drv, const u8 *aud_data, u32 aud_
 
 	frame_bytes = 2 * drv->channels;
 	frames = aud_len / frame_bytes;
-	/* the packet may be larger than the whole ring: wrap as often as needed */
-	while (frames) {
-		chunk = min(frames, drv->ring_size_byframes - drv->ring_wpos_byframes);
-		memcpy(runtime->dma_area + drv->ring_wpos_byframes * frame_bytes,
-		       aud_data, chunk * frame_bytes);
-		aud_data += chunk * frame_bytes;
-		frames -= chunk;
-		drv->ring_wpos_byframes = (drv->ring_wpos_byframes + chunk) % drv->ring_size_byframes;
-		drv->period_used_byframes += chunk;
+	if (fill_after)
+	{
+		drv->silence_until = fill_until;
+		drv->after_silence = true;
 	}
+	else if (drv->after_silence && frames)
+	{
+		/*
+		 * The card is back: its packet started one packet before its
+		 * interrupt. Silence that ran past that start is taken off the
+		 * front of the packet, a gap before it is filled - otherwise each
+		 * dropout would leave the audio up to a packet later or earlier.
+		 */
+		struct hws_pcie_dev *pdx = drv->dev;
+		u64 irq = max((u64)atomic64_read(&pdx->m_audio_half_ts[drv->index][0]),
+			      (u64)atomic64_read(&pdx->m_audio_half_ts[drv->index][1]));
+		s64 start = irq - div_u64((u64)frames * NSEC_PER_SEC, 48000);
+		s64 over = (s64)(drv->silence_until - start);
+		u32 adj = min_t(u64, div_u64((u64)abs(over) * 48000, NSEC_PER_SEC), frames);
+
+		drv->after_silence = false;
+		if (over > 0)
+		{
+			aud_data += adj * frame_bytes;
+			frames -= adj;
+		}
+		else
+		{
+			while (adj)
+			{
+				u32 n = min_t(u32, adj, sizeof(hws_silence) / frame_bytes);
+
+				hws_ring_write(drv, runtime, hws_silence, n, frame_bytes);
+				adj -= n;
+			}
+		}
+	}
+	hws_ring_write(drv, runtime, aud_data, frames, frame_bytes);
 	/* check if a period available */
 	if (drv->period_used_byframes >= drv->period_size_byframes) {
 		elapsed = 1;
@@ -1493,7 +1541,7 @@ static void audio_data_process(struct work_struct *p_work)
 
 		if (bBuf && aud_len > 0)
 		{
-			_deliver_samples(drv, bBuf, aud_len, 0);
+			_deliver_samples(drv, bBuf, aud_len, 0, 0);
 			atomic_inc(&drv->pkts_card);
 		}
 
@@ -3430,7 +3478,6 @@ static int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 	return 0;
 }
 
-static const u8 hws_silence[MAX_DMA_AUDIO_PK_SIZE];
 
 /*
  * While a capture runs: if the card sends no audio (no signal, or a source
@@ -3438,6 +3485,19 @@ static const u8 hws_silence[MAX_DMA_AUDIO_PK_SIZE];
  * keeps moving - otherwise apps see it stall and fail with an I/O error.
  * Stops by itself once real packets arrive again or the stream stops.
  */
+/*
+ * Frames in the ALSA ring the app hasn't read yet: ALSA's count up to its
+ * last look at our pointer, plus what we wrote since (that look also happens
+ * mid-period, on every read and avail/delay query). ring_lock held.
+ */
+static long hws_audio_unread(struct hws_audio *drv, struct snd_pcm_runtime *runtime)
+{
+	long ring = drv->ring_size_byframes;
+	long hw = (long)(READ_ONCE(runtime->status->hw_ptr) % ring);
+
+	return (long)snd_pcm_capture_avail(runtime) + (drv->ring_wpos_byframes - hw + ring) % ring;
+}
+
 static void hws_audio_silence_work(struct work_struct *work)
 {
 	struct hws_audio *drv = container_of(to_delayed_work(work), struct hws_audio, silence_work);
@@ -3464,10 +3524,11 @@ static void hws_audio_silence_work(struct work_struct *work)
 	lr = atomic64_read(&drv->last_real_ns);
 	if (running && drv->substream && drv->substream->runtime && drv->ring_size_byframes)
 	{
-		/* frames the app hasn't read yet: ALSA's count, plus ours since the last period */
-		long unread = (long)snd_pcm_capture_avail(drv->substream->runtime) + drv->period_used_byframes;
+		/* a margin of one or two packets, less with a ring of only two periods */
+		long margin = clamp_t(long, (long)drv->ring_size_byframes - (long)drv->period_size_byframes,
+				      pkt_frames, 2 * pkt_frames);
 
-		room = (long)drv->ring_size_byframes - unread - 2 * pkt_frames;
+		room = (long)drv->ring_size_byframes - hws_audio_unread(drv, drv->substream->runtime) - margin;
 	}
 	spin_unlock_irqrestore(&drv->ring_lock, flags);
 	if (!running || !pkt_frames)
@@ -3495,7 +3556,7 @@ static void hws_audio_silence_work(struct work_struct *work)
 		max_n = clamp_t(long, room / pkt_frames, 0, 8);
 		for (n = 0; n < max_n && (s64)(now - drv->silence_next_ns) >= 0; n++)
 		{
-			if (!_deliver_samples(drv, hws_silence, bytes, lr))
+			if (!_deliver_samples(drv, hws_silence, bytes, lr, drv->silence_next_ns))
 			{
 				filling = false;	/* the card is sending again */
 				break;
@@ -3510,7 +3571,9 @@ static void hws_audio_silence_work(struct work_struct *work)
 		if ((s64)(drv->silence_next_ns - now) > 0)
 			delay_ns = drv->silence_next_ns - now;	/* caught up: the next packet's time */
 		else if (n == max_n && max_n < 8)
-			delay_ns = pkt_ns / 4;	/* behind, the app's buffer full: wait for it to read */
+			/* behind, the app's buffer full: it reads soon after each period
+			 * while it is reading at all; one that stopped is asked once a packet */
+			delay_ns = n ? pkt_ns / 4 : pkt_ns;
 		else
 			delay_ns = 1;		/* behind: next jiffy */
 	}
@@ -3763,7 +3826,7 @@ static void EnableVideoCapture(struct hws_pcie_dev *pdx,int index,int en)
 	ULONG status;
 	int enable;
 	unsigned long flags;
-	pdx->m_bVCapStarted[index] = en;
+	WRITE_ONCE(pdx->m_bVCapStarted[index], en);
 	if(pdx->m_PciDeviceLost) return;
 	/* one register holds the enable bits of all channels: serialize the RMW */
 	spin_lock_irqsave(&pdx->reg_lock, flags);
@@ -5697,25 +5760,52 @@ static void hws_measure_rate(struct hws_pcie_dev *pdx, int ch)
 }
 
 /*
+ * The measured rate against the card's own whole-number figure (newer
+ * hardware reads it from the receiver): more than 1.5 fps apart, the source
+ * changed its rate. Interlaced, the card may count fields or frames.
+ */
+static bool hws_rate_matches_card(struct hws_pcie_dev *pdx, int ch, u64 tpf)
+{
+	u64 card = (u64)pdx->m_pVCAPStatus[ch][0].dwFrameRate * 1000, mhz;
+
+	if (!tpf || !(u32)tpf || !card)
+		return true;	/* nothing to compare */
+	mhz = div64_u64((u64)(u32)tpf * 1000ULL, tpf >> 32);	/* den/num Hz, x1000 */
+#define HWS_NEAR(a, b)	((a) + 1500 >= (b) && (a) <= (b) + 1500)
+	if (HWS_NEAR(mhz, card))
+		return true;
+	if (pdx->m_pVCAPStatus[ch][0].dwinterlace && (HWS_NEAR(2 * mhz, card) || HWS_NEAR(mhz, 2 * card)))
+		return true;
+#undef HWS_NEAR
+	return false;
+}
+
+/*
  * Signal lost or back: measure afresh, but keep the rate measured before -
  * usually the same source returns after a dropout, and the exact rate
  * (59.94) is known at once instead of 60 for the seconds a measurement takes.
- * A different rate (the card's own whole-number figure says so) or a new
- * mode (ChangeVideoSize: hws_reset_rate) starts from the card's figure.
+ * Not on the oldest hardware (its figure is counted from frames, stale after a
+ * dropout); a different rate is caught by hws_rate_check() on every poll, and
+ * a new mode (ChangeVideoSize: hws_reset_rate) starts over anyway.
  */
 static void hws_rate_signal_change(struct hws_pcie_dev *pdx, int ch, bool back)
 {
-	u64 tpf = atomic64_read(&pdx->video[ch].tpf);
-	u32 card = pdx->m_pVCAPStatus[ch][0].dwFrameRate;
-
 	atomic64_set(&pdx->tstats[ch].rate_acc, 0);
 	pdx->tstats[ch].rate_cand = 0;
-	if (back && tpf && (u32)tpf && card)
-	{
-		u64 mhz = div64_u64((u64)(u32)tpf * 1000ULL, tpf >> 32);	/* den/num Hz, x1000 */
+	if (back && (pdx->m_DeviceHW_Version == 0 ||
+		     !hws_rate_matches_card(pdx, ch, atomic64_read(&pdx->video[ch].tpf))))
+		atomic64_set(&pdx->video[ch].tpf, 0);
+}
 
-		if (mhz + 1500 < (u64)card * 1000 || mhz > (u64)card * 1000 + 1500)
-			atomic64_set(&pdx->video[ch].tpf, 0);
+/* with a signal, each poll: a kept or measured rate the card contradicts goes */
+static void hws_rate_check(struct hws_pcie_dev *pdx, int ch)
+{
+	if (pdx->m_DeviceHW_Version > 0 &&
+	    !hws_rate_matches_card(pdx, ch, atomic64_read(&pdx->video[ch].tpf)))
+	{
+		atomic64_set(&pdx->video[ch].tpf, 0);
+		atomic64_set(&pdx->tstats[ch].rate_acc, 0);
+		pdx->tstats[ch].rate_cand = 0;
 	}
 }
 
@@ -5758,7 +5848,7 @@ static int Get_Video_Status(struct hws_pcie_dev *pdx,unsigned int  ch)
 			dev_warn(&pdx->pdev->dev, "card stopped responding\n");
 		}
 		/* gone: "no signal"; a glitch so far: keep what we had */
-		return READ_ONCE(pdx->m_PciDeviceLost) ? 1 : READ_ONCE(pdx->m_curr_No_Video[ch]);
+		return READ_ONCE(pdx->m_PciDeviceLost) ? 1 : READ_ONCE(pdx->m_card_No_Video[ch]);
 	}
 	pdx->m_lost_reads = 0;
 	if (READ_ONCE(pdx->m_PciDeviceLost) && !READ_ONCE(pdx->suspended))
@@ -5934,7 +6024,10 @@ static void CheckVideFmt (struct hws_pcie_dev *pdx)
 				mod_delayed_work(pdx->wq, &pdx->audio[i].silence_work, 0);
 		}
 		else if (!now)
+		{
+			hws_rate_check(pdx, i);
 			hws_measure_rate(pdx, i);
+		}
 		if (was && !now)
 		{
 			/* signal back: count the frame rate from here, not across the gap */
@@ -6039,9 +6132,13 @@ static bool hws_card_reachable(struct hws_pcie_dev *pdx)
 static void hws_watchdog(struct hws_pcie_dev *pdx)
 {
 	u64 now = ktime_get_ns();
+	/* first run, or the thread didn't run for a while (suspend, a stall of the
+	 * system): what it saw then says nothing about now - start counting afresh */
+	bool fresh = now - pdx->wd_last_ns > NSEC_PER_SEC / 2;
 	bool stalled = false;
 	int ch;
 
+	pdx->wd_last_ns = now;
 	for (ch = 0; ch < pdx->m_nCurreMaxVideoChl; ch++)
 	{
 		u32 cnt = READ_ONCE(pdx->m_half_cnt[ch][0]);
@@ -6051,13 +6148,10 @@ static void hws_watchdog(struct hws_pcie_dev *pdx)
 			   !READ_ONCE(pdx->irq_storm_off) && !READ_ONCE(pdx->m_PciDeviceLost) &&
 			   !READ_ONCE(pdx->need_bringup);
 
-		if (cnt != pdx->wd_cnt[ch] || !due)
+		if (cnt != pdx->wd_cnt[ch] || !due || fresh)
 		{
 			if (cnt != pdx->wd_cnt[ch] && pdx->wd_stalled[ch])
-			{
 				dev_info(&pdx->pdev->dev, "channel %d: frames from the card again\n", ch);
-				pdx->wd_tries = 0;
-			}
 			pdx->wd_cnt[ch] = cnt;
 			pdx->wd_ns[ch] = now;
 			WRITE_ONCE(pdx->wd_stalled[ch], false);
@@ -6076,6 +6170,9 @@ static void hws_watchdog(struct hws_pcie_dev *pdx)
 				 " - the kernel switched its interrupt off (\"nobody cared\"?); reload the driver" : "");
 		}
 	}
+	/* a card that keeps hanging gets 3 tries, until a minute passes without a stall */
+	if (!stalled && pdx->wd_tries && now - pdx->wd_kick_ns > 60 * NSEC_PER_SEC)
+		pdx->wd_tries = 0;
 	if (stalled && pdx->wd_tries < 3 && now - pdx->wd_kick_ns > 10 * NSEC_PER_SEC)
 	{
 		pdx->wd_tries++;
@@ -6144,8 +6241,8 @@ static int MainKsThreadHandle(void *arg)
 			}
 		}
 		tick++;
-		if (need_check == 1)
-			hws_watchdog(pdx);
+		/* every tick: a channel not streaming is refreshed (and its stall ends) */
+		hws_watchdog(pdx);
 		/* also when a card that was gone at resume is back (config-space check
 		 * only until then): CheckVideFmt notices it and re-inits it. Idle: once
 		 * a second, so the default format matches the input before an app opens
@@ -6278,17 +6375,20 @@ static int irq_setup(struct hws_pcie_dev *lro, struct pci_dev *pdev)
 		irq_flag = lro->msi_enabled ? 0 : IRQF_SHARED;
 
 		/*
-		 * A shared line: IRQF_ONESHOT, which every sharer has to agree on - a
-		 * device registering later may insist on it. The IRQ thread only
-		 * delivers audio (tens of us), so the line is hardly ever held back.
-		 * If an earlier sharer registered without it, go along with that.
+		 * IRQF_ONESHOT has to match among all sharers of a line. Without it
+		 * by default (most drivers' plain request_irq() don't set it); join a
+		 * line already set up with it: IRQF_COND_ONESHOT where the kernel
+		 * has it, else a second try. The IRQ thread only delivers audio
+		 * (tens of us), so a ONESHOT line is hardly ever held back.
 		 */
+#ifdef IRQF_COND_ONESHOT
 		if (irq_flag & IRQF_SHARED)
-			irq_flag |= IRQF_ONESHOT;
+			irq_flag |= IRQF_COND_ONESHOT;
+#endif
 		rc = request_threaded_irq(pdev->irq, irqhandler, hws_irq_thread, irq_flag, pci_name(pdev), lro);
 		if (rc == -EBUSY && (irq_flag & IRQF_SHARED))
 			rc = request_threaded_irq(pdev->irq, irqhandler, hws_irq_thread,
-						  irq_flag & ~IRQF_ONESHOT, pci_name(pdev), lro);
+						  irq_flag | IRQF_ONESHOT, pci_name(pdev), lro);
 		if (rc)
 		{
 		}

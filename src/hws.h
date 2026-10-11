@@ -398,6 +398,10 @@ struct hws_audio{
 	atomic_t			pkts_card;	/* audio packets delivered: from the card, */
 	atomic_t			pkts_silence;	/* and silence filled in by the driver */
 	u64				silence_next_ns;	/* silence_work only: next silent packet due */
+	/* ring_lock: silence was delivered up to this time (the end of its last
+	 * packet), so the card's first packet after it can be fitted on */
+	u64				silence_until;
+	bool				after_silence;
 	int						pos;
 	int						index;
 	int                         ring_offsize;
@@ -573,8 +577,9 @@ struct hws_pcie_dev {
 	u32 wd_cnt[MAX_VID_CHANNELS];		/* m_half_cnt[ch][0] when it last moved */
 	u64 wd_ns[MAX_VID_CHANNELS];		/* and when */
 	bool wd_stalled[MAX_VID_CHANNELS];
-	int wd_tries;				/* re-inits since frames last came back */
+	int wd_tries;				/* re-inits; reset after 60 s without a stall */
 	u64 wd_kick_ns;				/* the last one */
+	u64 wd_last_ns;				/* the watchdog's previous run */
 	dma_addr_t   		m_pbyAudio_phys[MAX_VID_CHANNELS] ;
 	uint8_t     *m_pbyAudioBuffer[MAX_VID_CHANNELS];
 	uint8_t		*m_pbyUserAudioBuffer[MAX_VID_CHANNELS];

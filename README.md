@@ -23,9 +23,13 @@ list of crashes, hangs and causes of stutter in the original code.
   has its own real-time copy thread, so four channels don't wait for each
   other.
 - **Audio that keeps running** when the source is unplugged (silence instead
-  of an I/O error), without xruns.
-- **Several applications per channel** (e.g. OBS and a preview), each getting
-  every frame.
+  of an I/O error), without xruns, and stays in step with the video across
+  signal dropouts.
+- **No silent freezes:** a watchdog notices when the card stops delivering
+  frames, shows "no signal" instead of a frozen picture and brings the card
+  up again.
+- **Several applications per channel** (e.g. OBS and a preview, up to 8, all
+  at the same size), each getting every frame.
 - **Correct V4L2/ALSA behaviour** (`v4l2-compliance` passes except for the
   intentional multi-app design), working picture controls, suspend/resume,
   clean unplug and reboot.
@@ -47,7 +51,13 @@ two 1080p60 HDMI sources, using [`tools/test-on-card.sh`](#testing-on-your-card)
 
 Not yet tested on the card: all four inputs with a signal at once, long
 sessions (hours), suspend/resume, hot-unplugging the source while streaming.
-Reports are welcome; `tools/test-on-card.sh` writes a log that helps.
+
+The card test above was made with an earlier version. Everything added since
+(frame accounting in the stats file, the watchdog, the audio fill that keeps
+audio in step across dropouts, the handling of unsupported input modes, the
+faster scaler, the limits for local users) is verified with the userspace
+test suite and compile tests only, not yet on the card. Reports are welcome;
+`tools/test-on-card.sh --compare` writes a log that helps.
 
 ## Supported hardware
 
@@ -201,9 +211,12 @@ In OBS add a "Video Capture Device (V4L2)" source and pick `HVideo N`, and an
 "Audio Input Capture" (PipeWire/PulseAudio) or ALSA source for `HAudio N`.
 Use the input's own resolution for the lowest CPU use and latency.
 
-Several applications can capture the same channel at the same time; each one
-gets every frame for which it has a buffer queued. The `play/` directory has
-quick test scripts (`xawtv`, `gst-launch-1.0`).
+Several applications (up to 8) can capture the same channel at the same time;
+each one gets every frame for which it has a buffer queued. They share the
+channel's output size: while one of them holds buffers, another one asking
+for a different size gets `EBUSY` (start the others at the same size, or stop
+the first). The `play/` directory has quick test scripts (`xawtv`,
+`gst-launch-1.0`).
 
 ### Module parameters
 
@@ -232,10 +245,12 @@ HwsCapture ch0: in 60 fps (hw 60) out 60 fps | frames card 61 in 61 | ... dma_ov
 ```
 
 `frames card` / `in` are the frames the card completed and the frames the
-driver took in; they should be equal. `dma_overrun`, `unpaired`, `stale_half`,
-`overwrite` and `skip` count frames the driver had to drop and should stay 0
-in normal operation; `no_app_buf` counts frames no application had a free
-buffer for; `direct` counts frames that took the fast path.
+driver took in; every card frame is either taken in or counted under exactly
+one drop reason. `dma_overrun`, `stale_half`, `unpaired`, `aborted`,
+`copy_missed`, `overwrite` and `skip` count frames the driver had to drop and
+should stay 0 in normal operation (`aborted` also counts frames given up
+during a mode change or a stop); `no_app_buf` counts frames no application
+had a free buffer for; `direct` counts frames that took the fast path.
 
 ## Testing on your card
 
@@ -284,7 +299,9 @@ worked out from the frame timestamps (they should agree, e.g. 59.940 for a
 59.94 source). Then it captures all channels with a signal plus audio on every
 card at the same time, reports the CPU use, compares the frames the card
 produced with the frames the driver took in, and lists the driver's drop
-counters and problem messages from the kernel log.
+counters and problem messages from the kernel log. Over the whole run it checks
+from the driver's `stats` files that every frame the card completed was taken
+in or counted as dropped (more than 2 unaccounted frames is a driver bug).
 
 It also checks behaviour beyond plain capturing (about 2 minutes; `EXTRA=0`
 leaves it out):
@@ -443,7 +460,24 @@ sudo depmod -a
 | No `/dev/video*` device | `lspci -nn` must list the card with an ID from the table above (the VC12-4K needs a different driver); check `sudo dmesg \| grep -i hwscapture`. |
 | Picture shows "no signal" | No or unsupported input signal. Check the source and cable; inputs above 1920×1080 are not supported (`sudo dmesg \| grep -i hwscapture` names the mode). |
 | Stutter or dropped frames | Run `sudo tools/stutter-monitor.py` while streaming (see [Monitoring while streaming](#monitoring-while-streaming)): it tells card, driver, application and system causes apart. `tools/card-check.sh` tests the card on its own (see [Testing on your card](#testing-on-your-card)); `direct_io=0` rules out the fast path. |
+| Picture freezes, or "no frames from the card" in `dmesg` | The watchdog found the card silent although it reports a signal and re-initialised it. If the message names a switched-off interrupt ("nobody cared"), another device sharing the interrupt line misbehaved: reload the driver (`sudo modprobe -r HwsCapture && sudo modprobe HwsCapture`) or reboot. Please report it with the `dmesg` output. |
+| A second application fails with `EBUSY` | It asked for a different size than the one already streaming on that channel: use the same size for all applications on a channel. A ninth streaming application also gets `EBUSY`. |
+| Audio lags the video in OBS | Audio from the card comes in 21 ms packets; through PipeWire that adds about 40 ms or more. Set a sync offset on the audio source in OBS (Advanced Audio Properties). |
 | Module does not unload (`in use`) | Close all applications using the video or audio devices, including PipeWire (`systemctl --user stop pipewire.socket pipewire-pulse.socket pipewire wireplumber`), or reboot. |
+
+## Known limitations
+
+- **1080i** (and other interlaced inputs) is delivered as progressive frames
+  at the field rate, each field with its lines doubled: half the vertical
+  detail, and fine horizontal lines can flicker. Applications aren't told it
+  was interlaced, so they can't deinterlace it themselves.
+- **One output size per channel** at a time (see [Using the card](#using-the-card)).
+- **Audio latency:** the card delivers audio in 1024-frame packets (21 ms);
+  PipeWire adds its own buffering on top.
+- **Frame rate:** the driver reports the input's rate and can't reduce it
+  (`S_PARM` is ignored); an application wanting 30 fps from a 60 fps source
+  drops frames itself.
+- **Up to 1920×1080** input; larger modes show "no signal".
 
 ## Improvements over the official driver
 
@@ -512,7 +546,8 @@ have also been verified on a VC42 (see [Status](#status)).
   a misbehaving device sharing the line, or its DMA engine hung), applications
   waited forever and nothing was logged. A watchdog now notices it after 2 s,
   logs it, shows the "no signal" picture instead of a frozen one and brings
-  the card up again (at most 3 times, 10 s apart).
+  the card up again (at most 3 times, 10 s apart, until a minute passes
+  without a stall).
 - **Removing the device** waited for every audio application to close.
 - **Interrupt acknowledgements were lost** (bits added with `+=`), stalling
   channels; channels could switch each other off through an unlocked shared
@@ -639,8 +674,9 @@ have also been verified on a VC42 (see [Status](#status)).
   converter against guard pages with AddressSanitizer/UBSan, and a simulation
   of the capture core (simulated card at real interrupt timing, several
   applications that keep restarting, signal loss, mode changes, lost and
-  duplicate interrupts, hostile hardware returning garbage) that checks every
-  delivered frame, plus ThreadSanitizer.
+  duplicate interrupts, hostile hardware returning garbage, a card whose
+  interrupts die for seconds) that checks every delivered frame and that
+  every frame is accounted for, plus ThreadSanitizer.
 - **`tools/card-check.sh`, `tools/leak-check.sh`, `tools/test-on-card.sh`** for the real card (see
   [Testing on your card](#testing-on-your-card)).
 
@@ -649,7 +685,7 @@ have also been verified on a VC42 (see [Status](#status)).
 - `src/`: driver source (`hws_video.c`, `hws.h`, `hws_reg.h`) and the DKMS
   config.
 - `tools/driver-tests/`: the userspace test suite; run
-  `tools/driver-tests/verify.sh src` (about 30 minutes, prints `RESULT: PASS`
+  `tools/driver-tests/verify.sh src` (about 40 minutes, prints `RESULT: PASS`
   or `FAIL`); see its README.
 - `tools/card-check.sh`, `tools/leak-check.sh`, `tools/test-on-card.sh`:
   checks on the real card.

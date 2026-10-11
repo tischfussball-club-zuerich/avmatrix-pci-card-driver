@@ -290,3 +290,9 @@ static inline unsigned long snd_pcm_capture_avail(struct snd_pcm_runtime *r) { (
 #define irq_get_irq_data(irq) ((struct irq_data *)0)
 #define irqd_irq_disabled(d) 0
 struct irq_data;
+#ifndef SIM_SHIM_UNREAD
+#define SIM_SHIM_UNREAD
+struct hws_audio;
+/* the simulated apps read every period at once */
+static inline long hws_audio_unread(struct hws_audio *d, struct snd_pcm_runtime *r) { (void)d; (void)r; return 0; }
+#endif
