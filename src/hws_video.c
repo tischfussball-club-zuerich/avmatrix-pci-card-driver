@@ -890,6 +890,13 @@ static int hws_init_controls(struct hws_video *video)
 	struct v4l2_ctrl_handler *hdl = &video->ctrl_handler;
 
 	v4l2_ctrl_handler_init(hdl, 4);
+	/* the oldest hardware (version 121 and below, the 8501 at 122) doesn't
+	 * get the picture register written (SetHardWareInfo): no controls rather
+	 * than ones that change nothing */
+	if (video->dev->m_DeviceHW_Version == 0) {
+		video->ctrl_ready = true;
+		return 0;
+	}
 	v4l2_ctrl_new_std(hdl, &hws_ctrl_ops, V4L2_CID_BRIGHTNESS,
 			  MIN_VAMP_BRIGHTNESS_UNITS, MAX_VAMP_BRIGHTNESS_UNITS, 1, BrightnessDefault);
 	v4l2_ctrl_new_std(hdl, &hws_ctrl_ops, V4L2_CID_CONTRAST,
@@ -980,7 +987,8 @@ static bool hws_userptr_too_big(const struct v4l2_buffer *b)
 /*
  * ...and one too small for the format: vb2 would unpin the buffer's old
  * memory on that error without buf_cleanup, and its charge would stay
- * counted for good. qmutex held.
+ * counted for good. A buffer already prepared (PREPARE_BUF) is queued as it
+ * is: vb2 ignores the pointer and length passed with it. qmutex held.
  */
 static bool hws_userptr_too_short(struct vb2_queue *q, const struct v4l2_buffer *b)
 {
@@ -989,7 +997,7 @@ static bool hws_userptr_too_short(struct vb2_queue *q, const struct v4l2_buffer 
 	if (b->memory != V4L2_MEMORY_USERPTR || b->type != q->type)
 		return false;
 	vb = vb2_get_buffer(q, b->index);
-	return vb && b->length < vb->planes[0].min_length;
+	return vb && !vb->prepared && b->length < vb->planes[0].min_length;
 }
 
 static int hws_prepare_buf(struct file *file, void *priv, struct v4l2_buffer *b)
@@ -3376,6 +3384,8 @@ static int hws_video_register(struct hws_pcie_dev *dev)
 	int i;
 	int err=-1;
 
+	if (dev->m_DeviceHW_Version == 0)
+		dev_info(&dev->pdev->dev, "no picture controls on this hardware version\n");
 	for(i=0;i<dev->m_nCurreMaxVideoChl;i++){
 		struct hws_video *video = &dev->video[i];
 		struct video_device *vdev = &video->vdev;
@@ -4697,6 +4707,23 @@ static void hws_copy_doubled(BYTE *dst, const BYTE *src, int off, int len, int p
 }
 
 /*
+ * Card frames the driver drops still use up a sequence number, so apps see
+ * the gap (V4L2: a gap in the sequence is a lost frame). Not while the
+ * channel shows no signal: the frames then are the "no signal" pictures,
+ * numbered as they go out. Copy thread only.
+ */
+static void hws_seq_skip(struct hws_pcie_dev *pdx, int ch, u32 n)
+{
+	unsigned long flags;
+
+	if (!n || READ_ONCE(pdx->m_curr_No_Video[ch]))
+		return;
+	spin_lock_irqsave(&pdx->videoslock[ch], flags);
+	pdx->m_VideoInfo[ch].seq_counter += n;
+	spin_unlock_irqrestore(&pdx->videoslock[ch], flags);
+}
+
+/*
  * Every frame the card completes (its second-half interrupt, card_frames in
  * the stats file) ends in exactly one counter: frames_in or one reason for
  * dropping it, so the stats add up and a frame that vanishes stands out. A
@@ -4715,6 +4742,7 @@ static void hws_frame_drop(struct hws_pcie_dev *pdx, int ch, int half, atomic_t 
 	{
 		pdx->frame_open[ch] = false;
 		atomic_inc(why);
+		hws_seq_skip(pdx, ch, 1);
 	}
 }
 
@@ -4923,7 +4951,10 @@ static int hws_copy_half(struct hws_pcie_dev *pdx, int nDecoder, int mVideoBufIn
 		u32 gap = cnt_self - pdx->m_half_done_cnt[nDecoder][0] - 1;
 
 		if (gap && gap < 0x10000)
+		{
 			atomic_add(gap, &pdx->tstats[nDecoder].copy_missed);
+			hws_seq_skip(pdx, nDecoder, gap);
+		}
 		pdx->frame_open[nDecoder] = true;
 	}
 	else

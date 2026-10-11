@@ -53,7 +53,8 @@ compare_results() {
 	say "old: $OLD_DESC"
 	say "new: this checkout (srcversion $NEW_SRC)"
 	say ""
-	touch "$1" "$2"
+	# card-check runs as root and owns the files it wrote: only create missing ones
+	for f in "$1" "$2"; do [ -e "$f" ] || : > "$f"; done
 	awk '
 		function kv(line, which,   n, i, a, key, f) {
 			n = split(line, a, " "); key = a[1]
@@ -64,6 +65,7 @@ compare_results() {
 		FILENAME == ARGV[1] { kv($0, "new"); next }
 		{ kv($0, "old") }
 		function get(w, k, f) { return ((w, k, f) in v) ? v[w, k, f] : "-" }
+		function cpucell(w, k) { return get(w, k, "busy") (get(w, k, "channels") == "-" ? "" : " (" get(w, k, "channels") " ch)") }
 		# "-" (or "-/-") = not measured; a negative number is a measurement
 		function na(x) { return x == "" || x == "-" || x ~ /^-\// }
 		function missing(w, k,   f, t) {
@@ -91,14 +93,16 @@ compare_results() {
 			row("   longest gap, ms", get("old", k, "maxgap"), get("new", k, "maxgap"))
 			if (get("old", k, "wrong") + get("new", k, "wrong") > 0) row("   wrong size", get("old", k, "wrong"), get("new", k, "wrong"))
 			better = ""; row("   fps from the timestamps", get("old", k, "fps"), get("new", k, "fps"))
-			for (w = 1; w <= 2; w++) {
-				which = w == 1 ? "old" : "new"
-				if (get(which, k, "lost") != "-") {
+			# totals only over captures both drivers made: inputs without a signal
+			# are captured from a driver that never reports "no signal", skipped
+			# with one that does
+			if (get("old", k, "lost") != "-" && get("new", k, "lost") != "-")
+				for (w = 1; w <= 2; w++) {
+					which = w == 1 ? "old" : "new"
 					tl[which] += get(which, k, "lost") + get(which, k, "dup")
 					tlate[which] += get(which, k, "late")
 					tmiss[which] += missing(which, k)
 				}
-			}
 		}
 		END {
 			printf "%-46s %16s %16s\n", "", "installed", "new"
@@ -130,7 +134,11 @@ compare_results() {
 				else if (ch == "accounting") { better = "low"
 					row("driver " what ": frames dropped on the way in", get("old", k, "dropped"), get("new", k, "dropped"))
 					row("   frames unaccounted (must be 0)", get("old", k, "unaccounted"), get("new", k, "unaccounted")) }
-				else if (ch == "cpu") { better = "low"; row("whole system CPU busy, % (all at once)", get("old", k, "busy"), get("new", k, "busy")) }
+				else if (ch == "cpu") {
+					# comparable only with as many channels streaming on both
+					better = get("old", k, "channels") == get("new", k, "channels") ? "low" : ""
+					row("whole system CPU busy, % (all at once)", cpucell("old", k), cpucell("new", k))
+				}
 				else if (ch == "kernel") { better = "low"; row("kernel errors (Oops, BUG, WARNING)", get("old", k, "problems"), get("new", k, "problems")) }
 				else if (ch == "result") { better = "high"; row("card-check result OK (1 = yes)", get("old", k, "ok"), get("new", k, "ok")) }
 			}
@@ -142,6 +150,7 @@ compare_results() {
 		}' "$2" "$1"
 	say ""
 	say "\"-\" = not measured (e.g. no signal, or v4l2-compliance skipped for the installed driver)."
+	say "TOTAL rows count only the captures both drivers made."
 	say "Late frames with equal frame counts from card and driver come from the card/source."
 }
 

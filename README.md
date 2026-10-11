@@ -31,8 +31,8 @@ list of crashes, hangs and causes of stutter in the original code.
 - **Several applications per channel** (e.g. OBS and a preview, up to 8, all
   at the same size), each getting every frame.
 - **Correct V4L2/ALSA behaviour** (`v4l2-compliance` passes except for the
-  intentional multi-app design), working picture controls, suspend/resume,
-  clean unplug and reboot.
+  intentional multi-app design), working picture controls on hardware that
+  has them, suspend/resume, clean unplug and reboot.
 - **Tested:** userspace test suite that runs the driver's own code, compile
   tests on kernels 5.15 to 7.0, and test scripts for the real card.
 
@@ -311,7 +311,8 @@ leaves it out):
   shifted or colour-swapped picture fails; show something with contrast, a
   black screen can't be checked)
 - **picture controls work:** the average brightness of the picture at the
-  brightness control's minimum and maximum must differ
+  brightness control's minimum and maximum must differ (hardware version 121
+  and below has no picture controls: "not found")
 - **user-pointer buffers** (application memory instead of the driver's)
 - **two applications on one channel** at the same time, each must get every frame
 - **every CPU busy** (half computing, half memory traffic) while all channels
@@ -587,7 +588,8 @@ have also been verified on a VC42 (see [Status](#status)).
 - **No conversion with interrupts disabled** (it used to block them for
   0.2–0.9 ms per buffer).
 - **Accurate timing:** timestamps come from the frame's interrupt; sequence
-  numbers are per application and always increase, so a gap is a real drop;
+  numbers are per application and always increase, so a gap is a real drop
+  (also a frame the driver itself had to drop, e.g. copied too late);
   the reported frame rate is the real input rate instead of a fixed 60,
   measured from the frame interrupts so that 59.94 and 60 fps are told apart
   (an encoder given 60 for a 59.94 source drifts 3.6 s per hour). After a
@@ -631,7 +633,9 @@ have also been verified on a VC42 (see [Status](#status)).
 
 - **Picture controls** (brightness, contrast, saturation, hue) never reached
   the hardware; they now use the kernel's control framework (`v4l2-ctl`
-  lists them, events and `LOG_STATUS` work, the hue default is right).
+  lists them, events and `LOG_STATUS` work, the hue default is right). Only
+  offered where the hardware has them: not on hardware version 121 and below
+  (e.g. the VC42 tested here), where they changed nothing.
 - **Source change events:** applications that subscribe to
   `V4L2_EVENT_SOURCE_CHANGE` are told when the input resolution changes or
   the signal is lost or comes back, so they can follow the input instead of

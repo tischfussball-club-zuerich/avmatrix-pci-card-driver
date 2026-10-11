@@ -248,7 +248,7 @@ for d in "${nodes[@]}"; do
 			awk -v x=$bd 'BEGIN { exit !(x < 8) }' && bad "the brightness control doesn't change the picture on $d"
 		else
 			say "   brightness control: not found"
-			res "${KEY[$d]}.controls diff=-1"
+			res "${KEY[$d]}.controls diff=-"	# not measured, not a failure
 		fi
 
 		# user-pointer buffers (the app's own memory instead of the driver's)
@@ -294,7 +294,7 @@ if [ ${#sig_nodes[@]} -gt 0 ]; then
 	busy=$(awk -v t=$((tot1 - tot0)) -v i=$((idle1 - idle0)) 'BEGIN { printf "%.0f", t ? 100 * (t - i) / t : 0 }')
 	drv=$(awk -v d=$((thr1 - thr0)) -v hz="$(getconf CLK_TCK)" -v s="$DUR" 'BEGIN { printf "%.1f", 100 * d / hz / s }')
 	say "   CPU: whole system ${busy}% busy ($(nproc) cores); the driver's copy/conversion threads used ${drv}% of one core"
-	res "cpu busy=$busy"
+	res "cpu busy=$busy channels=${#sig_nodes[@]}"
 	# frames the card completed vs. frames the driver took in (timing_debug=1):
 	# equal = a late frame never came from the card; more card frames = lost in the driver
 	if [ $dmesg_ok = 1 ]; then
