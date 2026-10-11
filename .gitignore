@@ -24,3 +24,4 @@ tools/driver-tests/sim/*.txt
 tools/driver-tests/sim/*.log
 tools/driver-tests/conv/doubling.inc
 tools/driver-tests/conv/dbl
+__pycache__/
