@@ -52,6 +52,7 @@
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
+#include <linux/irq.h>
 #include <linux/io.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
@@ -565,6 +566,15 @@ struct hws_pcie_dev {
 	int m_curr_No_Video[MAX_VID_CHANNELS];
 	/* status thread: the input's mode doesn't fit the buffers, the channel's DMA is off */
 	bool mode_unsupported[MAX_VID_CHANNELS];
+	/* status thread: the signal as the card reports it (m_curr_No_Video also
+	 * counts a stalled channel as no signal) */
+	int m_card_No_Video[MAX_VID_CHANNELS];
+	/* watchdog (status thread): frames stopped although the card reports a signal */
+	u32 wd_cnt[MAX_VID_CHANNELS];		/* m_half_cnt[ch][0] when it last moved */
+	u64 wd_ns[MAX_VID_CHANNELS];		/* and when */
+	bool wd_stalled[MAX_VID_CHANNELS];
+	int wd_tries;				/* re-inits since frames last came back */
+	u64 wd_kick_ns;				/* the last one */
 	dma_addr_t   		m_pbyAudio_phys[MAX_VID_CHANNELS] ;
 	uint8_t     *m_pbyAudioBuffer[MAX_VID_CHANNELS];
 	uint8_t		*m_pbyUserAudioBuffer[MAX_VID_CHANNELS];

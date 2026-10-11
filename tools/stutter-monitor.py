@@ -141,6 +141,7 @@ class DriverTracker:
                  "input": d.get("input", "?"), "output": d.get("output", "?"),
                  "apps": num(d.get("apps_streaming")), "card_lost": d.get("card_lost") == "1",
                  "irq_paused": d.get("irq_paused") == "1", "audio_running": d.get("audio_running") == "1",
+                 "stalled": d.get("stalled") == "1",
                  "fps": frame_rate(d), "measured": frame_rate_measured(d)}
             # an application uses the channel (an unused one's source may sleep and wake)
             e["in_use"] = e["streaming"] or e["audio_running"] or num(d.get("apps_open")) > 0
@@ -517,7 +518,7 @@ def evaluate(s, irq_cpus, irq_median):
 
     drv = sorted(s["driver"].items())
     # device-wide states: once per sample, naming the channels
-    for key, flag in (("card_lost", "CARD-LOST"), ("irq_paused", "IRQ-PAUSED")):
+    for key, flag in (("card_lost", "CARD-LOST"), ("irq_paused", "IRQ-PAUSED"), ("stalled", "CARD-STALL")):
         names = [name for name, e in drv if e[key]]
         if names:
             flags.append(f"{flag} {','.join(names)}" + (" (interrupt storm)" if key == "irq_paused" else ""))
@@ -988,6 +989,8 @@ def print_summary(sm, out):
         "AUDIO-NONE": "the source sends no audio at all (check its audio output / HDMI audio setting)",
         "CARD-LOST": "the card stopped responding on the PCIe bus",
         "IRQ-PAUSED": "the driver paused the card's interrupts after an interrupt storm (it retries every second)",
+        "CARD-STALL": "no frames from the card for 2 s although it reports a signal: its interrupts or DMA stopped; "
+                      "the driver shows the no-signal picture and brings the card up again (check dmesg)",
     }
     for k, _ in sm.counts.most_common():
         if k in hints:

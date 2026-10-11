@@ -281,3 +281,12 @@ typedef int irqreturn_t;
 #define pci_read_config_word(p, off, v) ((void)(p), (void)(off), *(v) = PCI_COMMAND_MEMORY, 0)
 #define IS_ENABLED(x) (x)
 #define dev_warn_ratelimited(d, ...) fprintf(stderr, __VA_ARGS__)
+#ifndef SIM_SHIM_AVAIL
+#define SIM_SHIM_AVAIL
+/* the simulated apps read every period at once */
+static inline unsigned long snd_pcm_capture_avail(struct snd_pcm_runtime *r) { (void)r; return 0; }
+#endif
+#define max3(a, b, c) max(max(a, b), c)
+#define irq_get_irq_data(irq) ((struct irq_data *)0)
+#define irqd_irq_disabled(d) 0
+struct irq_data;

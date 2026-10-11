@@ -27,7 +27,7 @@ for mode in race logic nodirect irqfaults; do for f in 60 240 480; do
 	ASAN_OPTIONS=detect_leaks=0 timeout 300 $S/sim/sim $f 45 > $o 2>&1; rc=$?
 	echo "== sim $f fps, mode=$mode (race=card DMA race present, logic=race removed + 59.94 fps, nodirect=ring path only, irqfaults=lost+duplicate IRQs): exit $rc"
 	grep -E "^frames|delivered|restarts|steady|duplicate|out of order|mod 100|sequence not|timestamp not|STREAMOFF|ERROR b|stalls|latency|driver stats|accounting" $o | sed 's/^/    /'
-	for k in "torn/mixed, steady state" "duplicate frames" "frames out of order" "sequence not increasing" "timestamp not increasing" "left in driver after STREAMOFF" "completed after STREAMOFF" "2 s stalls"; do
+	for k in "torn/mixed, steady state" "duplicate frames" "frames out of order" "sequence not increasing" "timestamp not increasing" "left in driver after STREAMOFF" "completed after STREAMOFF" "2 s stalls" "watchdog re-inits"; do
 		v=$(grep "$k" $o | grep -o '[0-9]\+' | tail -1); [ "${v:-1}" = 0 ] || { echo "    !! $k = $v"; fail=1; }; done
 	# an app that keeps showing its frame until the next one arrives (2 buffers,
 	# 10 ms per frame) must get most frames at 60 fps (it got half when the
@@ -59,6 +59,16 @@ for f in 60 240; do
 	for v in $(grep "^coverage" $o | grep -o '[0-9]\+' | head -3); do [ "$v" -gt 0 ] || { echo "    !! a data path was never reached"; fail=1; }; done
 	scan $o; [ $rc = 0 ] || fail=1
 done
+# the card's interrupts die for 6 s on one channel: the watchdog must notice, show the
+# no-signal picture, and frames must flow in order again afterwards
+o=$S/sim/out_stall.txt
+SIM_STALL=1 ASAN_OPTIONS=detect_leaks=0 timeout 300 $S/sim/sim 60 30 > $o 2>&1; rc=$?
+echo "== sim 60 fps, interrupts of ch0 dead 10-16 s (watchdog): exit $rc"
+grep -E "no frames from the card|bringing the card up|frames from the card again|watchdog re-inits|no-signal" $o | sed 's/^/    /'
+grep -q "no frames from the card for 2 s" $o && grep -q "frames from the card again" $o && grep -q "watchdog re-inits *1 " $o || { echo "    !! the watchdog didn't notice the stall or the frames' return"; fail=1; }
+for k in "torn/mixed, steady state" "duplicate frames" "frames out of order" "sequence not increasing" "timestamp not increasing" "left in driver after STREAMOFF" "completed after STREAMOFF"; do
+	v=$(grep "$k" $o | grep -o '[0-9]\+' | tail -1); [ "${v:-1}" = 0 ] || { echo "    !! $k = $v"; fail=1; }; done
+scan $o; [ $rc = 0 ] || fail=1
 echo "== TSan (120 fps, 20 s)"
 (cd $S/sim && gcc -O1 -g -fsanitize=thread -pthread -w -I. -Ifake -I$SRC -include shim.h -o sim_tsan sim.c && TSAN_OPTIONS=report_signal_unsafe=0 timeout 400 setarch -R ./sim_tsan 120 20 > tsan.txt 2>&1) || true
 [ -x $S/sim/sim_tsan ] || { echo "!! TSan build FAILED"; fail=1; }

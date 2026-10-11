@@ -306,12 +306,27 @@ static const framegrabber_pixfmt_t support_pixfmts[] = {
 };
 
 
+/*
+ * The portrait size (1080x1920, rotated) is the table's last entry. Offered
+ * only on request: apps that pick the largest or the first-listed size (e.g.
+ * GStreamer) would otherwise choose it and show a rotated picture. Load-time
+ * only - a stream may hold that size.
+ */
+static bool portrait_output;
+module_param(portrait_output, bool, 0444);
+MODULE_PARM_DESC(portrait_output, "Also offer the rotated 1080x1920 portrait output size (default 0)");
+
+static int hws_num_sizes(void)
+{
+	return portrait_output ? V4L2_MODEL_VIDEOFORMAT_NUM : V4L2_MODEL_VIDEOFORMAT_1080X1920P60;
+}
+
 static int v4l2_get_suport_VideoFormatIndex(struct v4l2_format *fmt)
 {
 	struct v4l2_pix_format *pix = &fmt->fmt.pix;
 	int index;
 	int videoIndex=-1;
-	for(index=0; index<V4L2_MODEL_VIDEOFORMAT_NUM;index++)
+	for(index=0; index<hws_num_sizes();index++)
 	{
 		if((pix->width==support_videofmt[index].frame_size.width)&&(pix->height==support_videofmt[index].frame_size.height))
 		{
@@ -323,7 +338,7 @@ static int v4l2_get_suport_VideoFormatIndex(struct v4l2_format *fmt)
 }
 static v4l2_model_timing_t *v4l2_model_get_support_videoformat(int index)
 {
-	if(index <0 ||index >=V4L2_MODEL_VIDEOFORMAT_NUM)
+	if(index <0 ||index >=hws_num_sizes())
 		return NULL;
 
 	return (v4l2_model_timing_t *)&support_videofmt[index];
@@ -465,7 +480,7 @@ static int hws_vidioc_g_fmt_vid_cap(struct file *file, void *fh, struct v4l2_for
 static v4l2_model_timing_t *Get_input_framesizeIndex(int width,int height)
 {
 	int i;
-	for(i =0;i<V4L2_MODEL_VIDEOFORMAT_NUM;i++)
+	for(i =0;i<hws_num_sizes();i++)
 	{
 		if((support_videofmt[i].frame_size.width ==width)&&(support_videofmt[i].frame_size.height == height))
 		{
@@ -3125,9 +3140,11 @@ static void video_data_process(struct kthread_work *p_work)
          * all be shown, so drop the oldest ones now instead of delivering stale
          * frames and dropping the fresh ones. Keeps latency at a minimum while
          * an app with enough buffers still gets every frame, also next to a
-         * slower one.
+         * slower one. And never more than two waiting: a worker that can't
+         * keep up (slow conversion, busy CPU) shows the newest frames, not
+         * ones a whole ring old.
          */
-        while (backlog > 1 && backlog > avail) {
+        while (backlog > 2 || (backlog > 1 && backlog > avail)) {
             int oldest = -1;
 
             for (i = 0; i < MAX_VIDEO_QUEUE; i++)
@@ -3289,7 +3306,7 @@ static ssize_t stats_show(struct device *dev, struct device_attribute *attr, cha
 		"aborted %llu\ncopy_missed %llu\n"
 		"no_app_buf %llu\nirq_busy %llu\nwq_coalesced %llu\nworker_empty %llu\n"
 		"audio_running %d\naudio_card_packets %u\naudio_silence_packets %u\n"
-		"card_lost %d\nirq_paused %d\ncapture_starts %u\n",
+		"card_lost %d\nirq_paused %d\ncapture_starts %u\nstalled %d\n",
 		ch, pdx->m_bVCapStarted[ch] ? 1 : 0, READ_ONCE(pdx->m_curr_No_Video[ch]) ? 0 : 1,
 		pdx->m_pVCAPStatus[ch][0].dwWidth, pdx->m_pVCAPStatus[ch][0].dwHeight,
 		pdx->m_pVCAPStatus[ch][0].dwinterlace ? "i" : "p",
@@ -3302,7 +3319,7 @@ static ssize_t stats_show(struct device *dev, struct device_attribute *attr, cha
 		t[HWS_ST_NO_BUF], t[HWS_ST_IRQ_BUSY], t[HWS_ST_COALESCED], t[HWS_ST_EMPTY],
 		READ_ONCE(a->running) ? 1 : 0, atomic_read(&a->pkts_card), atomic_read(&a->pkts_silence),
 		READ_ONCE(pdx->m_PciDeviceLost) ? 1 : 0, READ_ONCE(pdx->irq_storm_off) ? 1 : 0,
-		READ_ONCE(pdx->capture_starts[ch]));
+		READ_ONCE(pdx->capture_starts[ch]), READ_ONCE(pdx->wd_stalled[ch]) ? 1 : 0);
 }
 static DEVICE_ATTR_RO(stats);
 
@@ -3426,67 +3443,82 @@ static void hws_audio_silence_work(struct work_struct *work)
 	struct hws_audio *drv = container_of(to_delayed_work(work), struct hws_audio, silence_work);
 	struct hws_pcie_dev *pdx = drv->dev;
 	unsigned int bytes = min_t(unsigned int, pdx->m_dwAudioPTKSize, sizeof(hws_silence));
-	u64 pkt_ns = div_u64((u64)(bytes / 4) * NSEC_PER_SEC, 48000);	/* S16 stereo: 4 bytes per frame */
-	u64 last, now;
+	long pkt_frames = bytes / 4;	/* S16 stereo: 4 bytes per frame */
+	u64 pkt_ns = div_u64((u64)pkt_frames * NSEC_PER_SEC, 48000);
 	/*
-	 * No signal: the card sends nothing, fill at once. With a signal, a gap
-	 * is usually just late delivery - inserting silence then would push the
-	 * audio behind the video for good - so only a long one (a source without
-	 * audio) is filled.
+	 * The card has stopped sending when its last packet's interrupt (the hard
+	 * IRQ's time: a packet merely delivered late still counts as sent) is 2.5
+	 * packets old - no signal, or a source without audio. As a backstop, also
+	 * when nothing was delivered for 250 ms although interrupts come.
 	 */
-	u64 gap_ns = READ_ONCE(pdx->m_curr_No_Video[drv->index]) ? 3 * pkt_ns : 250 * NSEC_PER_MSEC;
+	u64 gap_ns = 5 * pkt_ns / 2, lr, card, ref, now;
 	unsigned long flags;
 	bool running, filling;
-	u32 ring_frames;
+	long room = 0;
 	s64 delay_ns;
-	int n, burst, ring_pkts;
+	int n = 0, max_n = 0;
 
 	/* under the lock: START sets the timing and running together */
 	spin_lock_irqsave(&drv->ring_lock, flags);
 	running = drv->running;
-	ring_frames = drv->ring_size_byframes;
-	last = atomic64_read(&drv->last_real_ns);
+	lr = atomic64_read(&drv->last_real_ns);
+	if (running && drv->substream && drv->substream->runtime && drv->ring_size_byframes)
+	{
+		/* frames the app hasn't read yet: ALSA's count, plus ours since the last period */
+		long unread = (long)snd_pcm_capture_avail(drv->substream->runtime) + drv->period_used_byframes;
+
+		room = (long)drv->ring_size_byframes - unread - 2 * pkt_frames;
+	}
 	spin_unlock_irqrestore(&drv->ring_lock, flags);
-	now = ktime_get_ns();	/* after last: now >= last */
-	if (!running || !pkt_ns)
+	if (!running || !pkt_frames)
 		return;
-	/*
-	 * Packets at once without the app reading in between: what its buffer
-	 * holds, less two for margin. More, and ALSA sees a full buffer (an xrun),
-	 * stops the stream, the app restarts it - and the same burst comes again.
-	 */
-	ring_pkts = ring_frames / (bytes / 4);
-	burst = clamp_t(int, ring_pkts - 2, 1, 4);
-	filling = (s64)(now - last) > (s64)gap_ns;
+	/* the newest packet the card completed (START set lr after older ones) */
+	card = max3(lr, (u64)atomic64_read(&pdx->m_audio_half_ts[drv->index][0]),
+		    (u64)atomic64_read(&pdx->m_audio_half_ts[drv->index][1]));
+	now = ktime_get_ns();	/* after the reads: now >= card */
+	filling = (s64)(now - card) > (s64)gap_ns || (s64)(now - lr) > (s64)(250 * NSEC_PER_MSEC);
 	if (filling)
 	{
 		/*
-		 * Continue where the card stopped; a burst or more behind: drop the
-		 * backlog instead of catching up. A run then ends ahead of the next
-		 * packet's time, so at most one more comes in the next jiffy: never
-		 * the whole buffer (the re-arm at the deadline keeps the rate exact).
+		 * Silence continues the card's packet grid from its last packet and
+		 * fills the whole gap, so the audio stays in step with the video. It
+		 * catches up a few packets at a time, never more than the app's buffer
+		 * has room for (a full buffer is an xrun: the stream stops, the app
+		 * restarts it). Only a debt beyond half a second (the system stalled,
+		 * the app stopped reading) is given up.
 		 */
-		if ((s64)(drv->silence_next_ns - (last + pkt_ns)) < 0)
-			drv->silence_next_ns = last + pkt_ns;
-		if ((s64)(now - drv->silence_next_ns) >= (s64)(burst * pkt_ns))	/* signed: "next" is usually ahead */
-			drv->silence_next_ns = now - (burst - 1) * pkt_ns;
-		for (n = 0; n < burst && (s64)(now - drv->silence_next_ns) >= 0; n++)
+		ref = (s64)(now - card) > (s64)gap_ns ? card : lr;
+		if ((s64)(drv->silence_next_ns - (ref + pkt_ns)) < 0)
+			drv->silence_next_ns = ref + pkt_ns;
+		if ((s64)(now - drv->silence_next_ns) > (s64)(500 * NSEC_PER_MSEC))
+			drv->silence_next_ns = now - 500 * NSEC_PER_MSEC;
+		max_n = clamp_t(long, room / pkt_frames, 0, 8);
+		for (n = 0; n < max_n && (s64)(now - drv->silence_next_ns) >= 0; n++)
 		{
-			if (!_deliver_samples(drv, hws_silence, bytes, last))
-				break;	/* the card is sending again */
+			if (!_deliver_samples(drv, hws_silence, bytes, lr))
+			{
+				filling = false;	/* the card is sending again */
+				break;
+			}
 			atomic_inc(&drv->pkts_silence);
 			drv->silence_next_ns += pkt_ns;
 		}
 	}
-	/*
-	 * Filling: every packet. Real audio flowing: look again when the gap
-	 * could first be long enough, at most 125 ms on (a lost signal shortens
-	 * the gap that counts), instead of waking every other packet.
-	 */
-	if (filling)	/* at the next packet's time, so wake-up delays don't add up */
-		delay_ns = max_t(s64, (s64)(drv->silence_next_ns - ktime_get_ns()), 1);
+	if (filling)
+	{
+		now = ktime_get_ns();
+		if ((s64)(drv->silence_next_ns - now) > 0)
+			delay_ns = drv->silence_next_ns - now;	/* caught up: the next packet's time */
+		else if (n == max_n && max_n < 8)
+			delay_ns = pkt_ns / 4;	/* behind, the app's buffer full: wait for it to read */
+		else
+			delay_ns = 1;		/* behind: next jiffy */
+	}
 	else
-		delay_ns = clamp_t(s64, (s64)(last + gap_ns - now), 2 * pkt_ns, 125 * NSEC_PER_MSEC);
+	{
+		/* real audio flowing: look again when the gap could first be long enough */
+		delay_ns = max_t(s64, (s64)(card + gap_ns - now), (s64)(pkt_ns / 2));
+	}
 	queue_delayed_work(pdx->wq, &drv->silence_work,
 			   max_t(unsigned long, 1, DIV_ROUND_UP_ULL((u64)delay_ns, NSEC_PER_SEC / HZ)));
 }
@@ -5664,7 +5696,30 @@ static void hws_measure_rate(struct hws_pcie_dev *pdx, int ch)
 	}
 }
 
-/* new mode or signal: the old measurement doesn't apply */
+/*
+ * Signal lost or back: measure afresh, but keep the rate measured before -
+ * usually the same source returns after a dropout, and the exact rate
+ * (59.94) is known at once instead of 60 for the seconds a measurement takes.
+ * A different rate (the card's own whole-number figure says so) or a new
+ * mode (ChangeVideoSize: hws_reset_rate) starts from the card's figure.
+ */
+static void hws_rate_signal_change(struct hws_pcie_dev *pdx, int ch, bool back)
+{
+	u64 tpf = atomic64_read(&pdx->video[ch].tpf);
+	u32 card = pdx->m_pVCAPStatus[ch][0].dwFrameRate;
+
+	atomic64_set(&pdx->tstats[ch].rate_acc, 0);
+	pdx->tstats[ch].rate_cand = 0;
+	if (back && tpf && (u32)tpf && card)
+	{
+		u64 mhz = div64_u64((u64)(u32)tpf * 1000ULL, tpf >> 32);	/* den/num Hz, x1000 */
+
+		if (mhz + 1500 < (u64)card * 1000 || mhz > (u64)card * 1000 + 1500)
+			atomic64_set(&pdx->video[ch].tpf, 0);
+	}
+}
+
+/* new mode: the old measurement doesn't apply */
 static void hws_reset_rate(struct hws_pcie_dev *pdx, int ch)
 {
 	atomic64_set(&pdx->video[ch].tpf, 0);
@@ -5862,12 +5917,16 @@ static void CheckVideFmt (struct hws_pcie_dev *pdx)
 	{
 	{
 		int was = READ_ONCE(pdx->m_curr_No_Video[i]);
-		int now = Get_Video_Status(pdx,i);
+		int card = Get_Video_Status(pdx,i);
+		/* a stalled channel (hws_watchdog) shows the no-signal picture, not a frozen one */
+		int now = card || READ_ONCE(pdx->wd_stalled[i]);
+
+		WRITE_ONCE(pdx->m_card_No_Video[i], card);
 
 		WRITE_ONCE(pdx->m_curr_No_Video[i], now);
 		if (was != now)
 		{
-			hws_reset_rate(pdx, i);
+			hws_rate_signal_change(pdx, i, !now);
 			hws_notify_source_change(&pdx->video[i]);	/* signal lost or back */
 			/* lost: the silence fill starts now, not after its long re-arm
 			 * (it would then have to catch up in a burst) */
@@ -5968,6 +6027,70 @@ static bool hws_card_reachable(struct hws_pcie_dev *pdx)
 	return true;
 }
 
+/*
+ * Frames stopped coming although capture runs and the card reports a picture
+ * it can take: the interrupt line was switched off by the kernel ("nobody
+ * cared", e.g. a misbehaving device sharing it), an interrupt got lost, or the
+ * card's DMA engine hung. Nothing else would notice - apps just wait. After
+ * 2 s: log it, show the no-signal picture instead of a frozen one, and bring
+ * the card up again (the path a card back after a loss takes), at most 3
+ * times 10 s apart. Frames coming back end it. Status thread only.
+ */
+static void hws_watchdog(struct hws_pcie_dev *pdx)
+{
+	u64 now = ktime_get_ns();
+	bool stalled = false;
+	int ch;
+
+	for (ch = 0; ch < pdx->m_nCurreMaxVideoChl; ch++)
+	{
+		u32 cnt = READ_ONCE(pdx->m_half_cnt[ch][0]);
+		/* frames due: capture on, a picture the card can take, nothing paused on purpose */
+		bool due = READ_ONCE(pdx->m_bVCapStarted[ch]) && !READ_ONCE(pdx->m_card_No_Video[ch]) &&
+			   !READ_ONCE(pdx->mode_unsupported[ch]) && !pdx->m_pVCAPStatus[ch][0].dwhdcp &&
+			   !READ_ONCE(pdx->irq_storm_off) && !READ_ONCE(pdx->m_PciDeviceLost) &&
+			   !READ_ONCE(pdx->need_bringup);
+
+		if (cnt != pdx->wd_cnt[ch] || !due)
+		{
+			if (cnt != pdx->wd_cnt[ch] && pdx->wd_stalled[ch])
+			{
+				dev_info(&pdx->pdev->dev, "channel %d: frames from the card again\n", ch);
+				pdx->wd_tries = 0;
+			}
+			pdx->wd_cnt[ch] = cnt;
+			pdx->wd_ns[ch] = now;
+			WRITE_ONCE(pdx->wd_stalled[ch], false);
+			continue;
+		}
+		if (now - pdx->wd_ns[ch] < 2 * NSEC_PER_SEC)
+			continue;
+		stalled = true;
+		if (!pdx->wd_stalled[ch])
+		{
+			struct irq_data *d = pdx->irq_line >= 0 ? irq_get_irq_data(pdx->irq_line) : NULL;
+
+			WRITE_ONCE(pdx->wd_stalled[ch], true);
+			dev_warn(&pdx->pdev->dev, "channel %d: no frames from the card for 2 s although it reports a signal%s\n",
+				 ch, d && irqd_irq_disabled(d) ?
+				 " - the kernel switched its interrupt off (\"nobody cared\"?); reload the driver" : "");
+		}
+	}
+	if (stalled && pdx->wd_tries < 3 && now - pdx->wd_kick_ns > 10 * NSEC_PER_SEC)
+	{
+		pdx->wd_tries++;
+		pdx->wd_kick_ns = now;
+		dev_warn(&pdx->pdev->dev, "bringing the card up again (attempt %d of 3)\n", pdx->wd_tries);
+		mutex_lock(&pdx->pm_lock);
+		if (!pdx->suspended && !READ_ONCE(pdx->removing))
+		{
+			pdx->need_bringup = true;	/* CheckVideFmt: hws_hw_bringup, then the streams restart */
+			pdx->m_recovered = 1;
+		}
+		mutex_unlock(&pdx->pm_lock);
+	}
+}
+
 static int MainKsThreadHandle(void *arg)
 {
 	int need_check=0;
@@ -6021,6 +6144,8 @@ static int MainKsThreadHandle(void *arg)
 			}
 		}
 		tick++;
+		if (need_check == 1)
+			hws_watchdog(pdx);
 		/* also when a card that was gone at resume is back (config-space check
 		 * only until then): CheckVideFmt notices it and re-inits it. Idle: once
 		 * a second, so the default format matches the input before an app opens
@@ -6153,15 +6278,17 @@ static int irq_setup(struct hws_pcie_dev *lro, struct pci_dev *pdev)
 		irq_flag = lro->msi_enabled ? 0 : IRQF_SHARED;
 
 		/*
-		 * No IRQF_ONESHOT unless a sharer of the line insists: a masked line
-		 * would hold back the next half-frame interrupt, and with it the
-		 * overrun detection, until the IRQ thread is done. The hard handler
-		 * acknowledges the card, and the storm guard covers a stuck line.
+		 * A shared line: IRQF_ONESHOT, which every sharer has to agree on - a
+		 * device registering later may insist on it. The IRQ thread only
+		 * delivers audio (tens of us), so the line is hardly ever held back.
+		 * If an earlier sharer registered without it, go along with that.
 		 */
+		if (irq_flag & IRQF_SHARED)
+			irq_flag |= IRQF_ONESHOT;
 		rc = request_threaded_irq(pdev->irq, irqhandler, hws_irq_thread, irq_flag, pci_name(pdev), lro);
 		if (rc == -EBUSY && (irq_flag & IRQF_SHARED))
 			rc = request_threaded_irq(pdev->irq, irqhandler, hws_irq_thread,
-						  irq_flag | IRQF_ONESHOT, pci_name(pdev), lro);
+						  irq_flag & ~IRQF_ONESHOT, pci_name(pdev), lro);
 		if (rc)
 		{
 		}

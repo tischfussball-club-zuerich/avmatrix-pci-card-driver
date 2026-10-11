@@ -454,8 +454,20 @@ static void *irq_thread(void *a)
 	return NULL;
 }
 static pthread_mutex_t hard = PTHREAD_MUTEX_INITIALIZER;	/* hard IRQs don't nest, nor run twice at once */
+/* SIM_STALL: ch0's interrupts die from 10 s to 16 s (line switched off, hung DMA engine) */
+static int stall_mode;
+static _Atomic u64 sim_start_ns;
+static atomic_long wd_kicks;
+static int irq_dead(int ch)
+{
+	u64 t = ktime_get_ns() - atomic_load(&sim_start_ns);
+
+	return stall_mode && ch == 0 && t >= 10 * NSEC_PER_SEC && t < 16 * NSEC_PER_SEC;
+}
 static void raise_irq(int ch, int half)
 {
+	if (irq_dead(ch))
+		return;
 	pthread_mutex_lock(&hard);
 	atomic_store(&regs[(CVBS_IN_BASE + (32 + ch) * PCIE_BARADDROFSIZE) / 4], half);
 	atomic_fetch_or(&regs[(CVBS_IN_BASE + 1 * PCIE_BARADDROFSIZE) / 4], 1u << ch);
@@ -700,6 +712,13 @@ static void *status_thread(void *a)
 		}
 		sleep_ns(NSEC_PER_SEC / 4);
 		tick++;
+		/* as MainKsThreadHandle, every tick; the re-init it asks for is a no-op here */
+		hws_watchdog(pdx);
+		if (pdx->m_recovered) {
+			pdx->m_recovered = 0;
+			pdx->need_bringup = false;
+			atomic_fetch_add(&wd_kicks, 1);
+		}
 		for (int ch = 0; ch < NCH; ch++) {
 			/* source events: loss of signal or a mode change every few seconds;
 			 * on ch0 in 10 s bursts with 10 s calm in between (the driver needs
@@ -734,10 +753,13 @@ static void *status_thread(void *a)
 					ChangeVideoSize(pdx, ch, w, h, il);
 					hws_reset_rate(pdx, ch);
 				}
+				/* as CheckVideFmt: a stalled channel counts as no signal */
+				WRITE_ONCE(pdx->m_card_No_Video[ch], !present);
+				present = present && !READ_ONCE(pdx->wd_stalled[ch]);
 				WRITE_ONCE(pdx->m_curr_No_Video[ch], !present);
 				/* the exact rate, as CheckVideFmt measures it */
 				if (present != was_present)
-					hws_reset_rate(pdx, ch);
+					hws_rate_signal_change(pdx, ch, present);
 				else if (present) {
 					u32 before = atomic64_read(&pdx->video[ch].tpf) >> 32;
 					hws_measure_rate(pdx, ch);
@@ -1019,6 +1041,8 @@ int main(int argc, char **argv)
 	if (argc > 2) seconds = atoi(argv[2]);
 	dma_lock_mode = getenv("SIM_DMA_LOCK") != NULL;
 	hostile = getenv("SIM_HOSTILE") != NULL;
+	stall_mode = getenv("SIM_STALL") != NULL;
+	atomic_store(&sim_start_ns, ktime_get_ns());
 	ntsc = getenv("SIM_NTSC") != NULL;
 	atomic_store(&hostile_now, hostile);
 	if (hostile) printf("HOSTILE hardware: garbage registers, interrupt storm, DMA garbage, fake ALSA\n");
@@ -1192,6 +1216,7 @@ int main(int argc, char **argv)
 	printf("buffers completed after STREAMOFF       %ld <- must be 0\n", done_after_stop);
 	printf("ERROR buffers            %ld\n", err_bufs);
 	printf("2 s stalls               %ld\n", stalls);
+	printf("watchdog re-inits        %ld%s\n", (long)atomic_load(&wd_kicks), stall_mode ? " (SIM_STALL: ch0 interrupts dead 10-16 s)" : " <- must be 0");
 	printf("IRQ->app latency ms: <2:%ld <4:%ld <8:%ld <16:%ld <33:%ld <66:%ld <133:%ld >=133:%ld  max %.1f\n",
 	       lat_hist[0], lat_hist[1], lat_hist[2], lat_hist[3], lat_hist[4], lat_hist[5], lat_hist[6], lat_hist[7],
 	       lat_max_ns / 1e6);

@@ -79,7 +79,8 @@ driver made for that card, e.g.
   kernel log.
 - **Output:** YUYV (4:2:2) at 1920×1080, 1680×1050, 1440×900, 1360×768,
   1280×1024, 1280×800, 1280×768, 1280×720, 1024×768, 800×600, 720×576,
-  720×480, 640×480 and 1080×1920 (portrait, rotated). At the input size the
+  720×480 and 640×480, plus 1080×1920 (portrait, rotated) with
+  `portrait_output=1`. At the input size the
   frame is copied straight from the card into your buffer; other sizes are
   scaled by the driver (bilinear, keeping the aspect ratio: e.g. 1080p to
   640×480 crops the sides instead of squeezing the picture). Until an
@@ -216,6 +217,7 @@ with a file `/etc/modprobe.d/hwscapture.conf` containing e.g.
 | `direct_io` | `1` | Copy frames straight from the card into the application's buffer when no conversion is needed. `0`: always go through the driver's internal ring (for comparison). |
 | `nt_copy` | `0` | `1`: on the direct path, write frames with non-temporal stores that bypass the CPU cache. May help with several channels, may cost if the application reads each frame right away; measure on your system. Interlaced input always uses them (each line is written twice, ~40% faster). |
 | `timing_debug` | `0` | `1`: log statistics for each streaming channel to the kernel log (see below); `2`: a line every second and warnings about late frames. |
+| `portrait_output` | `0` | `1`: also offer the rotated 1080×1920 portrait size. Off by default, because some applications (e.g. GStreamer) pick it on their own and show a rotated picture. |
 | `buf_limit_mb` | `1024` | Buffer memory all applications together may allocate on one channel, in MiB (an application with 32 buffers at 1080p uses 133 MiB, so 8 such applications fit). Without a limit, any program with access to the device could hold gigabytes of kernel memory. Buffers an application freed while still mapping them no longer count until it unmaps them. |
 
 Up to 8 applications can stream from one channel at the same time; a ninth
@@ -345,7 +347,8 @@ sudo tools/stutter-monitor.py --quiet --log run.jsonl   # only seconds with a pr
   (`NO-APP-BUF`: the application is too slow), a card delivering fewer frames
   than the input rate (`CARD-SLOW`: source, cable or card), signal and format
   changes on channels in use, audio gaps the driver filled with silence
-  (`AUDIO-SILENCE`), a source that sends no audio at all (`AUDIO-NONE`, once).
+  (`AUDIO-SILENCE`), a source that sends no audio at all (`AUDIO-NONE`, once),
+  a card that stopped delivering frames (`CARD-STALL`, see the watchdog).
 - **System:** the card's interrupt rate and CPU, saturated or throttled CPUs,
   CPU/memory/IO pressure stalls, application threads at 100%, relevant kernel
   messages.
@@ -383,7 +386,8 @@ taken in (`frames_in`) or dropped on the way in (`dma_overrun`, `stale_half`,
 `unpaired`, `aborted`, `copy_missed`), so `card_frames` minus those is 0 apart
 from a frame in flight; anything else is a driver bug. `ring_overwrite` and
 `ring_skip` count frames dropped later, `no_app_buf` frames no application had
-a buffer for, `capture_starts` how often capture was started; `audio_card_packets` /
+a buffer for, `capture_starts` how often capture was started, `stalled` 1 while
+the card sends no frames although it reports a signal (see the watchdog below); `audio_card_packets` /
 `audio_silence_packets` count audio from the card and silence the driver filled
 in. Unlike `timing_debug`, this needs no module parameter and writes nothing to
 the kernel log.
@@ -503,6 +507,12 @@ have also been verified on a VC42 (see [Status](#status)).
 
 - **Blocking `DQBUF` held a per-device lock,** freezing other applications.
 - **Stopping a hung card looped forever;** it now times out after 1 s.
+- **Silent freeze:** when the card stopped delivering frames although it
+  reported a signal (its interrupt switched off by the kernel, e.g. because of
+  a misbehaving device sharing the line, or its DMA engine hung), applications
+  waited forever and nothing was logged. A watchdog now notices it after 2 s,
+  logs it, shows the "no signal" picture instead of a frozen one and brings
+  the card up again (at most 3 times, 10 s apart).
 - **Removing the device** waited for every audio application to close.
 - **Interrupt acknowledgements were lost** (bits added with `+=`), stalling
   channels; channels could switch each other off through an unlocked shared
@@ -545,7 +555,9 @@ have also been verified on a VC42 (see [Status](#status)).
   numbers are per application and always increase, so a gap is a real drop;
   the reported frame rate is the real input rate instead of a fixed 60,
   measured from the frame interrupts so that 59.94 and 60 fps are told apart
-  (an encoder given 60 for a 59.94 source drifts 3.6 s per hour).
+  (an encoder given 60 for a 59.94 source drifts 3.6 s per hour). After a
+  signal dropout the same source's exact rate is known at once, not only
+  after the few seconds a new measurement takes.
 - **Applications with few buffers** get every frame they have room for, and
   an application that queues a buffer while a frame is arriving still gets
   it; up to three applications per channel are served directly.
@@ -555,6 +567,8 @@ have also been verified on a VC42 (see [Status](#status)).
   dedicated converter (e.g. 1366×768 or 1440×900 in, 1080p out) computes each
   source row once and blends 4 bytes at a time: 6.9→2.7 ms per frame, 42%→16%
   of a CPU core at 60 fps, same output byte for byte.
+- **Low latency also when the CPU can't keep up:** at most two frames wait
+  for conversion; older ones are dropped instead of being shown late.
 - **Mode changes** are noticed within 250 ms instead of up to 1 s; while there
   is no signal nothing is copied and the "no signal" picture comes at ~30 fps
   (it used to come once per second).
@@ -563,9 +577,12 @@ have also been verified on a VC42 (see [Status](#status)).
 
 - **No I/O error without a signal:** the card sends no audio then, so the
   ALSA stream stalled. The driver now delivers silence at the exact 48 kHz
-  pace until audio returns, starting as soon as the signal is lost. It never
-  delivers more at once than the application's buffer holds (a small buffer
-  would overrun, the stream stop and restart, and overrun again), and never
+  pace until audio returns, starting as soon as the card stops sending (53 ms
+  after its last packet, also with a signal but a source without audio). The
+  silence fills the whole gap, so audio stays in step with the video across
+  any number of signal dropouts (it used to fall 0.1-0.2 s behind with each
+  one). It never delivers more at once than the application's buffer has room
+  for (a full buffer is an overrun: the stream stops and restarts), and never
   silence after audio from the card has resumed.
 - **No xruns:** periods match the card's 1024-frame packets, the BATCH flag is
   set, and no stale packet plays at start.
