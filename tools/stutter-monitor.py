@@ -61,11 +61,12 @@ KMSG_TIMING = re.compile(r"^HwsCapture ch\d+: ")
 
 # Flags that mean "the frames themselves were bad" - correlated against the rest
 FRAME_FLAGS = frozenset(("FRAME-GAP", "DUP-FRAMES", "LOW-FPS", "JITTER", "DELIVERY-LATE",
-                         "DRV-LOST", "DRV-DROP", "CARD-SLOW", "NO-APP-BUF"))
+                         "DRV-LOST", "DRV-DROP", "IRQ-LOST", "CARD-GAP", "CARD-SLOW", "NO-APP-BUF"))
 
 # counters in the driver's stats file (totals since it loaded; the monitor shows differences)
 DRV_COUNTERS = ("card_frames", "frames_in", "frames_out", "direct", "dma_overrun", "stale_half", "unpaired",
                 "aborted", "copy_missed", "ring_overwrite", "ring_skip", "no_app_buf",
+                "irq_lost", "card_late",
                 "audio_card_packets", "audio_silence_packets")
 # every frame the card completes ends in frames_in or exactly one of these (newer drivers;
 # a counter the driver doesn't have reads as 0)
@@ -551,6 +552,10 @@ def evaluate(s, irq_cpus, irq_median):
         expect = e["fps"] / 2 if e["input"].endswith("i") and not e["measured"] else e["fps"]
         if e["signal"] and expect and e["card_frames"] < 0.9 * expect * e["dt"] - 1:
             flags.append(f"CARD-SLOW {name} {e['card_frames'] / e['dt']:.1f}fps<{e['fps']:.2f}")
+        if e.get("irq_lost"):
+            flags.append(f"IRQ-LOST {name} {e['irq_lost']} frames whose interrupt never came")
+        if e.get("card_late"):
+            flags.append(f"CARD-GAP {name} {e['card_late']} times no frame from the card for over 1.5 frame periods")
         if e["no_app_buf"]:
             flags.append(f"NO-APP-BUF {name} x{e['no_app_buf']}")
 
@@ -979,6 +984,10 @@ def print_summary(sm, out):
         "DRV-DROP": "the driver dropped frames (DMA overrun / stale / unpaired halves, copy_missed, ring "
                     "overwritten or skipped) - usually its copy thread ran too late: look at CPU and IRQ flags "
                     "in the same seconds. aborted: given up during a format change or while apps stopped",
+        "IRQ-LOST": "the card wrote a frame but its interrupt never reached the driver, so the frame is gone - "
+                    "look at IRQ flags in the same seconds (a shared or busy interrupt line)",
+        "CARD-GAP": "the card sent no frame for over 1.5 frame periods, without a lost interrupt or a driver drop - "
+                    "the source or the card skipped a frame (not the driver)",
         "CARD-SLOW": "the card itself delivered fewer frames than the input rate - source, cable or card "
                      "(not the driver)",
         "NO-APP-BUF": "a frame arrived while the application had no free buffer - the application is too slow "

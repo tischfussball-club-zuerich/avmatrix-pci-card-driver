@@ -31,6 +31,7 @@ typedef unsigned char BYTE;
 typedef unsigned char BOOL;
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define max(a, b) ((a) > (b) ? (a) : (b))
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 typedef long long s64;
 #define div_s64(a, b) ((s64)(a) / (b))
 
@@ -149,7 +150,7 @@ static int run_one(int yv12, int res_w, int res_h, int il, int ow, int oh, int a
 	if (!fault && hash_mode)
 		printf("H yv12=%d in=%dx%d%s out=%dx%d %016llx\n", yv12, res_w, res_h, il ? "i" : "p", ow, oh, fnv(dst.p, out_size));
 	if (!fault && sigsetjmp(jb, 1) == 0)
-		SetNoVideoMem(dst.p, ow, oh);
+		SetNoVideoMem(dst.p, ow, oh, 0);
 	else if (!fault)
 		fault = 2;
 	if (fault) {

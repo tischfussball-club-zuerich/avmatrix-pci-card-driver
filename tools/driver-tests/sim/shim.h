@@ -98,6 +98,7 @@ typedef struct { atomic_int v; } atomic_t;
 #define atomic_read(a) atomic_load(&(a)->v)
 #define atomic_set(a, x) atomic_store(&(a)->v, (x))
 #define atomic_xchg(a, x) atomic_exchange(&(a)->v, (x))
+#define atomic_cmpxchg(a, o, n) ({ int _o = (o); atomic_compare_exchange_strong(&(a)->v, &_o, (n)); _o; })
 struct kref { atomic_t refcount; };
 typedef struct { _Atomic s64 v; } atomic64_t;
 #define atomic64_set(a, x) atomic_store(&(a)->v, (x))

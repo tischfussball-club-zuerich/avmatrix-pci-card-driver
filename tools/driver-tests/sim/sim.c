@@ -21,6 +21,7 @@
 atomic_long sim_ratelimited_warnings;
 static int timing_debug = 2;	/* exercise the diagnostic paths too */
 static int direct_io = 1;
+static int dma_probe = 1;	/* its marks must never show up in a frame */
 static int nt_copy = 1;	/* the non-temporal variant of the direct path (plain memcpy here) */
 
 /* ------------------------------------------------------------ fake MMIO */
@@ -714,6 +715,9 @@ static void *status_thread(void *a)
 		tick++;
 		/* as MainKsThreadHandle, every tick; the re-init it asks for is a no-op here */
 		hws_watchdog(pdx);
+		/* dma_probe: ask for marks; the status thread's watching isn't simulated */
+		for (int ch = 0; ch < NCH; ch++)
+			atomic_set(&pdx->probe_state[ch], 1);
 		if (pdx->m_recovered) {
 			pdx->m_recovered = 0;
 			pdx->need_bringup = false;
@@ -1251,6 +1255,8 @@ int main(int argc, char **argv)
 		       ch, card, t[HWS_ST_IN], t[HWS_ST_OVERRUN], t[HWS_ST_STALE], t[HWS_ST_UNPAIRED], t[HWS_ST_ABORTED],
 		       t[HWS_ST_MISSED], card - t[HWS_ST_IN] - t[HWS_ST_OVERRUN] - t[HWS_ST_STALE] - t[HWS_ST_UNPAIRED] -
 		       t[HWS_ST_ABORTED] - t[HWS_ST_MISSED]);
+		printf("ch%d not in the card count: irq_lost %ld, card_late %ld (at start %ld)\n",
+		       ch, t[HWS_ST_IRQ_LOST], t[HWS_ST_CARD_LATE], t[HWS_ST_LATE_START]);
 	}
 	/* the measured rate (G_PARM) */
 	long rate_err = atomic_load(&rate_bad);

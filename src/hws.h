@@ -431,7 +431,8 @@ struct hws_audio{
 /* counters of hws_timing_stats, in hws_tstat_counters() order */
 enum { HWS_ST_IN, HWS_ST_OUT, HWS_ST_IRQ_BUSY, HWS_ST_STALE, HWS_ST_OVERRUN, HWS_ST_DIRECT,
        HWS_ST_OVERWRITE, HWS_ST_COALESCED, HWS_ST_NO_BUF, HWS_ST_EMPTY, HWS_ST_SKIP,
-       HWS_ST_UNPAIRED, HWS_ST_ABORTED, HWS_ST_MISSED, HWS_ST_N };
+       HWS_ST_UNPAIRED, HWS_ST_ABORTED, HWS_ST_MISSED, HWS_ST_IRQ_LOST, HWS_ST_CARD_LATE,
+       HWS_ST_LATE_START, HWS_ST_N };
 
 struct hws_timing_stats {
 	atomic_t	frames_in;	/* complete frames committed to the ring */
@@ -450,10 +451,19 @@ struct hws_timing_stats {
 					 * every app stopped mid-frame, not capturing) */
 	atomic_t	copy_missed;	/* second halves the copy thread never got to (their interrupts
 					 * merged while it was busy); each one is a frame */
+	atomic_t	irq_lost;	/* frames whose second-half interrupt never came (a first
+					 * half twice in a row): not in the card's count either */
+	atomic_t	card_late;	/* frame intervals over 1.5 periods without any frame lost
+					 * in the driver: the card itself sent no frame in between */
+	atomic_t	card_late_start;	/* of these, within the first frames after a capture start */
+	u32		frames_since_start;	/* copy thread */
+	bool		lost_since_frame;	/* copy thread: a frame was dropped since the last one */
 	u64		last_frame_ns;
 	u64		interval_min;
 	u64		interval_max;
 	u64		copy_lat_max;	/* IRQ -> frame committed */
+	u64		copy_wake_max;	/* IRQ -> copy thread starts on a half */
+	u64		copy_dur_max;	/* copy of one half (incl. waiting for the CPU meanwhile) */
 	u64		wq_lat_max;		/* frame IRQ -> worker picked it */
 	u64		lock_hold_max;		/* worker time with videoslock held, IRQs off */
 	int		backlog_max;		/* ready slots waiting when worker ran */
@@ -527,6 +537,16 @@ struct hws_pcie_dev {
 	u32				capture_starts[MAX_VID_CHANNELS];	/* for the stats file: a restart between two readings */
 	atomic_t			*half1_drop[MAX_VID_CHANNELS];
 	u64				m_half1_ts[MAX_VID_CHANNELS];	/* IRQ time of that first half */
+	u32				m_half1_peer[MAX_VID_CHANNELS];	/* second-half count at that first half's interrupt */
+	/* dma_probe: 0 idle, 1 asked (status thread), 2 marks planted (copy thread);
+	 * HWS_PROBE_N marks per half, at 0/8 .. 8/8 of it */
+#define HWS_PROBE_N	9
+#define HWS_PROBE_MARK	0xA5C3A5C3u
+	atomic_t			probe_state[MAX_VID_CHANNELS];
+	u8				*probe_base[MAX_VID_CHANNELS];
+	u32				probe_size[MAX_VID_CHANNELS];
+	int				probe_half[MAX_VID_CHANNELS];
+	u64				probe_tirq[MAX_VID_CHANNELS];
 	u32				m_fmt_cnt0[MAX_VID_CHANNELS];
 	bool				m_fmt_armed[MAX_VID_CHANNELS];	/* videoslock: m_fmt_cnt0 still to be checked */
 	u64				m_sw_rate_t0[MAX_VID_CHANNELS];	/* status thread: start of the frame-rate count */	/* videoslock: second-half count at the last format change */

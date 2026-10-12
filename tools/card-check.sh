@@ -174,7 +174,20 @@ for d in "${nodes[@]}"; do
 	fi
 
 	res "${KEY[$d]}.info fmt=${w}x${h} fps=$fps signal=$([ "$nosig" -gt 0 ] && echo 0 || echo 1)"
-	[ "$nosig" -gt 0 ] && { say "   captures skipped: no signal"; continue; }
+	if [ "$nosig" -gt 0 ]; then
+		# apps get a picture saying so (blue, white "NO SIGNAL"), not a hang
+		rm -f "$TMP/nosig.yuv"
+		timeout -s INT 10 v4l2-ctl -d "$d" --set-fmt-video="$saved_fmt" --stream-mmap=4 --stream-skip=3 --stream-count=1 --stream-to="$TMP/nosig.yuv" >/dev/null 2>&1
+		size=$(stat -c %s "$TMP/nosig.yuv" 2>/dev/null || echo 0)
+		# white text: luma 235 next to chroma 128
+		text=$(od -An -tu1 -v "$TMP/nosig.yuv" 2>/dev/null | tr -s ' ' '\n' | grep -c '^235$')
+		if [ "$size" -ne $((w * h * 2)) ]; then bad "no picture from $d while it has no signal ($size bytes)"
+		elif [ "$text" -gt 0 ]; then say "   no-signal picture: delivered, with its text"
+		else say "   no-signal picture: delivered, without text"; fi
+		res "${KEY[$d]}.nosig size=$size text=$([ "$text" -gt 0 ] && echo 1 || echo 0)"
+		say "   captures skipped: no signal"
+		continue
+	fi
 	sig_nodes+=("$d")
 
 	# input size: straight from DMA into the app's buffer
@@ -467,11 +480,18 @@ elif [ -n "$stats_start" ]; then
 			drops = 0; txt = ""
 			for (i = 1; i <= 5; i++) { v = c[k[i]] - p[k[i]]; drops += v; if (v) txt = txt " " k[i] " " v }
 			inn = c["frames_in"] - p["frames_in"]
-			printf "%d %d %d %d%s", card, inn, drops, card - inn - drops, txt }')
+			il = c["irq_lost"] - p["irq_lost"]; cl = c["card_late"] - p["card_late"]
+			cs = c["card_late_start"] - p["card_late_start"]
+			printf "%d %d %d %d %d %d %d%s", card, inn, drops, card - inn - drops, il, cl, cs, txt }')
 		[ "$out" = old ] && continue
-		read -r card inn drops un rest <<< "$out"
+		read -r card inn drops un il cl cs rest <<< "$out"
 		say "   $d: card $card, taken in $inn, dropped $drops${rest:+ (${rest# })}, unaccounted $un"
-		res "accounting.${KEY[$d]} card=$card in=$inn dropped=$drops unaccounted=$un"
+		# not in the card's count: frames whose interrupt was lost (the driver
+		# can't copy them), and gaps where the card itself sent no frame
+		if [ -n "$cl" ] && [ "$((il + cl))" -gt 0 ]; then
+			say "      interrupt lost (frame gone) $il, no frame from the card (late) $cl, of these right after a capture start $cs"
+		fi
+		res "accounting.${KEY[$d]} card=$card in=$inn dropped=$drops unaccounted=$un irq_lost=${il:-0} card_late=${cl:-0} late_start=${cs:-0}"
 		if [ "$un" -gt 2 ] || [ "$un" -lt -2 ]; then bad "$d: $un frames neither taken in nor counted as dropped - a driver bug, please report"; fi
 	done <<< "$(stats_snap)"
 fi
@@ -493,8 +513,29 @@ else
 		say "== driver drop counters over the whole run (includes v4l2-compliance's own stream tests)"
 		say "$stats"
 	fi
+	# dma_probe=1: when the card rewrites a half, relative to that half's interrupt
+	probe=$(printf '%s\n' "$new" | awk '
+		/HwsCapture ch[0-9]+: dma probe, half / {
+			ch = $0; sub(/.*HwsCapture /, "", ch); sub(/:.*/, "", ch)
+			h = $0; sub(/.*half /, "", h); sub(/ .*/, "", h); k = ch " half " h
+			m = $0; sub(/.*rewritten after us: */, "", m); sub(/ *\|.*/, "", m); nv = split(m, t, " ")
+			o = $0; sub(/.*other half.s interrupt /, "", o); sub(/ .*/, "", o)
+			x = $0; sub(/.*this half.s next /, "", x); sub(/ .*/, "", x)
+			p = $0; sub(/.*period /, "", p); sub(/ .*/, "", p)
+			n[k]++; per[k] = p
+			for (i = 1; i <= nv; i++) if (t[i] != "-") { s[k, i] += t[i]; c[k, i]++
+				if (!((k, i) in lo) || t[i] + 0 < lo[k, i]) lo[k, i] = t[i] + 0 }
+			if (o > 0) { so[k] += o; co[k]++ } if (x > 0) { sx[k] += x; cx[k]++ } }
+		function avg(k, i) { return c[k, i] ? sprintf("%d", s[k, i] / c[k, i]) : "-" }
+		END { for (k in n) printf "   %s (%d samples, period %s us): rewritten 0/8 +%s us (earliest +%s), 4/8 +%s, 8/8 +%s (latest mark seen %d of %d times); other half interrupt +%s, own next +%s\n",
+			k, n[k], per[k], avg(k, 1), ((k, 1) in lo) ? lo[k, 1] : "-", avg(k, 5), avg(k, 9), c[k, 9], n[k],
+			co[k] ? sprintf("%d", so[k] / co[k]) : "-", cx[k] ? sprintf("%d", sx[k] / cx[k]) : "-" }' | sort)
+	if [ -n "$probe" ]; then
+		say "== card DMA timing (dma_probe=1): when the card rewrites a half, after that half's interrupt"
+		say "$probe"
+	fi
 	say "== kernel messages during this run (HwsCapture, last 10)"
-	printf '%s\n' "$new" | grep -i hwscapture | grep -v ': in [0-9]* fps' | tail -10 | sed 's/^/   /'
+	printf '%s\n' "$new" | grep -i hwscapture | grep -v ': in [0-9]* fps' | grep -v ': dma probe, ' | tail -10 | sed 's/^/   /'
 	# a crash in any module while we drove the card counts; older messages don't
 	probs=$(printf '%s\n' "$new" | grep -iE 'hwscapture.*(stuck|not respond|stopped|failed)|BUG:|Oops|WARNING: CPU' | head)
 	[ -n "$probs" ] && { say "$probs" | sed 's/^/   !! /'; fail=1; }

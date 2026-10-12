@@ -230,6 +230,7 @@ with a file `/etc/modprobe.d/hwscapture.conf` containing e.g.
 | `direct_io` | `1` | Copy frames straight from the card into the application's buffer when no conversion is needed. `0`: always go through the driver's internal ring (for comparison). |
 | `nt_copy` | `0` | `1`: on the direct path, write frames with non-temporal stores that bypass the CPU cache. May help with several channels, may cost if the application reads each frame right away; measure on your system. Interlaced input always uses them (each line is written twice, ~40% faster). |
 | `timing_debug` | `0` | `1`: log statistics for each streaming channel to the kernel log (see below); `2`: a line every second and warnings about late frames. |
+| `dma_probe` | `0` | `1`: every 2 s, measure when the card rewrites each part of a half-frame after its interrupt and log it (`dma probe` lines; `card-check.sh` sums them up). For working out how much time the driver has to copy a frame. Diagnostics only: the status thread busy-waits up to ~3 frame periods per channel each time. |
 | `portrait_output` | `0` | `1`: also offer the rotated 1080×1920 portrait size. Off by default, because some applications (e.g. GStreamer) pick it on their own and show a rotated picture. |
 | `buf_limit_mb` | `1024` | Buffer memory all applications together may allocate on one channel, in MiB (an application with 32 buffers at 1080p uses 133 MiB, so 8 such applications fit). Without a limit, any program with access to the device could hold gigabytes of kernel memory. Buffers an application freed while still mapping them no longer count until it unmaps them. |
 
@@ -251,6 +252,14 @@ one drop reason. `dma_overrun`, `stale_half`, `unpaired`, `aborted`,
 should stay 0 in normal operation (`aborted` also counts frames given up
 during a mode change or a stop); `no_app_buf` counts frames no application
 had a free buffer for; `direct` counts frames that took the fast path.
+`irq_lost` counts frames the card wrote but whose interrupt never came (the
+frame is gone; applications see a gap in the sequence numbers), `card_late`
+gaps of more than 1.5 frame periods where the card sent no frame at all, and
+`late_start` those of them among the first 10 frames after a capture started.
+Neither is in `frames card`. `copy_wake` is the longest time from a
+half-frame's interrupt to the copy thread starting on it, `copy_dur` the
+longest copy: together they show whether a late copy (`dma_overrun`) waited
+for the CPU or was slow itself.
 
 ## Testing on your card
 
@@ -402,7 +411,9 @@ cat /sys/class/video4linux/video0/stats
 (compare two readings). Every frame the card completes is counted exactly once:
 taken in (`frames_in`) or dropped on the way in (`dma_overrun`, `stale_half`,
 `unpaired`, `aborted`, `copy_missed`), so `card_frames` minus those is 0 apart
-from a frame in flight; anything else is a driver bug. `ring_overwrite` and
+from a frame in flight; anything else is a driver bug. `irq_lost`,
+`card_late` and `card_late_start` are frames outside that count (see
+`timing_debug` above). `ring_overwrite` and
 `ring_skip` count frames dropped later, `no_app_buf` frames no application had
 a buffer for, `capture_starts` how often capture was started, `stalled` 1 while
 the card sends no frames although it reports a signal (see the watchdog below); `audio_card_packets` /
@@ -608,7 +619,8 @@ have also been verified on a VC42 (see [Status](#status)).
   for conversion; older ones are dropped instead of being shown late.
 - **Mode changes** are noticed within 250 ms instead of up to 1 s; while there
   is no signal nothing is copied and the "no signal" picture comes at ~30 fps
-  (it used to come once per second).
+  (it used to come once per second). The picture says so: blue with "NO
+  SIGNAL" and the input number in white (it used to be plain blue).
 
 ### Audio
 

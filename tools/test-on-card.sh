@@ -120,6 +120,7 @@ compare_results() {
 					row("   colour match U", get("old", k, "u"), get("new", k, "u"))
 					row("   colour match V", get("old", k, "v"), get("new", k, "v")) }
 				else if (what == "controls") { better = "high"; row(ch ": brightness control, min->max change", get("old", k, "diff"), get("new", k, "diff")) }
+				else if (what == "nosig") { better = "high"; row(ch ": no-signal picture with text (1 = yes)", get("old", k, "text"), get("new", k, "text")) }
 				else if (what == "userptr") cap(k, ch ": user-pointer buffers")
 				else if (what == "app1") cap(k, ch ": two apps at once, app 1")
 				else if (what == "app2") cap(k, ch ": two apps at once, app 2")
@@ -133,7 +134,10 @@ compare_results() {
 				else if (ch == "audio") { better = "high"; row("audio " what " ok (1 = yes)", get("old", k, "ok"), get("new", k, "ok")) }
 				else if (ch == "accounting") { better = "low"
 					row("driver " what ": frames dropped on the way in", get("old", k, "dropped"), get("new", k, "dropped"))
-					row("   frames unaccounted (must be 0)", get("old", k, "unaccounted"), get("new", k, "unaccounted")) }
+					row("   frames unaccounted (must be 0)", get("old", k, "unaccounted"), get("new", k, "unaccounted"))
+					row("   frames gone, their interrupt lost", get("old", k, "irq_lost"), get("new", k, "irq_lost"))
+					row("   no frame from the card (late)", get("old", k, "card_late"), get("new", k, "card_late"))
+					row("      of these right after a capture start", get("old", k, "late_start"), get("new", k, "late_start")) }
 				else if (ch == "cpu") {
 					# comparable only with as many channels streaming on both
 					better = get("old", k, "channels") == get("new", k, "channels") ? "low" : ""
@@ -284,7 +288,7 @@ fi
 # timestamps, not line counts: a full kernel log buffer drops old lines as new ones come
 DMESG_START=$(sudo dmesg | tail -1 | sed -n 's/^\[ *\([0-9.]*\)\].*/\1/p')
 kmsg_since() { sudo dmesg | awk -v t="${DMESG_START:-0}" 'match($0, /^\[ *[0-9.]+\]/) { v = substr($0, RSTART + 1, RLENGTH - 2); gsub(/ /, "", v); if (v + 0 > t + 0) print }'; }
-if ! out=$(sudo insmod "$BUILD/HwsCapture.ko" timing_debug=1 2>&1); then
+if ! out=$(sudo insmod "$BUILD/HwsCapture.ko" timing_debug=1 dma_probe=1 2>&1); then
 	say "$out"
 	echo "$out" | grep -qi 'key was rejected' && say "   Secure Boot is on: the module must be signed (install with dkms-install.sh, see README) or Secure Boot disabled"
 	die "loading the new driver failed"
@@ -309,5 +313,5 @@ rc=$?
 
 say ""
 say "== all kernel messages during the test"
-kmsg_since | sed 's/^/   /' | tail -60
+kmsg_since | grep -v ': dma probe, ' | sed 's/^/   /' | tail -60
 exit $rc
