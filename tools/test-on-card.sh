@@ -16,6 +16,7 @@
 #   tools/test-on-card.sh --compare  # same check on the installed driver first, then
 #                                    # on this one, and a table of both results
 #   DUR=60 tools/test-on-card.sh     # longer captures (each phase)
+#   DMA_PROBE=0 tools/test-on-card.sh  # without the card DMA timing measurement
 #
 # --compare leaves v4l2-compliance out for the installed driver (older versions
 # of this driver crash the kernel in the control ioctls it tests);
@@ -288,7 +289,7 @@ fi
 # timestamps, not line counts: a full kernel log buffer drops old lines as new ones come
 DMESG_START=$(sudo dmesg | tail -1 | sed -n 's/^\[ *\([0-9.]*\)\].*/\1/p')
 kmsg_since() { sudo dmesg | awk -v t="${DMESG_START:-0}" 'match($0, /^\[ *[0-9.]+\]/) { v = substr($0, RSTART + 1, RLENGTH - 2); gsub(/ /, "", v); if (v + 0 > t + 0) print }'; }
-if ! out=$(sudo insmod "$BUILD/HwsCapture.ko" timing_debug=1 dma_probe=1 2>&1); then
+if ! out=$(sudo insmod "$BUILD/HwsCapture.ko" timing_debug=1 dma_probe="${DMA_PROBE:-1}" 2>&1); then
 	say "$out"
 	echo "$out" | grep -qi 'key was rejected' && say "   Secure Boot is on: the module must be signed (install with dkms-install.sh, see README) or Secure Boot disabled"
 	die "loading the new driver failed"

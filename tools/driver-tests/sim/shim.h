@@ -46,6 +46,7 @@ typedef u64 v4l2_std_id; typedef unsigned int __poll_t;
 #define printk printf
 #define pr_debug(...) do { } while (0)
 #define pr_info(...) do { } while (0)
+#define pr_info_ratelimited(...) do { } while (0)
 extern atomic_long sim_ratelimited_warnings;
 #define pr_warn_ratelimited(...) atomic_fetch_add(&sim_ratelimited_warnings, 1)
 #define printk_ratelimited(...) atomic_fetch_add(&sim_ratelimited_warnings, 1)

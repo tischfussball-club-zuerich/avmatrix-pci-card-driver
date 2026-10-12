@@ -5118,7 +5118,7 @@ static int hws_copy_half(struct hws_pcie_dev *pdx, int nDecoder, int mVideoBufIn
 	int downsize;
 	u32 gen, fmt_cnt0;
 	bool fmt_armed;
-	u32 cnt_self, peer_at_irq;
+	u32 cnt_self, peer_at_irq, prev_cnt;
 	u64 t_irq;
 	unsigned long flags;
 	int i;
@@ -5171,6 +5171,7 @@ static int hws_copy_half(struct hws_pcie_dev *pdx, int nDecoder, int mVideoBufIn
 	{
 		pdx->half1_drop[nDecoder] = NULL;	/* a new frame: an older reason doesn't apply */
 	}
+	prev_cnt = pdx->m_half_done_cnt[nDecoder][mVideoBufIndex];
 	pdx->m_half_done_cnt[nDecoder][mVideoBufIndex] = cnt_self;
 
 	/*
@@ -5300,6 +5301,18 @@ static int hws_copy_half(struct hws_pcie_dev *pdx, int nDecoder, int mVideoBufIn
 			{
 				atomic_inc(&pdx->tstats[nDecoder].irq_lost);
 				hws_seq_skip(pdx, nDecoder, 1);
+				/*
+				 * Which kind of loss: about a period since the last first
+				 * half means no interrupt came in between; about half a
+				 * period means one came but the card's half register still
+				 * named this half (then the first-half count moved by 2).
+				 */
+				if (timing_debug)
+					pr_info_ratelimited("HwsCapture ch%d: interrupt lost: previous first half %llu us before, other half's last interrupt %lld us before, first-half interrupts since %u, period %llu us\n",
+							    nDecoder, div_u64(t_irq - pdx->m_half1_ts[nDecoder], NSEC_PER_USEC),
+							    div_s64((s64)t_irq - atomic64_read(&pdx->m_half_ts[nDecoder][0]), NSEC_PER_USEC),
+							    cnt_self - prev_cnt,
+							    div_u64(hws_frame_period_ns(pdx, nDecoder), NSEC_PER_USEC));
 			}
 			pdx->m_half1_peer[nDecoder] = peer_at_irq;
 			pdx->m_nVideoHalfDone[nDecoder] = 1;

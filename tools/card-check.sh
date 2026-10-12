@@ -113,7 +113,7 @@ for t in v4l2-ctl arecord; do
 done
 [ "$SKIP_COMPLIANCE" = 1 ] || command -v v4l2-compliance >/dev/null || { say "missing v4l2-compliance (install v4l-utils)"; exit 2; }
 lsmod | grep -q '^HwsCapture' || { say "HwsCapture module not loaded"; exit 2; }
-say "== module: $(modinfo -F version HwsCapture 2>/dev/null) params: direct_io=$(cat /sys/module/HwsCapture/parameters/direct_io 2>/dev/null) nt_copy=$(cat /sys/module/HwsCapture/parameters/nt_copy 2>/dev/null) timing_debug=$(cat /sys/module/HwsCapture/parameters/timing_debug 2>/dev/null)"
+say "== module: $(modinfo -F version HwsCapture 2>/dev/null) params: direct_io=$(cat /sys/module/HwsCapture/parameters/direct_io 2>/dev/null) nt_copy=$(cat /sys/module/HwsCapture/parameters/nt_copy 2>/dev/null) timing_debug=$(cat /sys/module/HwsCapture/parameters/timing_debug 2>/dev/null) dma_probe=$(cat /sys/module/HwsCapture/parameters/dma_probe 2>/dev/null)"
 
 nodes=()
 # by number: video10 after video9, so ch1, ch2... follow the card's channels
@@ -534,8 +534,29 @@ else
 		say "== card DMA timing (dma_probe=1): when the card rewrites a half, after that half's interrupt"
 		say "$probe"
 	fi
+	# timing_debug: what each lost interrupt looked like (a whole period without
+	# one, or one that came but named the wrong half)
+	lost=$(printf '%s\n' "$new" | awk '
+		/HwsCapture ch[0-9]+: interrupt lost: / {
+			ch = $0; sub(/.*HwsCapture /, "", ch); sub(/:.*/, "", ch)
+			g = $0; sub(/.*previous first half /, "", g); sub(/ .*/, "", g)
+			n = $0; sub(/.*first-half interrupts since /, "", n); sub(/,.*/, "", n)
+			p = $0; sub(/.*period /, "", p); sub(/ .*/, "", p)
+			g += 0; n += 0; p += 0	# numbers, not strings, in the comparisons
+			tot[ch]++
+			if (g > p * 3 / 4 && g < p * 5 / 4 && n == 1) none[ch]++
+			else if (g < p * 3 / 4) wrong[ch]++
+			else other[ch]++
+			if (!(ch in lo) || g + 0 < lo[ch]) lo[ch] = g + 0
+			if (g + 0 > hi[ch]) hi[ch] = g + 0 }
+		END { for (ch in tot) printf "   %s: %d logged: %d with no interrupt for a whole period, %d with one too early (wrong half named), %d other; previous first half %d-%d us before\n",
+			ch, tot[ch], none[ch], wrong[ch], other[ch], lo[ch], hi[ch] }' | sort)
+	if [ -n "$lost" ]; then
+		say "== lost interrupts (timing_debug): what the card did around each"
+		say "$lost"
+	fi
 	say "== kernel messages during this run (HwsCapture, last 10)"
-	printf '%s\n' "$new" | grep -i hwscapture | grep -v ': in [0-9]* fps' | grep -v ': dma probe, ' | tail -10 | sed 's/^/   /'
+	printf '%s\n' "$new" | grep -i hwscapture | grep -v ': in [0-9]* fps' | grep -v ': dma probe, ' | grep -v ': interrupt lost: ' | tail -10 | sed 's/^/   /'
 	# a crash in any module while we drove the card counts; older messages don't
 	probs=$(printf '%s\n' "$new" | grep -iE 'hwscapture.*(stuck|not respond|stopped|failed)|BUG:|Oops|WARNING: CPU' | head)
 	[ -n "$probs" ] && { say "$probs" | sed 's/^/   !! /'; fail=1; }
