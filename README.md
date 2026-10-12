@@ -231,6 +231,7 @@ with a file `/etc/modprobe.d/hwscapture.conf` containing e.g.
 | `nt_copy` | `0` | `1`: on the direct path, write frames with non-temporal stores that bypass the CPU cache. May help with several channels, may cost if the application reads each frame right away; measure on your system. Interlaced input always uses them (each line is written twice, ~40% faster). |
 | `timing_debug` | `0` | `1`: log statistics for each streaming channel to the kernel log (see below); `2`: a line every second and warnings about late frames. |
 | `dma_probe` | `0` | `1`: every 2 s, measure when the card rewrites each part of a half-frame after its interrupt and log it (`dma probe` lines; `card-check.sh` sums them up). For working out how much time the driver has to copy a frame. Diagnostics only: the status thread busy-waits up to ~3 frame periods per channel each time. |
+| `irq_recover` | `1` | When a second half-frame's interrupt doesn't come (on a VC42 about one frame in 1000), copy the half anyway if the card wrote it completely, checked about 2 ms after the interrupt was due. `0`: such a frame is lost, as before. |
 | `portrait_output` | `0` | `1`: also offer the rotated 1080×1920 portrait size. Off by default, because some applications (e.g. GStreamer) pick it on their own and show a rotated picture. |
 | `buf_limit_mb` | `1024` | Buffer memory all applications together may allocate on one channel, in MiB (an application with 32 buffers at 1080p uses 133 MiB, so 8 such applications fit). Without a limit, any program with access to the device could hold gigabytes of kernel memory. Buffers an application freed while still mapping them no longer count until it unmaps them. |
 
@@ -253,10 +254,14 @@ should stay 0 in normal operation (`aborted` also counts frames given up
 during a mode change or a stop); `no_app_buf` counts frames no application
 had a free buffer for; `direct` counts frames that took the fast path.
 `irq_lost` counts frames the card wrote but whose interrupt never came (the
-frame is gone; applications see a gap in the sequence numbers), `card_late`
+frame is gone; applications see a gap in the sequence numbers). With
+`irq_recover` such frames are copied anyway and counted in `irq_recovered`
+instead; `half_skipped` counts those where the card hadn't written the half
+either (the frame is gone), and `irq_late` those where the interrupt still came
+after the driver had stepped in (should stay 0). `card_late`
 gaps of more than 1.5 frame periods where the card sent no frame at all, and
 `late_start` those of them among the first 10 frames after a capture started.
-Neither is in `frames card`. `copy_wake` is the longest time from a
+`irq_lost`, `half_skipped` and `card_late` are not in `frames card`. `copy_wake` is the longest time from a
 half-frame's interrupt to the copy thread starting on it, `copy_dur` the
 longest copy: together they show whether a late copy (`dma_overrun`) waited
 for the CPU or was slow itself.
@@ -281,6 +286,9 @@ brings back the installed driver.
 ```sh
 DUR=60 tools/test-on-card.sh
 ```
+
+It loads the new driver with `timing_debug=1 dma_probe=1 irq_recover=1`;
+`DMA_PROBE=0` and `IRQ_RECOVER=0` switch the last two off.
 
 **Old vs. new:** `tools/test-on-card.sh --compare` first runs the same check on
 the installed driver, then on this one, and ends with a table of both results
@@ -412,8 +420,9 @@ cat /sys/class/video4linux/video0/stats
 taken in (`frames_in`) or dropped on the way in (`dma_overrun`, `stale_half`,
 `unpaired`, `aborted`, `copy_missed`), so `card_frames` minus those is 0 apart
 from a frame in flight; anything else is a driver bug. `irq_lost`,
-`card_late` and `card_late_start` are frames outside that count (see
-`timing_debug` above). `ring_overwrite` and
+`half_skipped`, `card_late` and `card_late_start` are frames outside that count;
+`irq_recovered` frames are in it, `irq_late` counts interrupts that came after
+a recovery (see `timing_debug` above). `ring_overwrite` and
 `ring_skip` count frames dropped later, `no_app_buf` frames no application had
 a buffer for, `capture_starts` how often capture was started, `stalled` 1 while
 the card sends no frames although it reports a signal (see the watchdog below); `audio_card_packets` /

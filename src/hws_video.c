@@ -84,15 +84,16 @@ static u64 hws_frame_period_ns(struct hws_pcie_dev *pdx, int ch)
 }
 
 /*
- * The card rewrites a half one half-period after announcing it. A copy that
- * ends later than that may hold new data, even if the interrupt that would
- * show this (the other half's) was lost: treat it as overrun. The interrupt
- * time is taken when the handler runs, possibly late, so allow only 3/8 of a
- * period (2 ms of interrupt latency headroom at 60 fps).
+ * The card starts rewriting a half when it announces the other one: measured
+ * with dma_probe on a VC42 at 60 fps, 7.99 ms after the half's interrupt for
+ * the second half and 8.41 ms for the first (period/2 = 8.33). A copy that
+ * ends later may hold new data, even if the interrupt that would show this
+ * (the other half's) was lost: treat it as overrun. 7/16 of a period
+ * (7.29 ms) leaves 0.7 ms for an interrupt handled late.
  */
 static bool hws_copy_too_late(struct hws_pcie_dev *pdx, int ch, u64 t_irq)
 {
-	return ktime_get_ns() - t_irq > hws_frame_period_ns(pdx, ch) * 3 / 8;
+	return ktime_get_ns() - t_irq > hws_frame_period_ns(pdx, ch) * 7 / 16;
 }
 
 static inline void hws_tstat_max(u64 *max, u64 v)
@@ -161,6 +162,9 @@ static void hws_tstat_counters(struct hws_timing_stats *ts, atomic_t **c)
 	c[HWS_ST_IRQ_LOST] = &ts->irq_lost;
 	c[HWS_ST_CARD_LATE] = &ts->card_late;
 	c[HWS_ST_LATE_START] = &ts->card_late_start;
+	c[HWS_ST_RECOVERED] = &ts->irq_recovered;
+	c[HWS_ST_HALF_SKIPPED] = &ts->half_skipped;
+	c[HWS_ST_IRQ_LATE] = &ts->irq_late;
 }
 
 /* end a report window: its counts (win, may be NULL) go into the totals */
@@ -199,7 +203,8 @@ static void hws_tstat_report(struct hws_pcie_dev *pdx)
 				atomic_read(&ts->unpaired) || atomic_read(&ts->ring_overwrite) ||
 				atomic_read(&ts->aborted) || atomic_read(&ts->copy_missed) ||
 				atomic_read(&ts->ring_skip) || atomic_read(&ts->no_app_buf) ||
-				atomic_read(&ts->irq_lost) ||
+				atomic_read(&ts->irq_lost) || atomic_read(&ts->irq_recovered) ||
+				atomic_read(&ts->half_skipped) || atomic_read(&ts->irq_late) ||
 				ts->interval_max * 2 > 3 * hws_frame_period_ns(pdx, ch);
 		u32 w[HWS_ST_N];
 		u32 c0, card;
@@ -207,15 +212,16 @@ static void hws_tstat_report(struct hws_pcie_dev *pdx)
 		if (pdx->m_bVCapStarted[ch] && !eventful && timing_debug < 2 && elapsed_ms < 10000)
 			continue;
 		hws_tstat_fold(ts, w);
-		/* frames the card completed (one second-half interrupt each) vs.
-		 * frames the driver committed: more interrupts = frames lost in the driver */
+		/* frames the card completed (one second-half interrupt each, or a
+		 * stand-in for one that never came) vs. frames the driver committed:
+		 * more = frames lost in the driver */
 		c0 = READ_ONCE(pdx->m_half_cnt[ch][0]);
 		card = c0 - ts->last_half0_cnt;
 
 		ts->last_half0_cnt = c0;
 
 		if (pdx->m_bVCapStarted[ch] && elapsed_ms > 0)
-			pr_info("HwsCapture ch%d: in %llu fps (hw %u) out %llu fps | frames card %u in %u | irq_busy %u stale_half %u dma_overrun %u unpaired %u aborted %u copy_missed %u direct %u overwrite %u skip %u wq_coalesced %u no_app_buf %u empty %u irq_lost %u card_late %u late_start %u | interval %llu-%llu us, copy_lat %llu us, copy_wake %llu us, copy_dur %llu us, wq_lat %llu us, lock_hold %llu us, backlog %d\n",
+			pr_info("HwsCapture ch%d: in %llu fps (hw %u) out %llu fps | frames card %u in %u | irq_busy %u stale_half %u dma_overrun %u unpaired %u aborted %u copy_missed %u direct %u overwrite %u skip %u wq_coalesced %u no_app_buf %u empty %u irq_lost %u card_late %u late_start %u irq_recovered %u half_skipped %u irq_late %u | interval %llu-%llu us, copy_lat %llu us, copy_wake %llu us, copy_dur %llu us, wq_lat %llu us, lock_hold %llu us, backlog %d\n",
 				ch, div64_u64((u64)w[HWS_ST_IN] * 1000, elapsed_ms),
 				pdx->m_pVCAPStatus[ch][0].dwFrameRate,
 				div64_u64((u64)w[HWS_ST_OUT] * 1000, elapsed_ms),
@@ -226,6 +232,7 @@ static void hws_tstat_report(struct hws_pcie_dev *pdx)
 				w[HWS_ST_COALESCED],
 				w[HWS_ST_NO_BUF], w[HWS_ST_EMPTY],
 				w[HWS_ST_IRQ_LOST], w[HWS_ST_CARD_LATE], w[HWS_ST_LATE_START],
+				w[HWS_ST_RECOVERED], w[HWS_ST_HALF_SKIPPED], w[HWS_ST_IRQ_LATE],
 				ts->interval_min == U64_MAX ? 0 : div_u64(ts->interval_min, NSEC_PER_USEC),
 				div_u64(ts->interval_max, NSEC_PER_USEC),
 				div_u64(ts->copy_lat_max, NSEC_PER_USEC),
@@ -3438,6 +3445,7 @@ static ssize_t stats_show(struct device *dev, struct device_attribute *attr, cha
 		"card_frames %u\nframes_in %llu\nframes_out %llu\ndirect %llu\n"
 		"dma_overrun %llu\nstale_half %llu\nunpaired %llu\nring_overwrite %llu\nring_skip %llu\n"
 		"aborted %llu\ncopy_missed %llu\nirq_lost %llu\ncard_late %llu\ncard_late_start %llu\n"
+		"irq_recovered %llu\nhalf_skipped %llu\nirq_late %llu\n"
 		"no_app_buf %llu\nirq_busy %llu\nwq_coalesced %llu\nworker_empty %llu\n"
 		"audio_running %d\naudio_card_packets %u\naudio_silence_packets %u\n"
 		"card_lost %d\nirq_paused %d\ncapture_starts %u\nstalled %d\n",
@@ -3451,6 +3459,7 @@ static ssize_t stats_show(struct device *dev, struct device_attribute *attr, cha
 		t[HWS_ST_OVERRUN], t[HWS_ST_STALE], t[HWS_ST_UNPAIRED], t[HWS_ST_OVERWRITE], t[HWS_ST_SKIP],
 		t[HWS_ST_ABORTED], t[HWS_ST_MISSED],
 		t[HWS_ST_IRQ_LOST], t[HWS_ST_CARD_LATE], t[HWS_ST_LATE_START],
+		t[HWS_ST_RECOVERED], t[HWS_ST_HALF_SKIPPED], t[HWS_ST_IRQ_LATE],
 		t[HWS_ST_NO_BUF], t[HWS_ST_IRQ_BUSY], t[HWS_ST_COALESCED], t[HWS_ST_EMPTY],
 		READ_ONCE(a->running) ? 1 : 0, atomic_read(&a->pkts_card), atomic_read(&a->pkts_silence),
 		READ_ONCE(pdx->m_PciDeviceLost) ? 1 : 0, READ_ONCE(pdx->irq_storm_off) ? 1 : 0,
@@ -4251,6 +4260,8 @@ static void hws_dev_release(struct kref *kref)
 	struct hws_pcie_dev *pdx = container_of(kref, struct hws_pcie_dev, kref);
 	int i;
 
+	for (i = 0; i < MAX_VID_CHANNELS; i++)
+		hrtimer_cancel(&pdx->half_timer[i].timer);	/* it queues onto the copy threads */
 	/* the copy threads queue conversions: gone first (idle by now; this also flushes) */
 	for (i = 0; i < MAX_VID_CHANNELS; i++)
 		if (pdx->copy_worker[i])
@@ -4346,6 +4357,8 @@ static void hws_quiesce(struct hws_pcie_dev *dev)
 	irq_teardown(dev);	/* also waits for the IRQ thread */
 	WRITE_ONCE(dev->irq_line, -1);
 	mutex_unlock(&dev->irq_lock);
+	for (i = 0; i < MAX_VID_CHANNELS; i++)
+		hrtimer_cancel(&dev->half_timer[i].timer);	/* no IRQ re-arms it now; it queues copies */
 	for (i = 0; i < MAX_VID_CHANNELS; i++)
 		if (dev->copy_worker[i])	/* nothing queues them any more */
 			kthread_flush_work(&dev->video[i].copy_work);
@@ -4558,6 +4571,10 @@ static int StartVideoCapture(struct hws_pcie_dev *pdx,int index)
 	WRITE_ONCE(pdx->m_half_pending[index], 0);
 	pdx->direct_frame[index] = false;
 	spin_unlock_irqrestore(&pdx->videoslock[index], flags);
+	/* a stand-in from before the stop doesn't wait for its interrupt any more */
+	raw_spin_lock_irqsave(&pdx->half_lock[index], flags);
+	pdx->synth_open[index] = false;
+	raw_spin_unlock_irqrestore(&pdx->half_lock[index], flags);
 
 	pdx->m_bChangeVideoSize[index] = 0;
 	pdx->m_bVCapIntDone[index] = 1;
@@ -4969,6 +4986,22 @@ use_ring:
 static int hws_copy_half(struct hws_pcie_dev *pdx, int nDecoder, int mVideoBufIndex);
 
 /*
+ * Copy thread, a half handled: "not rewritten" marks into it. The second half
+ * gets one at its very end too, and half_timer is told where they are: a
+ * stand-in for its interrupt needs the whole half rewritten.
+ */
+static void hws_put_marks(struct hws_pcie_dev *pdx, int ch, int half, u8 *start, u8 *end)
+{
+	hws_put_mark(start);
+	if (half != 0)
+		return;
+	hws_put_mark(end);
+	smp_wmb();	/* the marks before the pointers (the timer reads them in that order) */
+	WRITE_ONCE(pdx->mark_start[ch], start);
+	WRITE_ONCE(pdx->mark_end[ch], end);
+}
+
+/*
  * dma_probe: when exactly does the card rewrite a half? The copy deadline
  * (hws_copy_too_late) assumes the rewrite starts half a frame period after
  * the half's interrupt; this measures it. Right after a half is copied, marks
@@ -5113,13 +5146,14 @@ static int hws_copy_half(struct hws_pcie_dev *pdx, int nDecoder, int mVideoBufIn
 	int nw,nh;
 	int interlace;
 	int halfsize;
-	BYTE *pMask;
+	BYTE *pMask, *pEnd;
 	int  line_cnt=0;
 	int downsize;
 	u32 gen, fmt_cnt0;
 	bool fmt_armed;
 	u32 cnt_self, peer_at_irq, prev_cnt;
 	u64 t_irq;
+	bool synth = false;	/* half_timer stood in for this second half's interrupt */
 	unsigned long flags;
 	int i;
 
@@ -5137,6 +5171,8 @@ static int hws_copy_half(struct hws_pcie_dev *pdx, int nDecoder, int mVideoBufIn
 		cnt_self = READ_ONCE(pdx->m_half_cnt[nDecoder][mVideoBufIndex]);
 		peer_at_irq = READ_ONCE(pdx->m_half_peer[nDecoder][mVideoBufIndex]);
 		t_irq = atomic64_read(&pdx->m_half_ts[nDecoder][mVideoBufIndex]);
+		if (mVideoBufIndex == 0)
+			synth = READ_ONCE(pdx->m_half_synth[nDecoder]);
 		smp_rmb();
 		if (!(seq & 1) && READ_ONCE(pdx->m_half_seq[nDecoder][mVideoBufIndex]) == seq)
 			break;
@@ -5153,7 +5189,8 @@ static int hws_copy_half(struct hws_pcie_dev *pdx, int nDecoder, int mVideoBufIn
 	 */
 	if (cnt_self == pdx->m_half_done_cnt[nDecoder][mVideoBufIndex])
 		return -1;
-	hws_tstat_max(&pdx->tstats[nDecoder].copy_wake_max, ktime_get_ns() - t_irq);
+	if (!synth)	/* (a stand-in starts a while after the interrupt was due) */
+		hws_tstat_max(&pdx->tstats[nDecoder].copy_wake_max, ktime_get_ns() - t_irq);
 	if (mVideoBufIndex == 0)
 	{
 		/* second halves skipped since the last one: interrupts that merged
@@ -5237,6 +5274,7 @@ static int hws_copy_half(struct hws_pcie_dev *pdx, int nDecoder, int mVideoBufIn
 		return -1;
 	}
 	pMask = pDmaSrcBuf+(copysize-(line_cnt-2)*dwSrcPitch);
+	pEnd = pDmaSrcBuf + ((copysize - 4) & ~3);	/* the half's last bytes */
 	/* order the marker/data reads after the IRQ that announced the DMA */
 	rmb();
 	if(hws_get_mark(pMask) == 0x55AAAA55)
@@ -5269,12 +5307,15 @@ static int hws_copy_half(struct hws_pcie_dev *pdx, int nDecoder, int mVideoBufIn
 
 				hws_frame_drop(pdx, nDecoder, 0, why ? why : &pdx->tstats[nDecoder].unpaired);
 				pdx->m_nVideoHalfDone[nDecoder] =0;
-				hws_put_mark(pMask);
+				hws_put_marks(pdx, nDecoder, mVideoBufIndex, pMask, pEnd);
 				return -1;
 			}
 			else
 			{
 				pdx->m_nVideoHalfDone[nDecoder] =0;
+				/* the card wrote it, its interrupt just never came */
+				if (synth)
+					atomic_inc(&pdx->tstats[nDecoder].irq_recovered);
 			}
 		}
 		else if (fmt_armed && (s32)(peer_at_irq - fmt_cnt0) <= 0)
@@ -5285,7 +5326,7 @@ static int hws_copy_half(struct hws_pcie_dev *pdx, int nDecoder, int mVideoBufIn
 			 * it is still in the old layout: skip it.
 			 */
 			pdx->m_nVideoHalfDone[nDecoder] = 0;
-			hws_put_mark(pMask);
+			hws_put_marks(pdx, nDecoder, mVideoBufIndex, pMask, pEnd);
 			return -1;
 		}
 		else
@@ -5299,7 +5340,12 @@ static int hws_copy_half(struct hws_pcie_dev *pdx, int nDecoder, int mVideoBufIn
 			 */
 			if (pdx->m_nVideoHalfDone[nDecoder] && peer_at_irq == pdx->m_half1_peer[nDecoder])
 			{
-				atomic_inc(&pdx->tstats[nDecoder].irq_lost);
+				/* half_timer looked: the card never wrote that second half */
+				bool skipped = READ_ONCE(pdx->unwritten[nDecoder]) &&
+					       READ_ONCE(pdx->unwritten_cnt1[nDecoder]) == pdx->m_half1_cnt[nDecoder];
+
+				WRITE_ONCE(pdx->unwritten[nDecoder], false);
+				atomic_inc(skipped ? &pdx->tstats[nDecoder].half_skipped : &pdx->tstats[nDecoder].irq_lost);
 				hws_seq_skip(pdx, nDecoder, 1);
 				/*
 				 * Which kind of loss: about a period since the last first
@@ -5307,7 +5353,7 @@ static int hws_copy_half(struct hws_pcie_dev *pdx, int nDecoder, int mVideoBufIn
 				 * period means one came but the card's half register still
 				 * named this half (then the first-half count moved by 2).
 				 */
-				if (timing_debug)
+				if (!skipped && timing_debug)
 					pr_info_ratelimited("HwsCapture ch%d: interrupt lost: previous first half %llu us before, other half's last interrupt %lld us before, first-half interrupts since %u, period %llu us\n",
 							    nDecoder, div_u64(t_irq - pdx->m_half1_ts[nDecoder], NSEC_PER_USEC),
 							    div_s64((s64)t_irq - atomic64_read(&pdx->m_half_ts[nDecoder][0]), NSEC_PER_USEC),
@@ -5336,7 +5382,7 @@ static int hws_copy_half(struct hws_pcie_dev *pdx, int nDecoder, int mVideoBufIn
 					   copysize, nw, nh, interlace, cnt_self, peer_at_irq, t_irq);
 		if (dret >= 0)
 		{
-			hws_put_mark(pMask);
+			hws_put_marks(pdx, nDecoder, mVideoBufIndex, pMask, pEnd);
 			return dret;	/* direct path: nothing for the worker */
 		}
 	}
@@ -5396,7 +5442,7 @@ static int hws_copy_half(struct hws_pcie_dev *pdx, int nDecoder, int mVideoBufIn
 			{
 				hws_frame_drop(pdx, nDecoder, mVideoBufIndex, &pdx->tstats[nDecoder].dma_overrun);
 				pdx->m_nVideoHalfDone[nDecoder] = 0;
-				hws_put_mark(pMask);
+				hws_put_marks(pdx, nDecoder, mVideoBufIndex, pMask, pEnd);
 				return 1;
 			}
 			if (mVideoBufIndex == 1)
@@ -5430,7 +5476,7 @@ static int hws_copy_half(struct hws_pcie_dev *pdx, int nDecoder, int mVideoBufIn
 			pdx->m_nVideoHalfDone[nDecoder] =0;
 		}
 	}
-	hws_put_mark(pMask);
+	hws_put_marks(pdx, nDecoder, mVideoBufIndex, pMask, pEnd);
 	return committed ? 0 : 1;
 }
 static int MemCopyAudioToSteam( struct hws_pcie_dev  *pdx,int dwAudioCh,int half)
@@ -5625,6 +5671,183 @@ static void hws_video_dpc(struct hws_pcie_dev *pdx, int i)
  * (SCHED_FIFO, preemptible) instead of softirq context, so they no longer
  * hold up network, timer and block softirqs on the CPU taking this IRQ.
  */
+/*
+ * A half is complete: one consistent snapshot (ts/cnt/peer/synth) for the copy
+ * thread, then wake it. half_lock held; synth: half_timer stands in for the
+ * interrupt.
+ */
+static void hws_half_done(struct hws_pcie_dev *pdx, int i, int tmp, u64 ts, bool synth)
+{
+	pdx->video_data[i]= tmp;
+	pdx->m_nVideoBufferIndex[i] = tmp;
+	WRITE_ONCE(pdx->m_half_seq[i][tmp], pdx->m_half_seq[i][tmp] + 1);
+	smp_wmb();
+	atomic64_set(&pdx->m_half_ts[i][tmp], ts);
+	WRITE_ONCE(pdx->m_half_cnt[i][tmp], pdx->m_half_cnt[i][tmp] + 1);
+	WRITE_ONCE(pdx->m_half_peer[i][tmp], pdx->m_half_cnt[i][!tmp]);
+	if (tmp == 0)
+		WRITE_ONCE(pdx->m_half_synth[i], synth);
+	smp_wmb();
+	WRITE_ONCE(pdx->m_half_seq[i][tmp], pdx->m_half_seq[i][tmp] + 1);
+	smp_mb__before_atomic();	/* ts/counts visible before the bit */
+	set_bit(tmp, &pdx->m_half_pending[i]);
+	kthread_queue_work(pdx->copy_worker[i], &pdx->video[i].copy_work);
+}
+
+/*
+ * Recovering lost second-half interrupts. On a VC42 about one in 1000 second
+ * halves comes without its interrupt: the first halves keep their exact
+ * rhythm, the second half's interrupt just isn't there (logged with
+ * timing_debug, 2026-10-12). The card normally writes the half anyway, and
+ * rewrites it only from the next first half's interrupt on, a period after
+ * the missing one was due. So a timer armed at each first half looks at the
+ * half when its interrupt is overdue: if the card rewrote it completely (the
+ * "not rewritten" marks at its start and its end are both gone), the timer
+ * stands in for the interrupt and the half is copied as usual; if the card
+ * never began it, the frame is counted as skipped by the card (half_skipped);
+ * if it is still being written, it looks again a little later. Off (0): such
+ * a frame is lost (irq_lost).
+ */
+static int irq_recover = 1;
+module_param(irq_recover, int, 0644);
+MODULE_PARM_DESC(irq_recover, "Copy a second half-frame whose interrupt didn't come, if the card wrote it (default 1)");
+
+/* hard IRQ, half_lock held: the first half is in; arm the stand-in for the second */
+static void hws_arm_half_timer(struct hws_pcie_dev *pdx, int ch, u64 now)
+{
+	struct hws_half_timer *ht = &pdx->half_timer[ch];
+	u64 period = hws_frame_period_ns(pdx, ch), d = pdx->half12_ns[ch];
+
+	if (!d)
+		d = period / 2;
+	ht->cnt0 = pdx->m_half_cnt[ch][0];
+	ht->cnt1 = pdx->m_half_cnt[ch][1];
+	ht->due_ns = now + d;
+	/* a quarter of the rest of the period late: 10.7 ms of 16.7 at 60 fps,
+	 * 6 ms before the card starts rewriting the half; checks again until
+	 * half the rest is gone (12.7 ms), so the copy still has 4 ms */
+	ht->fire_ns = ht->due_ns + (period - d) / 4;
+	ht->give_up_ns = ht->due_ns + (period - d) / 2;
+	hrtimer_start(&ht->timer, ns_to_ktime(ht->fire_ns - now), HRTIMER_MODE_REL_HARD);
+}
+
+static enum hrtimer_restart hws_half_timer_fn(struct hrtimer *t)
+{
+	struct hws_half_timer *ht = container_of(t, struct hws_half_timer, timer);
+	struct hws_pcie_dev *pdx = ht->pdx;
+	enum hrtimer_restart ret = HRTIMER_NORESTART;
+	int ch = ht->ch;
+	unsigned long flags;
+	u64 now;
+
+	raw_spin_lock_irqsave(&pdx->half_lock[ch], flags);
+	now = ktime_get_ns();
+	/*
+	 * Not if a newer first half re-armed it meanwhile (this is the old
+	 * expiry), or an interrupt came since it was armed, or capture stopped.
+	 */
+	if (now + 50 * NSEC_PER_USEC >= ht->fire_ns &&
+	    pdx->m_half_cnt[ch][0] == ht->cnt0 && pdx->m_half_cnt[ch][1] == ht->cnt1 &&
+	    READ_ONCE(pdx->m_bVCapStarted[ch]) && !READ_ONCE(pdx->m_PciDeviceLost) &&
+	    !READ_ONCE(pdx->removing))
+	{
+		u8 *m0 = READ_ONCE(pdx->mark_start[ch]), *m1 = READ_ONCE(pdx->mark_end[ch]);
+		bool start, end;
+		u32 v;
+
+		if (!m0 || !m1)
+			goto out;	/* no second half copied yet: nothing to compare */
+		rmb();	/* the marks were planted before the pointers were set */
+		/*
+		 * The card writes a half front to back. Only if both the first lines
+		 * and the very end are new is the half complete; dma_probe's own
+		 * marks don't count as new data.
+		 */
+		v = hws_get_mark(m0);
+		start = v != 0x55AAAA55 && v != HWS_PROBE_MARK;
+		v = hws_get_mark(m1);
+		end = v != 0x55AAAA55 && v != HWS_PROBE_MARK;
+		if (start && end)
+		{
+			/* stamped when the interrupt was due: the copy deadline counts from there */
+			hws_half_done(pdx, ch, 0, ht->due_ns, true);
+			pdx->synth_open[ch] = true;
+		}
+		else if (!start)
+		{
+			/* not begun long after it should have ended: the card skipped it */
+			WRITE_ONCE(pdx->unwritten_cnt1[ch], ht->cnt1);
+			WRITE_ONCE(pdx->unwritten[ch], true);
+		}
+		else if (now < ht->give_up_ns)
+		{
+			/* still being written (a card running late): look again shortly */
+			u64 again = div_u64(hws_frame_period_ns(pdx, ch), 64);
+
+			ht->fire_ns = now + again;
+			hrtimer_forward_now(t, ns_to_ktime(again));
+			ret = HRTIMER_RESTART;
+		}
+	}
+out:
+	raw_spin_unlock_irqrestore(&pdx->half_lock[ch], flags);
+	return ret;
+}
+
+static void hws_half_timer_init(struct hws_pcie_dev *pdx, int ch)
+{
+	struct hws_half_timer *ht = &pdx->half_timer[ch];
+
+	raw_spin_lock_init(&pdx->half_lock[ch]);
+	ht->pdx = pdx;
+	ht->ch = ch;
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0))
+	hrtimer_setup(&ht->timer, hws_half_timer_fn, CLOCK_MONOTONIC, HRTIMER_MODE_REL_HARD);
+#else
+	hrtimer_init(&ht->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_HARD);
+	ht->timer.function = hws_half_timer_fn;
+#endif
+}
+
+/* hard IRQ: channel i's DMA engine finished half tmp */
+static void hws_half_irq(struct hws_pcie_dev *pdx, int i, int tmp)
+{
+	u64 now = ktime_get_ns();
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&pdx->half_lock[i], flags);
+	if (tmp == 0 && pdx->synth_open[i])
+	{
+		pdx->synth_open[i] = false;
+		/* the interrupt the timer stood in for, late after all: already
+		 * handled. (Much later it is the next frame's, its first half lost.) */
+		if (now - pdx->half_timer[i].due_ns < hws_frame_period_ns(pdx, i) / 2)
+		{
+			atomic_inc(&pdx->tstats[i].irq_late);
+			raw_spin_unlock_irqrestore(&pdx->half_lock[i], flags);
+			return;
+		}
+	}
+	if (tmp == 0)
+	{
+		/* the card's rhythm, first to second half (8.66 ms of 16.67 on a VC42);
+		 * an interval spanning a lost interrupt doesn't fit */
+		u64 period = hws_frame_period_ns(pdx, i);
+		u64 d = now - atomic64_read(&pdx->m_half_ts[i][1]);
+
+		if (d > period / 4 && d < period * 3 / 4)
+			pdx->half12_ns[i] = d;
+	}
+	hws_half_done(pdx, i, tmp, now, false);
+	if (tmp == 1)
+	{
+		pdx->synth_open[i] = false;
+		if (READ_ONCE(irq_recover) && READ_ONCE(pdx->m_bVCapStarted[i]))
+			hws_arm_half_timer(pdx, i, now);
+	}
+	raw_spin_unlock_irqrestore(&pdx->half_lock[i], flags);
+}
+
 static irqreturn_t irqhandler(int irq, void  *info)
 {
 	struct hws_pcie_dev *pdx = (struct hws_pcie_dev *)(info);
@@ -5688,23 +5911,7 @@ static irqreturn_t irqhandler(int irq, void  *info)
 				 * pairing checks see the counts); a duplicate without new data
 				 * is caught by the "not rewritten" mark in MemCopyVideoToSteam.
 				 */
-				{
-					u64 now = ktime_get_ns();
-
-					pdx->video_data[i]= tmp;
-					pdx->m_nVideoBufferIndex[i] = tmp;
-					/* the copy thread reads ts/cnt/peer as one snapshot */
-					WRITE_ONCE(pdx->m_half_seq[i][tmp], pdx->m_half_seq[i][tmp] + 1);
-					smp_wmb();
-					atomic64_set(&pdx->m_half_ts[i][tmp], now);
-					WRITE_ONCE(pdx->m_half_cnt[i][tmp], pdx->m_half_cnt[i][tmp] + 1);
-					WRITE_ONCE(pdx->m_half_peer[i][tmp], pdx->m_half_cnt[i][!tmp]);
-					smp_wmb();
-					WRITE_ONCE(pdx->m_half_seq[i][tmp], pdx->m_half_seq[i][tmp] + 1);
-					smp_mb__before_atomic();	/* ts/counts visible before the bit */
-					set_bit(tmp, &pdx->m_half_pending[i]);
-					kthread_queue_work(pdx->copy_worker[i], &pdx->video[i].copy_work);
-				}
+				hws_half_irq(pdx, i, tmp);
 			}
 			if(IntState & (0x100 << i)) // audio ch done
 			{
@@ -6881,6 +7088,9 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	if (!gdev)
 		return -ENOMEM;
 	kref_init(&gdev->kref);
+	/* first: every error path ends in hws_dev_release(), which cancels them */
+	for (i = 0; i < MAX_VID_CHANNELS; i++)
+		hws_half_timer_init(gdev, i);
 	spin_lock_init(&gdev->reg_lock);
 	mutex_init(&gdev->pm_lock);
 	mutex_init(&gdev->irq_lock);
@@ -7158,6 +7368,8 @@ static int __maybe_unused hws_suspend(struct device *dev)
 	hws_hw_stop(pdx);
 	if (pdx->irq_line != -1)
 		synchronize_irq(pdx->irq_line);	/* hard handler and IRQ thread */
+	for (i = 0; i < MAX_VID_CHANNELS; i++)
+		hrtimer_cancel(&pdx->half_timer[i].timer);	/* armed by the handler, queues copies */
 	for (i = 0; i < MAX_VID_CHANNELS; i++)
 		kthread_flush_work(&pdx->video[i].copy_work);	/* and the copies it queued */
 	for (i = 0; i < MAX_VID_CHANNELS; i++) {

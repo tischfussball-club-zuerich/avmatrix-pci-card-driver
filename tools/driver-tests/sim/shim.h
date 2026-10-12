@@ -115,6 +115,10 @@ typedef struct { pthread_mutex_t m; } spinlock_t;
 #define spin_unlock(l) pthread_mutex_unlock(&(l)->m)
 #define spin_lock_irqsave(l, f) do { (f) = 0; pthread_mutex_lock(&(l)->m); } while (0)
 #define spin_unlock_irqrestore(l, f) do { (void)(f); pthread_mutex_unlock(&(l)->m); } while (0)
+typedef struct { pthread_mutex_t m; } raw_spinlock_t;
+#define raw_spin_lock_init(l) pthread_mutex_init(&(l)->m, NULL)
+#define raw_spin_lock_irqsave(l, f) do { (f) = 0; pthread_mutex_lock(&(l)->m); } while (0)
+#define raw_spin_unlock_irqrestore(l, f) do { (void)(f); pthread_mutex_unlock(&(l)->m); } while (0)
 struct mutex { pthread_mutex_t m; };
 #define mutex_init(l) pthread_mutex_init(&(l)->m, NULL)
 /* rt_mutex: priority inheritance doesn't matter without RT scheduling here */
@@ -221,6 +225,26 @@ bool cancel_work_sync(struct work_struct *w);
 bool mod_delayed_work(struct workqueue_struct *wq, struct delayed_work *d, unsigned long ms);
 bool cancel_delayed_work_sync(struct delayed_work *d);
 #define to_delayed_work(w) container_of(w, struct delayed_work, work)
+
+/* ---- hrtimer: one thread per timer; the callback runs outside the device
+ * "hard IRQ" (as on another CPU), so the driver's own locking is what counts */
+typedef s64 ktime_t;
+#define ns_to_ktime(x) ((ktime_t)(x))
+enum hrtimer_restart { HRTIMER_NORESTART, HRTIMER_RESTART };
+enum hrtimer_mode { HRTIMER_MODE_REL_HARD };
+struct hrtimer {
+	enum hrtimer_restart (*function)(struct hrtimer *);
+	pthread_mutex_t lock;
+	pthread_cond_t cond;
+	u64 expires;		/* 0 = not armed */
+	u64 forward_to;		/* set by hrtimer_forward_now() in the callback */
+	bool running;
+	pthread_t thr;
+};
+void hrtimer_setup(struct hrtimer *t, enum hrtimer_restart (*fn)(struct hrtimer *), int clock, enum hrtimer_mode mode);
+void hrtimer_start(struct hrtimer *t, ktime_t rel, enum hrtimer_mode mode);
+int hrtimer_cancel(struct hrtimer *t);
+u64 hrtimer_forward_now(struct hrtimer *t, ktime_t interval);
 
 /* ---- vb2 / v4l2 (only what the capture core touches) ---- */
 enum vb2_buffer_state { VB2_BUF_STATE_DEQUEUED, VB2_BUF_STATE_QUEUED, VB2_BUF_STATE_ACTIVE,

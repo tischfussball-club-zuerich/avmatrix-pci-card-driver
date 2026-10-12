@@ -18,15 +18,16 @@ PY
 grep -q "mismatches: 0" $S/conv/dbl.txt || fail=1
 rm -f $S/sim/sim $S/sim/sim_tsan
 if ! $S/sim/build.sh $SRC > $S/sim/build.log 2>&1; then echo "!! simulator build FAILED:"; grep -m5 error $S/sim/build.log; echo "RESULT: FAIL"; exit 1; fi
-for mode in race logic nodirect irqfaults; do for f in 60 240 480; do
+for mode in race logic nodirect irqfaults skiphalf; do for f in 60 240 480; do
 	o=$S/sim/out_${mode}_$f.txt
-	unset SIM_DMA_LOCK SIM_NO_DIRECT SIM_LOSE_IRQ SIM_DUP_IRQ SIM_NTSC
+	unset SIM_DMA_LOCK SIM_NO_DIRECT SIM_LOSE_IRQ SIM_DUP_IRQ SIM_NTSC SIM_SKIP_HALF
 	if [ $mode = logic ]; then export SIM_DMA_LOCK=1 SIM_NTSC=1; fi	# also: 59.94 instead of 60
 	if [ $mode = nodirect ]; then export SIM_NO_DIRECT=1; fi
 	if [ $mode = irqfaults ]; then export SIM_LOSE_IRQ=40 SIM_DUP_IRQ=40; fi
+	if [ $mode = skiphalf ]; then export SIM_SKIP_HALF=40; fi	# the card skips a second half: nothing to recover
 	ASAN_OPTIONS=detect_leaks=0 timeout 300 $S/sim/sim $f 45 > $o 2>&1; rc=$?
-	echo "== sim $f fps, mode=$mode (race=card DMA race present, logic=race removed + 59.94 fps, nodirect=ring path only, irqfaults=lost+duplicate IRQs): exit $rc"
-	grep -E "^frames|delivered|restarts|steady|duplicate|out of order|mod 100|sequence not|timestamp not|STREAMOFF|ERROR b|stalls|latency|driver stats|accounting" $o | sed 's/^/    /'
+	echo "== sim $f fps, mode=$mode (race=card DMA race present, logic=race removed + 59.94 fps, nodirect=ring path only, irqfaults=lost+duplicate IRQs, skiphalf=card skips second halves): exit $rc"
+	grep -E "^frames|recovery totals|delivered|restarts|steady|duplicate|out of order|mod 100|sequence not|timestamp not|STREAMOFF|ERROR b|stalls|latency|driver stats|accounting" $o | sed 's/^/    /'
 	for k in "torn/mixed, steady state" "duplicate frames" "frames out of order" "sequence not increasing" "timestamp not increasing" "left in driver after STREAMOFF" "completed after STREAMOFF" "2 s stalls" "watchdog re-inits"; do
 		v=$(grep "$k" $o | grep -o '[0-9]\+' | tail -1); [ "${v:-1}" = 0 ] || { echo "    !! $k = $v"; fail=1; }; done
 	# an app that keeps showing its frame until the next one arrives (2 buffers,
@@ -35,6 +36,17 @@ for mode in race logic nodirect irqfaults; do for f in 60 240 480; do
 	if [ $f = 60 ]; then
 		p=$(grep -o "frames: [0-9]*%" $o | grep -o "[0-9]*"); echo "    steady 2-buffer app got ${p:-?}% of the frames"
 		[ "${p:-0}" -ge 75 ] || { echo "    !! steady 2-buffer app got only ${p:-0}% of the frames"; fail=1; }
+	fi
+	# lost-interrupt recovery at the card's real rate: lost interrupts whose half
+	# was written are copied, skipped halves are recognised (most of each; the
+	# rest are lost frames as before, never torn ones - checked above)
+	if [ $f = 60 ] && [ $mode = irqfaults ]; then
+		read -r l r <<< "$(grep -o "lost IRQs [0-9]* -> recovered [0-9]*" $o | grep -o "[0-9]*" | tr '\n' ' ')"
+		[ "${l:-0}" -gt 0 ] && [ $(( ${r:-0} * 10 )) -ge $(( l * 8 )) ] || { echo "    !! only ${r:-?} of ${l:-?} lost interrupts recovered"; fail=1; }
+	fi
+	if [ $f = 60 ] && [ $mode = skiphalf ]; then
+		read -r k c <<< "$(grep -o "skipped by the card [0-9]* -> counted [0-9]*" $o | grep -o "[0-9]*" | tr '\n' ' ')"
+		[ "${k:-0}" -gt 0 ] && [ $(( ${c:-0} * 10 )) -ge $(( k * 8 )) ] || { echo "    !! only ${c:-?} of ${k:-?} skipped halves recognised"; fail=1; }
 	fi
 	# the exact frame rate reported by G_PARM (1001/60000 vs 1/60)
 	ok=$(grep -o "frame rate measurements: right [0-9]*" $o | grep -o "[0-9]*$"); echo "    exact frame rate measured right ${ok:-?} times"
@@ -47,7 +59,7 @@ for mode in race logic nodirect irqfaults; do for f in 60 240 480; do
 	[ "${a:-0}" -ge 95 ] && [ "${a:-0}" -le 105 ] || { echo "    !! silent audio stream at ${a:-?}% of its rate"; fail=1; }
 	scan $o; [ $rc = 0 ] || fail=1
 done; done
-unset SIM_DMA_LOCK SIM_NO_DIRECT SIM_LOSE_IRQ SIM_DUP_IRQ SIM_NTSC
+unset SIM_DMA_LOCK SIM_NO_DIRECT SIM_LOSE_IRQ SIM_DUP_IRQ SIM_NTSC SIM_SKIP_HALF
 for f in 60 240; do
 	o=$S/sim/out_hostile_$f.txt
 	SIM_HOSTILE=1 ASAN_OPTIONS=detect_leaks=0 timeout 300 $S/sim/sim $f 45 > $o 2>&1; rc=$?

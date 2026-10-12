@@ -31,6 +31,7 @@
 #include <linux/timer.h>
 #include <linux/kthread.h>
 #include <linux/rtmutex.h>
+#include <linux/hrtimer.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/module.h>
@@ -432,7 +433,7 @@ struct hws_audio{
 enum { HWS_ST_IN, HWS_ST_OUT, HWS_ST_IRQ_BUSY, HWS_ST_STALE, HWS_ST_OVERRUN, HWS_ST_DIRECT,
        HWS_ST_OVERWRITE, HWS_ST_COALESCED, HWS_ST_NO_BUF, HWS_ST_EMPTY, HWS_ST_SKIP,
        HWS_ST_UNPAIRED, HWS_ST_ABORTED, HWS_ST_MISSED, HWS_ST_IRQ_LOST, HWS_ST_CARD_LATE,
-       HWS_ST_LATE_START, HWS_ST_N };
+       HWS_ST_LATE_START, HWS_ST_RECOVERED, HWS_ST_HALF_SKIPPED, HWS_ST_IRQ_LATE, HWS_ST_N };
 
 struct hws_timing_stats {
 	atomic_t	frames_in;	/* complete frames committed to the ring */
@@ -456,6 +457,11 @@ struct hws_timing_stats {
 	atomic_t	card_late;	/* frame intervals over 1.5 periods without any frame lost
 					 * in the driver: the card itself sent no frame in between */
 	atomic_t	card_late_start;	/* of these, within the first frames after a capture start */
+	/* irq_recover: a second-half interrupt that didn't come in time */
+	atomic_t	irq_recovered;	/* the card had written the half: copied anyway */
+	atomic_t	half_skipped;	/* the card hadn't written it: frame lost (instead of
+					 * irq_lost), not in the card's count either */
+	atomic_t	irq_late;	/* it came after all, after the stand-in (should stay 0) */
 	u32		frames_since_start;	/* copy thread */
 	bool		lost_since_frame;	/* copy thread: a frame was dropped since the last one */
 	u64		last_frame_ns;
@@ -502,6 +508,29 @@ struct hws_pcie_dev {
 	u32				m_half_cnt[MAX_VID_CHANNELS][2];	/* completed-IRQ count per half */
 	u32				m_half_peer[MAX_VID_CHANNELS][2];	/* other half's count at that IRQ */
 	u32				m_half1_cnt[MAX_VID_CHANNELS];	/* count of the first half copied for the current frame */
+	/*
+	 * irq_recover: when a second half's interrupt doesn't come in time,
+	 * half_timer stands in for it. half_lock serialises the two writers of
+	 * the half counts/timestamps (hard IRQ and the timer, both hard-IRQ context).
+	 */
+	raw_spinlock_t			half_lock[MAX_VID_CHANNELS];
+	bool				m_half_synth[MAX_VID_CHANNELS];	/* half_lock, in the m_half_seq snapshot:
+									 * the latest second half came from the timer */
+	bool				synth_open[MAX_VID_CHANNELS];	/* half_lock: stood in for, the real one may still come */
+	u64				half12_ns[MAX_VID_CHANNELS];	/* half_lock: first -> second half interrupt, last seen */
+	u8				*mark_start[MAX_VID_CHANNELS];	/* copy thread: "not rewritten" marks */
+	u8				*mark_end[MAX_VID_CHANNELS];	/* in the second half, for half_timer */
+	bool				unwritten[MAX_VID_CHANNELS];	/* half_timer: the card skipped the second */
+	u32				unwritten_cnt1[MAX_VID_CHANNELS];	/* half of this first half (its count) */
+	struct hws_half_timer {
+		struct hrtimer		timer;
+		struct hws_pcie_dev	*pdx;
+		int			ch;
+		u32			cnt0, cnt1;	/* half counts when armed */
+		u64			due_ns;		/* when the second half's interrupt was due */
+		u64			fire_ns;	/* when it checks (again) */
+		u64			give_up_ns;	/* last check: later the copy can't finish in time */
+	}				half_timer[MAX_VID_CHANNELS];
 	/* direct-to-buffer path: app buffers being filled straight from DMA (IRQ thread) */
 	struct rt_mutex			direct_lock[MAX_VID_CHANNELS];	/* rt: the RT copy thread waits on it */
 	struct list_head		direct_bufs[MAX_VID_CHANNELS];

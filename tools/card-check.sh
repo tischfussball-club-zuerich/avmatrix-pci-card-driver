@@ -113,7 +113,7 @@ for t in v4l2-ctl arecord; do
 done
 [ "$SKIP_COMPLIANCE" = 1 ] || command -v v4l2-compliance >/dev/null || { say "missing v4l2-compliance (install v4l-utils)"; exit 2; }
 lsmod | grep -q '^HwsCapture' || { say "HwsCapture module not loaded"; exit 2; }
-say "== module: $(modinfo -F version HwsCapture 2>/dev/null) params: direct_io=$(cat /sys/module/HwsCapture/parameters/direct_io 2>/dev/null) nt_copy=$(cat /sys/module/HwsCapture/parameters/nt_copy 2>/dev/null) timing_debug=$(cat /sys/module/HwsCapture/parameters/timing_debug 2>/dev/null) dma_probe=$(cat /sys/module/HwsCapture/parameters/dma_probe 2>/dev/null)"
+say "== module: $(modinfo -F version HwsCapture 2>/dev/null) params: direct_io=$(cat /sys/module/HwsCapture/parameters/direct_io 2>/dev/null) nt_copy=$(cat /sys/module/HwsCapture/parameters/nt_copy 2>/dev/null) timing_debug=$(cat /sys/module/HwsCapture/parameters/timing_debug 2>/dev/null) dma_probe=$(cat /sys/module/HwsCapture/parameters/dma_probe 2>/dev/null) irq_recover=$(cat /sys/module/HwsCapture/parameters/irq_recover 2>/dev/null)"
 
 nodes=()
 # by number: video10 after video9, so ch1, ch2... follow the card's channels
@@ -482,16 +482,20 @@ elif [ -n "$stats_start" ]; then
 			inn = c["frames_in"] - p["frames_in"]
 			il = c["irq_lost"] - p["irq_lost"]; cl = c["card_late"] - p["card_late"]
 			cs = c["card_late_start"] - p["card_late_start"]
-			printf "%d %d %d %d %d %d %d%s", card, inn, drops, card - inn - drops, il, cl, cs, txt }')
+			rc = c["irq_recovered"] - p["irq_recovered"]; hs = c["half_skipped"] - p["half_skipped"]
+			lt = c["irq_late"] - p["irq_late"]
+			printf "%d %d %d %d %d %d %d %d %d %d%s", card, inn, drops, card - inn - drops, il, cl, cs, rc, hs, lt, txt }')
 		[ "$out" = old ] && continue
-		read -r card inn drops un il cl cs rest <<< "$out"
+		read -r card inn drops un il cl cs rc hs lt rest <<< "$out"
 		say "   $d: card $card, taken in $inn, dropped $drops${rest:+ (${rest# })}, unaccounted $un"
-		# not in the card's count: frames whose interrupt was lost (the driver
-		# can't copy them), and gaps where the card itself sent no frame
-		if [ -n "$cl" ] && [ "$((il + cl))" -gt 0 ]; then
-			say "      interrupt lost (frame gone) $il, no frame from the card (late) $cl, of these right after a capture start $cs"
+		# a second half without its interrupt: copied anyway (recovered), or the
+		# card hadn't written it (skipped) or it couldn't be checked (lost) -
+		# those two not in the card's count; and gaps where the card sent nothing
+		if [ -n "$cl" ] && [ "$((il + cl + rc + hs + lt))" -gt 0 ]; then
+			say "      interrupt missing: copied anyway $rc, half not written by the card $hs, frame lost $il; came late after all $lt"
+			say "      no frame from the card (late) $cl, of these right after a capture start $cs"
 		fi
-		res "accounting.${KEY[$d]} card=$card in=$inn dropped=$drops unaccounted=$un irq_lost=${il:-0} card_late=${cl:-0} late_start=${cs:-0}"
+		res "accounting.${KEY[$d]} card=$card in=$inn dropped=$drops unaccounted=$un irq_lost=${il:-0} card_late=${cl:-0} late_start=${cs:-0} irq_recovered=${rc:-0} half_skipped=${hs:-0} irq_late=${lt:-0}"
 		if [ "$un" -gt 2 ] || [ "$un" -lt -2 ]; then bad "$d: $un frames neither taken in nor counted as dropped - a driver bug, please report"; fi
 	done <<< "$(stats_snap)"
 fi
@@ -534,8 +538,10 @@ else
 		say "== card DMA timing (dma_probe=1): when the card rewrites a half, after that half's interrupt"
 		say "$probe"
 	fi
-	# timing_debug: what each lost interrupt looked like (a whole period without
-	# one, or one that came but named the wrong half)
+	# timing_debug: what each lost interrupt looked like. The gap to the previous
+	# first half: about a period = no interrupt in between, about half = one came
+	# but named the wrong half (raw ranges: the logged period can be off while
+	# the frame rate is still being measured)
 	lost=$(printf '%s\n' "$new" | awk '
 		/HwsCapture ch[0-9]+: interrupt lost: / {
 			ch = $0; sub(/.*HwsCapture /, "", ch); sub(/:.*/, "", ch)
@@ -544,13 +550,13 @@ else
 			p = $0; sub(/.*period /, "", p); sub(/ .*/, "", p)
 			g += 0; n += 0; p += 0	# numbers, not strings, in the comparisons
 			tot[ch]++
-			if (g > p * 3 / 4 && g < p * 5 / 4 && n == 1) none[ch]++
-			else if (g < p * 3 / 4) wrong[ch]++
-			else other[ch]++
-			if (!(ch in lo) || g + 0 < lo[ch]) lo[ch] = g + 0
-			if (g + 0 > hi[ch]) hi[ch] = g + 0 }
-		END { for (ch in tot) printf "   %s: %d logged: %d with no interrupt for a whole period, %d with one too early (wrong half named), %d other; previous first half %d-%d us before\n",
-			ch, tot[ch], none[ch], wrong[ch], other[ch], lo[ch], hi[ch] }' | sort)
+			if (!(ch in glo) || g < glo[ch]) glo[ch] = g
+			if (g > ghi[ch]) ghi[ch] = g
+			if (!(ch in plo) || p < plo[ch]) plo[ch] = p
+			if (p > phi[ch]) phi[ch] = p
+			if (n != 1) multi[ch]++ }
+		END { for (ch in tot) printf "   %s: %d logged; previous first half %d-%d us before (period %d-%d us); with more than one first-half interrupt in between: %d\n",
+			ch, tot[ch], glo[ch], ghi[ch], plo[ch], phi[ch], multi[ch] + 0 }' | sort)
 	if [ -n "$lost" ]; then
 		say "== lost interrupts (timing_debug): what the card did around each"
 		say "$lost"

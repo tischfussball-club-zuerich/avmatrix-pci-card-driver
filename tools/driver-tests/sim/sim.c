@@ -21,6 +21,7 @@
 atomic_long sim_ratelimited_warnings;
 static int timing_debug = 2;	/* exercise the diagnostic paths too */
 static int direct_io = 1;
+static int irq_recover = 1;	/* SIM_NO_RECOVER=1: off */
 static int dma_probe = 1;	/* its marks must never show up in a frame */
 static int nt_copy = 1;	/* the non-temporal variant of the direct path (plain memcpy here) */
 
@@ -230,6 +231,72 @@ static void *kdwork_thread(void *arg)
 		pthread_cond_timedwait(&d->cond, &d->lock, &ts);
 	}
 	return NULL;
+}
+static void *hrtimer_thread(void *arg)
+{
+	struct hrtimer *t = arg;
+	pthread_mutex_lock(&t->lock);
+	for (;;) {
+		while (!t->expires)
+			pthread_cond_wait(&t->cond, &t->lock);
+		if (ktime_get_ns() >= t->expires) {
+			enum hrtimer_restart r;
+			t->expires = 0;
+			t->forward_to = 0;
+			t->running = true;
+			pthread_mutex_unlock(&t->lock);
+			r = t->function(t);
+			pthread_mutex_lock(&t->lock);
+			/* like the kernel: a restart doesn't undo an hrtimer_start meanwhile */
+			if (r == HRTIMER_RESTART && !t->expires)
+				t->expires = t->forward_to;
+			t->running = false;
+			pthread_cond_broadcast(&t->cond);
+			continue;
+		}
+		struct timespec ts = { (time_t)(t->expires / NSEC_PER_SEC), (long)(t->expires % NSEC_PER_SEC) };
+		pthread_cond_timedwait(&t->cond, &t->lock, &ts);
+	}
+	return NULL;
+}
+void hrtimer_setup(struct hrtimer *t, enum hrtimer_restart (*fn)(struct hrtimer *), int clock, enum hrtimer_mode mode)
+{
+	pthread_condattr_t a;
+	(void)clock; (void)mode;
+	t->function = fn;
+	pthread_mutex_init(&t->lock, NULL);
+	pthread_condattr_init(&a);
+	pthread_condattr_setclock(&a, CLOCK_MONOTONIC);
+	pthread_cond_init(&t->cond, &a);
+	t->expires = 0;
+	t->running = false;
+	pthread_create(&t->thr, NULL, hrtimer_thread, t);
+}
+void hrtimer_start(struct hrtimer *t, ktime_t rel, enum hrtimer_mode mode)
+{
+	(void)mode;
+	pthread_mutex_lock(&t->lock);
+	t->expires = ktime_get_ns() + (u64)(rel > 0 ? rel : 1);
+	pthread_cond_broadcast(&t->cond);
+	pthread_mutex_unlock(&t->lock);
+}
+u64 hrtimer_forward_now(struct hrtimer *t, ktime_t interval)
+{
+	pthread_mutex_lock(&t->lock);
+	t->forward_to = ktime_get_ns() + (u64)interval;
+	pthread_mutex_unlock(&t->lock);
+	return 1;
+}
+int hrtimer_cancel(struct hrtimer *t)
+{
+	int was;
+	pthread_mutex_lock(&t->lock);
+	was = t->expires != 0;
+	t->expires = 0;
+	while (t->running)
+		pthread_cond_wait(&t->cond, &t->lock);
+	pthread_mutex_unlock(&t->lock);
+	return was;
 }
 void kthread_init_delayed_work(struct kthread_delayed_work *d, void (*f)(struct kthread_work *))
 {
@@ -495,7 +562,8 @@ static long frame_of_ts(int ch, u64 ts)
 static atomic_long true_dups, order_err;
 
 /* ---- simulated card ---- */
-static int lose_irq, dup_irq;
+static int lose_irq, dup_irq, skip_half;
+static atomic_long skipped_halves;
 static atomic_long dup_irqs;
 static unsigned lose_seed = 99;
 static atomic_long lost_irqs;
@@ -537,7 +605,7 @@ static void *hw_thread(void *a)
 			/* split point as programmed by the driver (ChangeVideoSize/SetDMAAddress) */
 			int half = atomic_load(&regs[(CBVS_IN_BUF_BASE2 + ch * PCIE_BARADDROFSIZE) / 4]) * 16;
 			u8 v = 120 + f % 100;
-			int lose;
+			int lose, skip;
 
 			if (half <= 0 || half >= total)
 				half = total / 2;
@@ -552,11 +620,16 @@ static void *hw_thread(void *a)
 			sleep_until(s0 + slot);
 			raise_irq(ch, 1);
 			ev(ch, 'I', 1, v, (int)pdx->m_half_cnt[ch][1]);
+			/* SIM_SKIP_HALF=N: one in N second halves is neither written nor
+			 * announced (a card that skips it: nothing to recover) */
+			skip = skip_half && (rand_r(&lose_seed) % skip_half) == 0;
 			/* second half */
-			if (dma_lock_mode) pthread_rwlock_wrlock(&dma_lock[ch]);
-			memset(pdx->m_pbyVideoBuffer[ch] + half, v, total - half);
-			if (dma_lock_mode) pthread_rwlock_unlock(&dma_lock[ch]);
-			ev(ch, 'W', 0, v, 0);
+			if (!skip) {
+				if (dma_lock_mode) pthread_rwlock_wrlock(&dma_lock[ch]);
+				memset(pdx->m_pbyVideoBuffer[ch] + half, v, total - half);
+				if (dma_lock_mode) pthread_rwlock_unlock(&dma_lock[ch]);
+				ev(ch, 'W', 0, v, 0);
+			}
 			/* SIM_DUP_IRQ=N: one in N first halves is reported again shortly
 			 * after, without new data (spurious duplicate interrupt) */
 			if (dup_irq && (rand_r(&lose_seed) % dup_irq) == 0) {
@@ -569,9 +642,19 @@ static void *hw_thread(void *a)
 			/* SIM_LOSE_IRQ=N: lose one second-half interrupt in N (the card's next
 			 * interrupt then reports the same half twice in a row) */
 			lose = lose_irq && (rand_r(&lose_seed) % lose_irq) == 0;
-			if (lose) {
+			if (skip) {
+				atomic_fetch_add(&skipped_halves, 1);
+				ev(ch, 'S', 0, v, 0);
+			} else if (lose) {
 				atomic_fetch_add(&lost_irqs, 1);
 				ev(ch, 'L', 0, v, 0);
+				/* the data is there: a recovered frame carries the time its
+				 * interrupt was due (first half + the card's usual offset) */
+				u64 d = pdx->half12_ns[ch];
+				long kk = atomic_fetch_add(&fid_pos[ch], 1) % FID_N;
+				atomic_store(&fid[ch][kk].f, (long)f);
+				atomic_store(&fid[ch][kk].ts, (u64)atomic64_read(&pdx->m_half_ts[ch][1]) +
+					     (d ? d : hws_frame_period_ns(pdx, ch) / 2));
 			} else {
 				raise_irq(ch, 0);
 				ev(ch, 'I', 0, v, (int)pdx->m_half_cnt[ch][0]);
@@ -1052,6 +1135,7 @@ int main(int argc, char **argv)
 	if (hostile) printf("HOSTILE hardware: garbage registers, interrupt storm, DMA garbage, fake ALSA\n");
 	if (getenv("SIM_LOSE_IRQ")) lose_irq = atoi(getenv("SIM_LOSE_IRQ"));
 	if (getenv("SIM_DUP_IRQ")) dup_irq = atoi(getenv("SIM_DUP_IRQ"));
+	if (getenv("SIM_SKIP_HALF")) skip_half = atoi(getenv("SIM_SKIP_HALF"));
 	for (ch = 0; ch < MAX_VID_CHANNELS; ch++)
 		pthread_rwlock_init(&dma_lock[ch], NULL);
 	printf("dma race %s\n", dma_lock_mode ? "REMOVED (logic-only mode)" : "present (like real hardware)");
@@ -1069,8 +1153,10 @@ int main(int argc, char **argv)
 	spin_lock_init(&pdx->reg_lock);
 	mutex_init(&pdx->pm_lock);
 	if (getenv("SIM_NO_DIRECT")) direct_io = 0;
-	printf("direct path %s\n", direct_io ? "on" : "off");
+	if (getenv("SIM_NO_RECOVER")) irq_recover = 0;
+	printf("direct path %s, lost-interrupt recovery %s\n", direct_io ? "on" : "off", irq_recover ? "on" : "off");
 	for (ch = 0; ch < MAX_VID_CHANNELS; ch++) {
+		hws_half_timer_init(pdx, ch);
 		spin_lock_init(&pdx->videoslock[ch]);
 		spin_lock_init(&pdx->audiolock[ch]);
 		pdx->video[ch].index = ch;
@@ -1201,7 +1287,7 @@ int main(int argc, char **argv)
 	       (long)cov_video_copy, (long)cov_audio_copy, (long)cov_audio_deliver, (long)sim_ratelimited_warnings);
 
 	printf("fps=%d seconds=%d channels=%d consumers=%d\n", fps, seconds, NCH, ncons);
-	printf("frames from hw           %ld  (lost second-half IRQs %ld, duplicate first-half IRQs %ld)\n", frames_hw, lost_irqs, dup_irqs);
+	printf("frames from hw           %ld  (lost second-half IRQs %ld, duplicate first-half IRQs %ld, second halves skipped by the card %ld)\n", frames_hw, lost_irqs, dup_irqs, skipped_halves);
 	for (i = 0; i < ncons; i++)
 		if (cons[i].fixed_ms)
 			printf("steady app (ch%d, %d bufs, %d ms/frame) got %ld of %ld frames: %.0f%%\n",
@@ -1243,6 +1329,7 @@ int main(int argc, char **argv)
 		       atomic_read(&ts->no_app_buf), atomic_read(&ts->worker_empty), atomic_read(&ts->wq_coalesced));
 	}
 	/* every frame the card completed is in frames_in or exactly one drop counter */
+	long tot_recovered = 0, tot_skipped = 0, tot_irq_lost = 0;
 	for (ch = 0; ch < NCH; ch++) {
 		struct hws_timing_stats *ts = &pdx->tstats[ch];
 		atomic_t *c[HWS_ST_N];
@@ -1255,9 +1342,16 @@ int main(int argc, char **argv)
 		       ch, card, t[HWS_ST_IN], t[HWS_ST_OVERRUN], t[HWS_ST_STALE], t[HWS_ST_UNPAIRED], t[HWS_ST_ABORTED],
 		       t[HWS_ST_MISSED], card - t[HWS_ST_IN] - t[HWS_ST_OVERRUN] - t[HWS_ST_STALE] - t[HWS_ST_UNPAIRED] -
 		       t[HWS_ST_ABORTED] - t[HWS_ST_MISSED]);
-		printf("ch%d not in the card count: irq_lost %ld, card_late %ld (at start %ld)\n",
-		       ch, t[HWS_ST_IRQ_LOST], t[HWS_ST_CARD_LATE], t[HWS_ST_LATE_START]);
+		printf("ch%d not in the card count: irq_lost %ld, card_late %ld (at start %ld), half_skipped %ld\n",
+		       ch, t[HWS_ST_IRQ_LOST], t[HWS_ST_CARD_LATE], t[HWS_ST_LATE_START], t[HWS_ST_HALF_SKIPPED]);
+		printf("ch%d lost-interrupt recovery: recovered %ld, late interrupts after a stand-in %ld\n",
+		       ch, t[HWS_ST_RECOVERED], t[HWS_ST_IRQ_LATE]);
+		tot_recovered += t[HWS_ST_RECOVERED];
+		tot_skipped += t[HWS_ST_HALF_SKIPPED];
+		tot_irq_lost += t[HWS_ST_IRQ_LOST];
 	}
+	printf("recovery totals: lost IRQs %ld -> recovered %ld, still lost %ld; halves skipped by the card %ld -> counted %ld\n",
+	       (long)atomic_load(&lost_irqs), tot_recovered, tot_irq_lost, (long)atomic_load(&skipped_halves), tot_skipped);
 	/* the measured rate (G_PARM) */
 	long rate_err = atomic_load(&rate_bad);
 	printf("frame rate measurements: right %ld, wrong %ld <- must be 0\n", (long)atomic_load(&rate_ok), rate_err);

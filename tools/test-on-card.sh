@@ -17,6 +17,7 @@
 #                                    # on this one, and a table of both results
 #   DUR=60 tools/test-on-card.sh     # longer captures (each phase)
 #   DMA_PROBE=0 tools/test-on-card.sh  # without the card DMA timing measurement
+#   IRQ_RECOVER=0 tools/test-on-card.sh  # without copying halves whose interrupt didn't come
 #
 # --compare leaves v4l2-compliance out for the installed driver (older versions
 # of this driver crash the kernel in the control ioctls it tests);
@@ -137,6 +138,11 @@ compare_results() {
 					row("driver " what ": frames dropped on the way in", get("old", k, "dropped"), get("new", k, "dropped"))
 					row("   frames unaccounted (must be 0)", get("old", k, "unaccounted"), get("new", k, "unaccounted"))
 					row("   frames gone, their interrupt lost", get("old", k, "irq_lost"), get("new", k, "irq_lost"))
+					row("   second half not written by the card", get("old", k, "half_skipped"), get("new", k, "half_skipped"))
+					row("   interrupt came late after recovery", get("old", k, "irq_late"), get("new", k, "irq_late"))
+					better = "high"
+					row("   frames recovered (interrupt missing)", get("old", k, "irq_recovered"), get("new", k, "irq_recovered"))
+					better = "low"
 					row("   no frame from the card (late)", get("old", k, "card_late"), get("new", k, "card_late"))
 					row("      of these right after a capture start", get("old", k, "late_start"), get("new", k, "late_start")) }
 				else if (ch == "cpu") {
@@ -289,7 +295,7 @@ fi
 # timestamps, not line counts: a full kernel log buffer drops old lines as new ones come
 DMESG_START=$(sudo dmesg | tail -1 | sed -n 's/^\[ *\([0-9.]*\)\].*/\1/p')
 kmsg_since() { sudo dmesg | awk -v t="${DMESG_START:-0}" 'match($0, /^\[ *[0-9.]+\]/) { v = substr($0, RSTART + 1, RLENGTH - 2); gsub(/ /, "", v); if (v + 0 > t + 0) print }'; }
-if ! out=$(sudo insmod "$BUILD/HwsCapture.ko" timing_debug=1 dma_probe="${DMA_PROBE:-1}" 2>&1); then
+if ! out=$(sudo insmod "$BUILD/HwsCapture.ko" timing_debug=1 dma_probe="${DMA_PROBE:-1}" irq_recover="${IRQ_RECOVER:-1}" 2>&1); then
 	say "$out"
 	echo "$out" | grep -qi 'key was rejected' && say "   Secure Boot is on: the module must be signed (install with dkms-install.sh, see README) or Secure Boot disabled"
 	die "loading the new driver failed"
