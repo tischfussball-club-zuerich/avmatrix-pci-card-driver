@@ -11,7 +11,7 @@ This is a reworked version of the AVMatrix vendor driver. It is based on
 includes the additions from the AVMatrix 2026-05-19 release, and fixes a long
 list of crashes, hangs and causes of stutter in the original code.
 
-The driver was fully reworked by Claude. It currently runs stable on our streaming PC which provides the stream for [https://](https://www.youtube.com/@tischfussballclubzuerich)
+The driver was fully reworked by Claude. It currently runs stable on our streaming PC which provides the stream for [TFCZ](https://www.youtube.com/@tischfussballclubzuerich)
 With the original driver we had a lot of stutters/crashes. The reworked driver works perfectly well.
 
 Let us know if you find further issues - happy to improved the driver even further. 
